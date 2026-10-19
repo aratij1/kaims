@@ -1,5 +1,18 @@
 .git
 .github
+.env
+.env.*
+**/*.pem
+.aws
+.codex
+.claude
+external
+replacement
+docs
+backend/tests
+frontend/react/tests
+frontend/react/src/**/*.test.ts
+frontend/react/src/**/*.test.tsx
 .pytest_cache
 .ruff_cache
 .uv-cache
@@ -24,3 +37,4 @@ backend/rag/changes
 backend/rag/_review
 
 backend/retention-archives
+backend/host-evidence

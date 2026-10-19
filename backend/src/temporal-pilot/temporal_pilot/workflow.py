@@ -173,8 +173,16 @@ class KaiOpsRemediationWorkflow:
         timeout_seconds = int(profile.get("timeout_seconds") or 1200) if isinstance(profile, dict) else 1200
         timeout_seconds = max(60, min(timeout_seconds, 3600))
         poll_seconds = 10
+        deadline = (
+            workflow.now() + timedelta(seconds=timeout_seconds)
+            if workflow.patched("executor-wait-wall-clock-deadline-v1") else None
+        )
         for attempt in range(math.ceil(timeout_seconds / poll_seconds)):
+            if deadline is not None and workflow.now() >= deadline:
+                break
             await workflow.sleep(timedelta(seconds=poll_seconds))
+            if deadline is not None and workflow.now() >= deadline:
+                break
             action = await workflow.execute_activity(
                 "reconcile_remediation_action",
                 approval,
@@ -192,6 +200,8 @@ class KaiOpsRemediationWorkflow:
             start_to_close_timeout=timedelta(seconds=45),
             retry_policy=RetryPolicy(maximum_attempts=3),
         )
+        if workflow.patched("timeout-preserves-observed-terminal-result-v1"):
+            return await self._finish_or_rollback(approval, action)
         self._stage("timed_out", timeout_seconds=timeout_seconds, action=action)
         return action
 

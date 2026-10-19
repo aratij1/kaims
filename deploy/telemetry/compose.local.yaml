@@ -1,0 +1,4 @@
+services:
+  frontend:
+    image: telemetry-local/frontend:20260911
+    pull_policy: never

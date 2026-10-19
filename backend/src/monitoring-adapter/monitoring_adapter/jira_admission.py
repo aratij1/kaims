@@ -125,6 +125,7 @@ class JiraAdmissionState:
         fingerprint: str,
         source: str,
         severity: str,
+        episode_start: str | None = None,
         now: datetime | None = None,
     ) -> AdmissionDecision:
         """Cheap pre-LLM gate that never reserves Jira creation capacity.
@@ -137,6 +138,14 @@ class JiraAdmissionState:
         state = self._load()
         discoveries = state.setdefault("discovery_fingerprints", {})
         item = discoveries.setdefault(fingerprint, {})
+        onset = self._parse(episode_start)
+        prior_onset = self._parse(item.get("episode_start"))
+        if onset is not None:
+            if prior_onset is not None and onset < prior_onset:
+                return AdmissionDecision(False, "suppressed", "older alert episode", 0)
+            if prior_onset is None or onset > prior_onset:
+                item.clear()
+                item["episode_start"] = onset.isoformat()
         cutoff = current - self.recurrence_window
         occurrences = [
             parsed

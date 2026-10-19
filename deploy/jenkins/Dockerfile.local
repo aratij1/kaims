@@ -1,6 +1,6 @@
 FROM docker:27-cli AS docker-cli
 
-FROM jenkins/jenkins:lts-jdk17
+FROM jenkins/jenkins:lts-jdk21
 
 # Compose has no engine-level "scale" primitive; only the real `docker
 # compose` CLI knows how to add a correctly-networked replica (see
@@ -16,6 +16,10 @@ COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr
 RUN chmod +x /usr/local/bin/docker /usr/local/lib/docker/cli-plugins/docker-compose
 USER jenkins
 
-RUN jenkins-plugin-cli --plugins workflow-aggregator pipeline-utility-steps pipeline-milestone-step timestamper
+# Explicitly select patched library/multibranch plugins rather than accepting
+# the older minimum versions pulled by workflow-aggregator dependencies.
+# https://www.jenkins.io/security/advisory/2026-09-16/
+RUN jenkins-plugin-cli --plugins workflow-aggregator pipeline-utility-steps pipeline-milestone-step timestamper \
+    workflow-multibranch:842.v3a_b_59b_57b_e6e pipeline-groovy-lib:806.v408277b_33d1d
 
 COPY init.groovy.d/ /usr/share/jenkins/ref/init.groovy.d/

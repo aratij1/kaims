@@ -28,8 +28,7 @@ MESSAGE_BUS_DUAL_CONSUME_ENABLED = str(
 async def _persist_orchestration_event(app: FastAPI, envelope: dict) -> None:
     session_factory = getattr(app.state, "session_factory", None)
     if session_factory is None:
-        logger.warning("orchestrator metadata persistence skipped; database session factory unavailable")
-        return
+        raise RuntimeError("orchestrator database session factory unavailable")
 
     async with session_factory() as session:
         repo = IncidentRepository(session)
@@ -61,7 +60,7 @@ async def startup(app: FastAPI) -> None:
         alert = Alert.model_validate(payload["alert"])
         incident = Incident.model_validate(payload["incident"])
         decision = await agent.decide_workflow_async_with_runtime(alert, incident)
-        transport_provider = str(decision.__dict__.get("message_bus_provider") or "kafka")
+        transport_provider = app.state.message_bus_provider
         event_envelope = build_orchestration_envelope(
             alert=alert,
             incident=incident,
@@ -73,6 +72,9 @@ async def startup(app: FastAPI) -> None:
             await _persist_orchestration_event(app, event_envelope)
         except Exception:
             logger.exception("orchestrator metadata persistence failed")
+            # Let durable delivery retry. Publishing and acknowledging here
+            # would advance the workflow without its recorded decision.
+            raise
         if settings.temporal_pilot_enabled:
             workflow_id = f"kaiops-incident-{incident.id}"
             try:
@@ -114,6 +116,9 @@ async def startup(app: FastAPI) -> None:
 async def shutdown(app: FastAPI) -> None:
     for task in tasks:
         task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    tasks.clear()
 
 
 app = create_app(title="KaiMS Orchestrator", settings=settings, startup=startup, shutdown=shutdown)

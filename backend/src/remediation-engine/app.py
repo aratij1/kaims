@@ -62,6 +62,15 @@ ACTIVE_EXECUTION_STATUSES = {
     RemediationStatus.VERIFYING.value,
 }
 
+TERMINAL_EXECUTION_STATUSES = frozenset({
+    RemediationStatus.SUCCEEDED, RemediationStatus.FAILED, RemediationStatus.SKIPPED,
+    RemediationStatus.EXECUTION_FAILED, RemediationStatus.VALIDATION_FAILED,
+    RemediationStatus.DISPATCH_FAILED, RemediationStatus.POLICY_BLOCKED,
+    RemediationStatus.ROLLED_BACK, RemediationStatus.ROLLBACK_FAILED,
+    RemediationStatus.CANCELLED, RemediationStatus.TIMED_OUT,
+    RemediationStatus.MANUAL_INTERVENTION_REQUIRED,
+})
+
 ConsumeRunner = Callable[[Any, Callable[[dict], Awaitable[None]]], Coroutine[Any, Any, None]]
 
 
@@ -196,13 +205,25 @@ def _advance_action_lifecycle(action: RemediationAction) -> None:
     if not lifecycle:
         return
     if action.status == RemediationStatus.SUCCEEDED:
+        receipt = action.parameters.get("execution_result") or {}
+        if (lifecycle.get("state") == ResolutionState.READY_TO_EXECUTE.value
+                and receipt.get("executed") is True and receipt.get("recovery_validated") is True):
+            lifecycle = transition_lifecycle(
+                lifecycle, ResolutionState.EXECUTING, actor=LifecycleActor.REMEDIATION,
+                execution={"action_id": str(action.id), "status": action.status.value,
+                           "reconciled_from_executor_receipt": True},
+            )
         state, reason = ResolutionState.VALIDATING, None
     elif action.status in {RemediationStatus.ROLLED_BACK}:
         state, reason = ResolutionState.ROLLED_BACK, "rollback_completed"
     elif action.status in {RemediationStatus.POLICY_BLOCKED, RemediationStatus.AWAITING_APPROVAL}:
         state, reason = ResolutionState.BLOCKED_RETRYABLE, "policy_precondition_failed"
     elif action.status in {RemediationStatus.TIMED_OUT, RemediationStatus.DISPATCH_FAILED, RemediationStatus.EXECUTION_FAILED, RemediationStatus.FAILED}:
-        state, reason = ResolutionState.FAILED_RETRYABLE, "execution_failed"
+        if (lifecycle.get("state") == ResolutionState.READY_TO_EXECUTE.value
+                and not (action.parameters.get("execution_result") or {}).get("accepted")):
+            state, reason = ResolutionState.BLOCKED_RETRYABLE, "dispatch_not_accepted"
+        else:
+            state, reason = ResolutionState.FAILED_RETRYABLE, "execution_failed"
     elif action.status == RemediationStatus.SKIPPED and action.action_type == "diagnostic_completion":
         # The diagnostic branch remains non-mutating. Closure owns the final
         # transition after it has durably recorded the diagnostic evidence.
@@ -1035,6 +1056,7 @@ async def _finalize_api_execution(approval: Approval, action: RemediationAction)
     # observed terminal result before publishing its event; otherwise an API
     # caller sees the terminal response while subsequent reads remain stuck on
     # the last non-terminal value.
+    _advance_action_lifecycle(action)
     await _persist_action(app, action)
     source_payload = {"approval": approval.model_dump(mode="json")}
     await _request_failure_reconsideration(action=action, source_payload=source_payload)
@@ -1088,12 +1110,15 @@ async def dispatch_approval_direct(approval: Approval, x_kaiops_internal_token: 
     existing = await _find_existing_action(app, action.idempotency_key)
     if existing is not None:
         existing_result = existing.parameters.get("execution_result")
-        if isinstance(existing_result, dict) and existing_result.get("accepted"):
+        if (isinstance(existing_result, dict) and existing_result.get("accepted")
+                and (existing.approval_id == approval.id
+                     or existing.status.value in ACTIVE_EXECUTION_STATUSES)):
             return existing
         action.id = existing.id
     bind_execution_contract(action, approval)
     verify_execution_contract(action)
     action.status = RemediationStatus.DISPATCHING
+    _advance_action_lifecycle(action)
     action.parameters["lifecycle"] = {
         "state": RemediationStatus.DISPATCHING.value,
         "history": [RemediationStatus.POLICY_CHECKED.value, RemediationStatus.APPROVED.value, RemediationStatus.DISPATCHING.value],
@@ -1108,6 +1133,14 @@ async def dispatch_approval_direct(approval: Approval, x_kaiops_internal_token: 
     return action
 
 
+def _require_matching_execution_attempt(approval: Approval, action: RemediationAction) -> None:
+    # The plan's stable idempotency key can be reused by a separately approved
+    # retry. Late callbacks from the former workflow must not mutate that retry.
+    if (action.approval_id != approval.id or action.incident_id != approval.incident_id
+            or action.tenant_id != approval.tenant_id):
+        raise HTTPException(status_code=409, detail="Execution callback belongs to a superseded approval attempt.")
+
+
 @app.post("/reconcile-direct", response_model=RemediationAction, include_in_schema=False)
 async def reconcile_execution_direct(payload: dict[str, Any], x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
     """Perform one executor observation and persist only observed truth."""
@@ -1119,7 +1152,10 @@ async def reconcile_execution_direct(payload: dict[str, Any], x_kaiops_internal_
     action = await _find_existing_action(app, _build_action_idempotency_key(approval, preview.action_type))
     if action is None:
         raise HTTPException(status_code=404, detail="No dispatched remediation action exists for this incident.")
+    _require_matching_execution_attempt(approval, action)
     verify_execution_contract(action)
+    if action.status in TERMINAL_EXECUTION_STATUSES:
+        return await _finalize_api_execution(approval, action)
     previous = action.status.value
     action = await engine.observe(action)
     lifecycle = action.parameters.get("lifecycle") if isinstance(action.parameters.get("lifecycle"), dict) else {"history": []}
@@ -1127,21 +1163,7 @@ async def reconcile_execution_direct(payload: dict[str, Any], x_kaiops_internal_
     if previous != action.status.value:
         lifecycle["history"] = [*lifecycle.get("history", []), action.status.value]
     action.parameters["lifecycle"] = lifecycle
-    terminal = {
-        RemediationStatus.SUCCEEDED,
-        RemediationStatus.FAILED,
-        RemediationStatus.SKIPPED,
-        RemediationStatus.EXECUTION_FAILED,
-        RemediationStatus.VALIDATION_FAILED,
-        RemediationStatus.DISPATCH_FAILED,
-        RemediationStatus.POLICY_BLOCKED,
-        RemediationStatus.ROLLED_BACK,
-        RemediationStatus.ROLLBACK_FAILED,
-        RemediationStatus.CANCELLED,
-        RemediationStatus.TIMED_OUT,
-        RemediationStatus.MANUAL_INTERVENTION_REQUIRED,
-    }
-    if action.status in terminal:
+    if action.status in TERMINAL_EXECUTION_STATUSES:
         return await _finalize_api_execution(approval, action)
     await _persist_action(app, action)
     return action
@@ -1157,6 +1179,16 @@ async def timeout_execution_direct(payload: dict[str, Any], x_kaiops_internal_to
     action = await _find_existing_action(app, _build_action_idempotency_key(approval, preview.action_type))
     if action is None:
         raise HTTPException(status_code=404, detail="No remediation action exists for this incident.")
+    _require_matching_execution_attempt(approval, action)
+    verify_execution_contract(action)
+    if action.status in TERMINAL_EXECUTION_STATUSES:
+        return await _finalize_api_execution(approval, action)
+    # A deadline is not evidence of executor failure. A build may have finished
+    # since the last poll; observe it once before recording a timeout. If the
+    # observation fails, retain the last durable state and let Temporal retry.
+    action = await engine.observe(action)
+    if action.status in TERMINAL_EXECUTION_STATUSES:
+        return await _finalize_api_execution(approval, action)
     action.status = RemediationStatus.TIMED_OUT
     action.error = str(payload.get("error") or "Executor did not reach a terminal state before the remediation deadline.")
     action.completed_at = utc_now()
@@ -1287,6 +1319,8 @@ async def reconcile_rollback_direct(payload: dict[str, Any], x_kaiops_internal_t
     action = await _find_existing_action(app, _rollback_idempotency_key(approval, preview.action_type))
     if action is None:
         raise HTTPException(status_code=404, detail="No automatic rollback action exists for this incident.")
+    _require_matching_execution_attempt(approval, action)
+    verify_execution_contract(action)
     original = await _find_existing_action(app, _build_action_idempotency_key(approval, preview.action_type))
     if action.status in {RemediationStatus.ROLLED_BACK, RemediationStatus.ROLLBACK_FAILED, RemediationStatus.MANUAL_INTERVENTION_REQUIRED}:
         return action
@@ -1315,6 +1349,10 @@ async def timeout_rollback_direct(payload: dict[str, Any], x_kaiops_internal_tok
     action = await _find_existing_action(app, _rollback_idempotency_key(approval, preview.action_type))
     if action is None:
         raise HTTPException(status_code=404, detail="No automatic rollback action exists for this incident.")
+    _require_matching_execution_attempt(approval, action)
+    action = await reconcile_rollback_direct(payload, x_kaiops_internal_token)
+    if action.status in TERMINAL_EXECUTION_STATUSES:
+        return action
     action.status = RemediationStatus.MANUAL_INTERVENTION_REQUIRED
     action.error = "Automatic rollback did not reach a verified terminal state before its deadline."
     action.completed_at = utc_now()
@@ -1341,6 +1379,15 @@ async def record_execution_failure(payload: dict[str, Any], x_kaiops_internal_to
         action = existing or preview
     else:
         action = existing
+    if existing is not None:
+        _require_matching_execution_attempt(approval, action)
+        if action.status in TERMINAL_EXECUTION_STATUSES:
+            return await _finalize_api_execution(approval, action)
+        receipt = action.parameters.get("execution_result")
+        if isinstance(receipt, dict) and receipt.get("accepted") is True:
+            # An HTTP error after executor acceptance is not proof that the
+            # external action failed. Observe the existing execution instead.
+            return await reconcile_execution_direct({"approval": approval.model_dump(mode="json")}, x_kaiops_internal_token)
     policy_blocked = bool(payload.get("policy_blocked")) or int(payload.get("http_status") or 0) == 409
     action.status = RemediationStatus.POLICY_BLOCKED if policy_blocked else RemediationStatus.FAILED
     action.error = str(payload.get("error") or "Durable remediation execution failed.").strip()
@@ -1386,6 +1433,15 @@ async def execute_approval(approval: Approval) -> RemediationAction:
         RemediationStatus.SUCCEEDED,
         RemediationStatus.SKIPPED,
     }:
+        return existing
+    if existing is not None and existing.approval_id == approval.id and existing.status in {
+        RemediationStatus.FAILED, RemediationStatus.POLICY_BLOCKED,
+        RemediationStatus.EXECUTION_FAILED, RemediationStatus.DISPATCH_FAILED,
+        RemediationStatus.VALIDATION_FAILED, RemediationStatus.TIMED_OUT,
+    }:
+        # Temporal completes a workflow which returns a failed action. Reusing
+        # that approval cannot create a new run; retain the terminal receipt.
+        # A separately persisted approval authorizes a distinct retry attempt.
         return existing
     if existing is not None and existing.approval_id == approval.id and existing.status in {
         RemediationStatus.PENDING,
@@ -1658,10 +1714,11 @@ async def _require_persisted_human_approval(approval: Approval) -> None:
 async def _require_persisted_approved_runbook(approval: Approval) -> None:
     if not settings.database_enabled:
         raise PolicyViolation("automatic execution requires durable runbook governance")
-    runbook_id = str(approval.metadata.get("runbook_id") or "").strip()
+    plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
+    runbook_id = str(approval.metadata.get("runbook_id") or plan.get("runbook_governance_id") or "").strip()
     if not runbook_id:
         raise PolicyViolation("automatic execution blocked: governed runbook identity is missing")
-    version = int(approval.metadata.get("runbook_version") or 1)
+    version = int(approval.metadata.get("runbook_version") or plan.get("playbook_version") or 1)
     async with app.state.session_factory() as session:
         governance = await IncidentRepository(session).get_runbook_governance(
             runbook_id, version, tenant_id=approval.tenant_id
@@ -1670,7 +1727,7 @@ async def _require_persisted_approved_runbook(approval: Approval) -> None:
         raise PolicyViolation("automatic execution blocked: runbook version is not durably approved or is suspended")
     payload = governance.get("payload") if isinstance(governance.get("payload"), dict) else {}
     approved_checksum = str(payload.get("checksum_sha256") or "").strip()
-    plan_checksum = str(approval.metadata.get("runbook_checksum") or "").strip()
+    plan_checksum = str(approval.metadata.get("runbook_checksum") or plan.get("runbook_checksum") or "").strip()
     if not approved_checksum or approved_checksum != plan_checksum:
         raise PolicyViolation("automatic execution blocked: runbook checksum does not match durable approval")
     expires_at = str(payload.get("approval_expires_at") or "").strip()

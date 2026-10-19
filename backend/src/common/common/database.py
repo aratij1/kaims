@@ -7,7 +7,7 @@ from time import perf_counter
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Computed, func, literal_column, Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, Integer, MetaData, Numeric, String, Text, UniqueConstraint, Uuid, event, text
+from sqlalchemy import Computed, func, literal_column, Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, ForeignKeyConstraint, Integer, MetaData, Numeric, String, Text, UniqueConstraint, Uuid, event, text
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -104,6 +104,7 @@ class AlertRecord(Base, TimestampMixin):
 
 class IncidentRecord(Base, TimestampMixin):
     __tablename__ = "incidents"
+    __table_args__ = (UniqueConstraint("tenant_id", "id", name="uq_incidents_tenant_id"),)
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
@@ -202,6 +203,11 @@ class IncidentCorrelationBackfillRecord(Base, TimestampMixin):
 
 class ApprovalRecord(Base, TimestampMixin):
     __tablename__ = "approvals"
+    __table_args__ = (
+        ForeignKeyConstraint(["tenant_id", "incident_id"], ["incidents.tenant_id", "incidents.id"],
+                             name="fk_approvals_tenant_incident"),
+        Index("idx_approvals_tenant_incident", "tenant_id", "incident_id"),
+    )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
@@ -249,6 +255,8 @@ class ApprovalAssignmentRecord(Base, TimestampMixin):
 class ActionRecord(Base, TimestampMixin):
     __tablename__ = "actions"
     __table_args__ = (
+        ForeignKeyConstraint(["tenant_id", "incident_id"], ["incidents.tenant_id", "incidents.id"],
+                             name="fk_actions_tenant_incident"),
         Index("idx_actions_tenant_updated", "tenant_id", "updated_at"),
         Index(
             "idx_actions_lifecycle_binding", "tenant_id", "incident_id", "recommendation_id",

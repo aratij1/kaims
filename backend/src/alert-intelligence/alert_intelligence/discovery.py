@@ -135,9 +135,9 @@ def build_incident_candidate(alert: Alert, incident: Incident, llm: dict[str, An
             }
         )
     correlation_key = str(
-        alert.labels.get("discovery_fingerprint")
+        alert.fingerprint
+        or alert.labels.get("discovery_fingerprint")
         or alert.correlation_id
-        or alert.fingerprint
         or alert.id
     )
     idempotency_key = hashlib.sha256(

@@ -38,22 +38,31 @@ _EXECUTABLE_PREFIXES = ("ansible-playbook ", "kubectl ", "curl ", "mysql ", "pyt
 _HTTP_URL = re.compile(r"https?://[A-Za-z0-9_.:-]+(?:/[A-Za-z0-9_./?=&%+:-]*)?")
 
 
-def docker_compose_restart_plan(*, project: str, service: str) -> dict[str, list[str]]:
+def docker_compose_restart_plan(*, project: str, service: str, container_id: str | None = None) -> dict[str, list[str]]:
     """Resolve a Compose target by stable labels instead of an ephemeral name."""
-    filters = quote(json.dumps({"label": [
+    target_filters = {"label": [
         f"com.docker.compose.project={project}", f"com.docker.compose.service={service}",
-    ]}, separators=(",", ":")), safe="")
-    list_url = f"http://docker-socket-proxy:2375/containers/json?filters={filters}"
+    ]}
+    if container_id:
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise ValueError("Invalid pinned container identity")
+        target_filters["id"] = [container_id]
+        target_filters["status"] = ["exited", "dead"]
+    filters = quote(json.dumps(target_filters, separators=(",", ":")), safe="")
+    # Docker excludes stopped containers unless all=true, precisely the targets
+    # that a service-down recovery must be able to find.
+    list_url = f"http://docker-socket-proxy:2375/containers/json?all=true&filters={filters}"
     id_lookup = (
         f"curl --fail --silent --show-error '{list_url}' "
         "| grep -o '\"Id\":\"[^\"]*\"' | head -n 1 | cut -d'\"' -f4"
     )
+    operation = "start" if container_id else "restart?t=30"
     return {
         "preflight": [f"{id_lookup} | grep --quiet ."],
         "commands": [
             f"container_id=$({id_lookup}); test -n \"$container_id\" && "
             "curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 "
-            "-X POST http://docker-socket-proxy:2375/containers/$container_id/restart?t=30"
+            f"-X POST http://docker-socket-proxy:2375/containers/$container_id/{operation}"
         ],
     }
 
@@ -609,15 +618,24 @@ def resolve_execution_plan(
             "closure-service", "context-agent", "discovery-mcp", "model-router",
             "monitoring-adapter", "orchestrator", "remediation-engine", "resolution-agent",
         }
-        if remediation_operations == {"restart_service"} and docker_service in internal_services:
+        from common.orchestration.compose_targets import compose_recovery_target
+        external_target = compose_recovery_target(
+            tenant=alert.tenant_id, environment=alert.environment, service=execution_service,
+        )
+        if remediation_operations == {"restart_service"} and (docker_service in internal_services or external_target):
             compose_project = re.sub(
                 r"[^A-Za-z0-9_.-]", "", os.getenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure")
             ) or "kaiops_azure"
-            docker_plan = docker_compose_restart_plan(project=compose_project, service=docker_service)
+            if external_target:
+                compose_project, docker_service = external_target["project"], external_target["service"]
+            docker_plan = docker_compose_restart_plan(project=compose_project, service=docker_service,
+                container_id=external_target["container_id"] if external_target else None)
             phase_commands["diagnostic"] = docker_plan["preflight"]
             phase_commands["remediation"] = docker_plan["commands"]
+            import shlex
+            health_url = external_target["health_url"] if external_target else f"http://{docker_service}:8000/healthz"
             phase_commands["validation"] = [
-                f"curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-connrefused --retry-delay 2 http://{docker_service}:8000/healthz"
+                f"curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-connrefused --retry-delay 2 {shlex.quote(health_url)}"
             ]
             # Process restart has no inverse. Recovery is retry/escalation, not
             # a misleading second restart labelled as rollback. This is only

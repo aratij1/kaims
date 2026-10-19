@@ -8,7 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -169,7 +169,8 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
         "required_validators": bool(validators),
         "rollback_readiness": str(plan.get("rollback_mode") or "").lower() == "not_applicable" or bool(rollback),
         "policy_acceptance": str(policy.get("decision") or metadata.get("policy_decision") or "").lower()
-        in {"allow", "approved", "accept", "hitl"},
+        in ({"allow", "approved", "accept", "hitl", "hotl"} if settings.resolution_auto_execution_enabled
+            else {"allow", "approved", "accept", "hitl"}),
         "evidence_threshold": (
             float(quality.get("evidence_coverage") or 0.0) >= 0.85
             and float(quality.get("citation_coverage") or 0.0) > 0.0
@@ -202,6 +203,38 @@ def _signed_approval_readiness(context: dict[str, Any]) -> dict[str, Any]:
     return {**material, "decision_id": decision_id, "signature": f"hmac-sha256:{signature}" if signature else ""}
 
 
+async def request_automatic_selection(payload: dict) -> None:
+    """Prepare a bound remedy; execution remains governed by the resolution policy."""
+    recommendation = payload.get("recommendation") or {}
+    metadata = recommendation.get("metadata") or {}
+    incident = payload.get("incident") or {}
+    tenant = str(recommendation.get("tenant_id") or incident.get("tenant_id") or "")
+    service = str(metadata.get("service") or incident.get("service") or "")
+    environment = str(metadata.get("environment") or incident.get("environment") or "")
+    control = metadata.get("resolution_control") or {}
+    investigation = metadata.get("iterative_investigation") or {}
+    grounded = investigation.get("conclusive") is True and metadata.get("rca_status") == "grounded"
+    if control.get("disposition") == "watch_only":
+        return
+    if control.get("disposition") == "execution_ready" and metadata.get("resolution_selection"):
+        return
+    if control.get("disposition") == "investigate" and not grounded:
+        return
+    body = {key: metadata.get(key) for key in ("analysis_request_id", "rca_version", "context_snapshot_id", "context_fingerprint")}
+    body.update(tenant_id=tenant, incident_id=recommendation.get("incident_id"),
+                alert_id=metadata.get("alert_id") or (payload.get("context") or {}).get("alert", {}).get("id"),
+                recommendation_id=recommendation.get("id"), service=service, environment=environment,
+                issue=incident.get("title") or recommendation.get("root_cause") or service,
+                recommended_action=recommendation.get("recommended_action") or "")
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(f"{settings.resolution_agent_url.rstrip('/')}/resolution-catalog/assist",
+            headers={"x-kaiops-internal-token": settings.service_internal_token}, json=body)
+        if response.status_code in {409, 422}:
+            logger.info("Automatic selection remains human-gated incident_id=%s", recommendation.get("incident_id"))
+            return
+        response.raise_for_status()
+
+
 async def startup(app: FastAPI) -> None:
     workers = max(1, int(getattr(settings, "message_bus_worker_count", 1) or 1))
     consumers: list[tuple[str, Any, ConsumeRunner]] = []
@@ -228,6 +261,8 @@ async def startup(app: FastAPI) -> None:
         cache_key = _pending_key(tenant_id, incident_id)
         metadata = recommendation.get("metadata", {}) if isinstance(recommendation.get("metadata"), dict) else {}
         control = metadata.get("resolution_control", {}) if isinstance(metadata.get("resolution_control"), dict) else {}
+        PENDING_INCIDENTS[cache_key] = payload
+        await request_automatic_selection(payload)
         if control.get("disposition") in {"watch_only", "investigate", "execution_ready"}:
             PENDING_INCIDENTS.pop(cache_key, None)
             return
@@ -300,6 +335,8 @@ class ApprovalRequest(BaseModel):
                 raise ValueError(f"policy-engine approvals must be recorded under approver={AUTO_POLICY_APPROVER!r}")
             if not settings.resolution_auto_execution_enabled:
                 raise ValueError("automatic execution is not enabled on this deployment")
+        elif self.approver == AUTO_POLICY_APPROVER:
+            raise ValueError("policy-engine identity cannot be used for human approval")
         return self
 
 
@@ -587,6 +624,20 @@ async def _approval_from_request(
         recommendation = dict(recommendation)
         metadata = dict(metadata)
         metadata["execution_plan"] = plan
+        if request.approver_role == "policy-engine":
+            from common.automatic_execution import automatic_execution_authorized
+            incident = pending.get("incident") or {}
+            if not automatic_execution_authorized(
+                settings, tenant=request.tenant_id,
+                environment=str(metadata.get("environment") or incident.get("environment") or ""),
+                service=str(metadata.get("service") or incident.get("service") or ""),
+            ) or (plan.get("policy_decision") or {}).get("decision") != "hotl" or (
+                plan.get("approval_policy") or {}).get("decision") != "policy_required" or (
+                str(plan.get("risk_tier") or "").lower() != "low"
+                or float(recommendation.get("confidence") or 0) < 0.92
+                or len(plan.get("actions") or []) != 1
+            ):
+                raise HTTPException(status_code=409, detail="Automatic approval is not authorized for this target and plan")
         recommendation["metadata"] = metadata
         pending["recommendation"] = recommendation
         readiness = _signed_approval_readiness(pending)
@@ -618,6 +669,8 @@ async def _approval_from_request(
         expected_fingerprint = request.plan_fingerprint
         expiry = None
     return Approval(
+        id=uuid5(NAMESPACE_URL, f"automatic-approval:{request.tenant_id}:{expected_fingerprint}")
+        if request.approver_role == "policy-engine" else uuid4(),
         tenant_id=request.tenant_id,
         incident_id=request.incident_id,
         recommendation_id=recommendation_id,
@@ -633,6 +686,7 @@ async def _approval_from_request(
         modified_action=modified_action,
         metadata={
             "execution_confirmation_required": True,
+            "impact": str(recommendation.get("impact") or "") if decision == ApprovalDecision.APPROVED else None,
             "authorization_scope": request.authorization_scope,
             "rca_version": plan.get("rca_version") if decision == ApprovalDecision.APPROVED else None,
             "evidence_snapshot_id": plan.get("evidence_snapshot_id") if decision == ApprovalDecision.APPROVED else None,
@@ -665,9 +719,9 @@ async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[s
         plan = metadata.get("execution_plan") if isinstance(metadata, dict) else {}
         if isinstance(plan, dict):
             plan_tenant = str(plan.get("tenant_id") or "").strip()
-            if plan_tenant == normalized_tenant:
+            if plan_tenant == normalized_tenant and not settings.database_enabled:
                 return memory_payload
-            if plan_tenant:
+            if plan_tenant and plan_tenant != normalized_tenant:
                 raise HTTPException(status_code=403, detail="Approval tenant does not match the execution plan tenant.")
     elif any(key.endswith(f":{normalized_incident_id}") for key in PENDING_INCIDENTS):
         # Deliberately indistinguishable from a missing incident for callers in
@@ -687,6 +741,26 @@ async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[s
                 normalized_incident_id,
                 tenant_id=normalized_tenant,
             )
+            if isinstance(recommendation, dict):
+                metadata = dict(recommendation.get("metadata") or {})
+                version = int(metadata.get("rca_version") or 0)
+                canonical = await repo.get_current_execution_plan_for_incident(
+                    tenant_id=normalized_tenant, incident_id=normalized_incident_id,
+                    recommendation_id=recommendation["id"], rca_version=version,
+                ) if version else None
+                if canonical:
+                    from common.database import GovernedResolutionPlanRecord
+                    selected = await session.get(GovernedResolutionPlanRecord, UUID(canonical["resolution_selection_id"]))
+                    metadata["execution_plan"] = canonical
+                    metadata["resolution_selection"] = dict(selected.payload) if selected else {}
+                else:
+                    # A proposed plan is not the canonical plan required by
+                    # /approve. Never sign an eligible receipt for that draft.
+                    proposed = metadata.pop("execution_plan", None)
+                    if proposed:
+                        metadata.setdefault("model_proposed_execution_plan", proposed)
+                    metadata.pop("resolution_selection", None)
+                recommendation = {**recommendation, "metadata": metadata}
             pending = await repo.get_pending_workflow(normalized_incident_id)
     except HTTPException:
         raise
@@ -749,34 +823,18 @@ async def get_incident(incident_id: str, tenant_id: str = Query(min_length=1, ma
     if not normalized_incident_id:
         return {"incident_id": incident_id, "status": "unknown"}
 
-    memory_payload = PENDING_INCIDENTS.get(_pending_key(normalized_tenant, normalized_incident_id))
-    if isinstance(memory_payload, dict):
-        memory_payload.setdefault("incident_id", normalized_incident_id)
-
     if settings.database_enabled:
         try:
-            async with app.state.session_factory() as session:
-                repo = IncidentRepository(session)
-                incident = await repo.get_incident(normalized_incident_id, tenant_id=normalized_tenant)
-                pending = await repo.get_pending_workflow(normalized_incident_id)
-                recommendation = await repo.get_latest_recommendation_for_incident(normalized_incident_id, tenant_id=normalized_tenant)
-                if isinstance(recommendation, dict):
-                    memory_payload = {
-                        **(memory_payload if isinstance(memory_payload, dict) else {}),
-                        "recommendation": recommendation,
-                        "recommendation_id": _recommendation_id_from_repository_payload(recommendation),
-                    }
-                if isinstance(incident, dict):
-                    return _build_incident_context({**incident, **(memory_payload or {})}, pending)
-                if isinstance(pending, dict):
-                    return _build_incident_context(memory_payload or {"incident_id": normalized_incident_id}, pending)
-        except Exception:
-            logger.exception("failed to load incident context", extra={"incident_id": normalized_incident_id})
-
+            incident_uuid = UUID(normalized_incident_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="incident_id must be a UUID") from exc
+        context = await _load_approval_context(incident_uuid, tenant_id=normalized_tenant)
+        return _build_incident_context(context, None)
+    memory_payload = PENDING_INCIDENTS.get(_pending_key(normalized_tenant, normalized_incident_id))
     if isinstance(memory_payload, dict):
         return _build_incident_context(memory_payload, None)
-
     return {"incident_id": normalized_incident_id, "status": "unknown"}
+
 
 
 def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict[str, Any] | None) -> dict[str, Any]:
@@ -1031,6 +1089,8 @@ def _build_approval_event_payload(approval: Approval) -> dict[str, Any]:
             "authorization_scope": approval.authorization_scope,
         },
     )
+    if approval.approver_role == "policy-engine":
+        event_contract["event_id"] = f"automatic-approval:{approval.id}:{approval.decision.value}"
     return {
         "approval": approval,
         "recommendation": recommendation,

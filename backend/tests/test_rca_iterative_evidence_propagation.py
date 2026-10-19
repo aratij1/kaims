@@ -84,6 +84,7 @@ async def test_conclusive_iterative_investigation_evidence_is_recognized_as_vali
             "conclusion": {"confidence": 0.863, "evidence_ids": [trace_evidence_id]},
         }
     )
+    context.metadata["context_quality"] = {"execution_ready": False, "discovery_degraded": False}
     agent = ResolutionIntelligenceAgent(model_router=_router(trace_evidence_id))
     state = await agent.collect_context({"context": context})
     state = await agent.generate_rca(state)
@@ -95,7 +96,9 @@ async def test_conclusive_iterative_investigation_evidence_is_recognized_as_vali
     # valid_ids for a conclusive investigation.
     assert trace_evidence_id in rca_analysis["evidence_used"]
     assert rca_analysis["evidence_validation"]["available_count"] >= 1
-    assert rca_analysis["causal_chain"] == "The dependency failure caused request retries and exhausted the service connection pool."
+    assert not rca_analysis.get("context_degraded", False)
+    assert "discovery_evidence" not in rca_analysis.get("missing_evidence", [])
+    assert rca_analysis["causal_chain"] == ["The dependency failure caused request retries and exhausted the service connection pool."]
 
 
 @pytest.mark.asyncio

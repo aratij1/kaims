@@ -61,10 +61,18 @@ async def execute_remediation_action(approval: dict[str, Any]) -> dict[str, Any]
         settings.remediation_engine_url, "/execute-direct", approval,
         extra_headers={"X-KaiOps-Internal-Token": settings.remediation_internal_token},
     ))
-    while not execution.done():
-        done, _ = await asyncio.wait({execution}, timeout=30.0)
-        if not done:
-            activity.heartbeat({"stage": "executor_running", "incident_id": approval.get("incident_id")})
+    try:
+        while not execution.done():
+            done, _ = await asyncio.wait({execution}, timeout=30.0)
+            if not done:
+                activity.heartbeat({"stage": "executor_running", "incident_id": approval.get("incident_id")})
+    finally:
+        # Temporal cancellation must not leave a detached HTTP request running
+        # alongside a retried activity. This cancels the local request only;
+        # an already accepted external action still requires reconciliation.
+        if not execution.done():
+            execution.cancel()
+            await asyncio.gather(execution, return_exceptions=True)
     try:
         result = await execution
     except httpx.HTTPStatusError as exc:
@@ -98,7 +106,7 @@ async def dispatch_remediation_action(approval: dict[str, Any]) -> dict[str, Any
     except httpx.HTTPStatusError as exc:
         # 4xx responses are deterministic policy/contract decisions. Retrying
         # them cannot succeed and previously left the UI apparently hanging.
-        if 400 <= exc.response.status_code < 500:
+        if 400 <= exc.response.status_code < 500 or activity.info().attempt >= 3:
             try:
                 body = exc.response.json()
                 detail = str(body.get("detail") or body)

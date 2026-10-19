@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useState } from "react";
 import { ONBOARDING_SOURCE_DOC_BUCKETS } from "./onboardingConfig";
-import { looksLikeUuid, normalizeMatchToken } from "./onboardingUtils";
+import { looksLikeUuid } from "./onboardingUtils";
 import { queryClient } from "./app/queryClient";
 import { parseInternalApiResponse } from "./schemas/apiContracts";
 
@@ -1117,13 +1117,13 @@ const ALERT_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 function mapLandingPadRowToAlertStreamRow(row, index = 0) {
   const payload = row && typeof row === "object" ? row : {};
   const labels = typeof payload.labels === "object" && payload.labels ? payload.labels : {};
-  const incidentId = String(payload.incident_id || payload.id || payload.alert_id || payload.file || `landing-${index + 1}`).trim();
+  const alertIdentity = String(payload.alert_id || payload.id || payload.file || `landing-${index + 1}`).trim();
   const alertName = String(payload.name || payload.alert_name || payload.alertname || labels.alertname || "Landing Pad Alert").trim();
   const channel = normalizeAlertChannel(payload);
   return {
     ...payload,
-    id: incidentId,
-    alert_id: String(payload.alert_id || incidentId).trim(),
+    id: alertIdentity,
+    alert_id: String(payload.alert_id || alertIdentity).trim(),
     // Alert identity is not incident identity. Keep this empty until the
     // backend returns a persisted incident projection for the alert.
     incident_id: String(payload.incident_id || "").trim(),
@@ -1390,6 +1390,7 @@ function clampQualityScore(value, fallback = 0) {
 }
 
 function formatQualityPercent(value) {
+  if (value === null || value === undefined || value === "") return "Unavailable";
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
     return "-";
@@ -1411,21 +1412,21 @@ function qualityToneFromScore(value, inverse = false) {
 
 function normalizeEvaluationEnvelope(source = {}, fallback = {}) {
   const raw = source && typeof source === "object" ? source : {};
-  const fallbackConfidence = clampQualityScore(fallback.confidence, 0);
-  const ragMatchScore = clampQualityScore(raw.rag_match_score ?? fallback.ragMatchScore, 0);
-  const citationCoverage = clampQualityScore(raw.citation_coverage ?? fallback.citationCoverage, 0);
-  const evidenceCoverage = clampQualityScore(raw.evidence_coverage ?? fallback.evidenceCoverage, 0);
-  const groundingScore = clampQualityScore(raw.grounding_score ?? ((ragMatchScore * 0.45) + (citationCoverage * 0.25) + (evidenceCoverage * 0.3)), 0);
-  const confidenceScore = clampQualityScore(raw.confidence_score ?? fallbackConfidence, fallbackConfidence);
-  const hallucinationRisk = clampQualityScore(raw.hallucination_risk ?? (1 - ((groundingScore * 0.55) + (confidenceScore * 0.25) + (citationCoverage * 0.2))), 0);
-  const hallucinationScore = clampQualityScore(raw.hallucination_score ?? (1 - hallucinationRisk), 0);
-  const overallScore = clampQualityScore(
-    raw.overall_score ?? ((confidenceScore * 0.3) + (groundingScore * 0.3) + (hallucinationScore * 0.2) + (citationCoverage * 0.1) + (evidenceCoverage * 0.1)),
-    0,
-  );
+  const score = (value) => value === null || value === undefined || value === "" || !Number.isFinite(Number(value))
+    ? null : clampQualityScore(value);
+  const confidenceScore = score(raw.confidence_score ?? raw.confidenceScore ?? fallback.confidence);
+  const groundingScore = score(raw.grounding_score ?? raw.groundingScore);
+  const hallucinationRisk = score(raw.hallucination_risk ?? raw.hallucinationRisk);
+  const hallucinationScore = score(raw.hallucination_score ?? raw.hallucinationScore);
+  const citationCoverage = score(raw.citation_coverage ?? raw.citationCoverage);
+  const evidenceCoverage = score(raw.evidence_coverage ?? raw.evidenceCoverage);
+  const ragMatchScore = score(raw.rag_match_score ?? raw.ragMatchScore);
+  const overallScore = score(raw.overall_score ?? raw.overallScore);
+  const available = [overallScore, groundingScore, hallucinationRisk, citationCoverage, evidenceCoverage].some((value) => value !== null);
   return {
     contractVersion: raw.contract_version || "kaiops.evaluation.v1",
-    provider: raw.provider || "ui-derived-quality-gate",
+    provider: raw.provider || (available ? "recorded-evaluation" : "unavailable"),
+    available,
     confidenceScore,
     groundingScore,
     hallucinationRisk,
@@ -1434,8 +1435,8 @@ function normalizeEvaluationEnvelope(source = {}, fallback = {}) {
     evidenceCoverage,
     ragMatchScore,
     overallScore,
-    qualityLabel: raw.quality_label || (overallScore >= 0.82 ? "high" : overallScore >= 0.62 ? "medium" : "low"),
-    requiresReview: Boolean(raw.requires_review ?? (hallucinationRisk >= 0.45 || groundingScore < 0.55 || confidenceScore < 0.65)),
+    qualityLabel: raw.quality_label || (overallScore === null ? "unavailable" : overallScore >= 0.82 ? "high" : overallScore >= 0.62 ? "medium" : "low"),
+    requiresReview: Boolean(raw.requires_review ?? (!available || hallucinationRisk >= 0.45 || groundingScore < 0.55 || confidenceScore < 0.65)),
     externalJudge: raw.external_judge && typeof raw.external_judge === "object" ? raw.external_judge : {},
     signals: raw.signals && typeof raw.signals === "object" ? raw.signals : {},
   };

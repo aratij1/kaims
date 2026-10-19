@@ -33,3 +33,22 @@ async def test_non_mysql_development_schema_is_compatible(sqlite_session_factory
         state = await inspect_schema_compatibility(connection)
     assert state["compatible"] is True
     assert state["schema_version"] == Path(next(reversed(migration_manifest()))).stem
+
+
+@pytest.mark.asyncio
+async def test_schema_compatibility_reports_checksum_drift_without_rewriting_it(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import common.migration_state as module
+
+    monkeypatch.setattr(module, "migration_manifest", lambda: {"example.sql": "a" * 64})
+    connection = SimpleNamespace(
+        dialect=SimpleNamespace(name="mysql"),
+        scalar=AsyncMock(return_value=1),
+        execute=AsyncMock(return_value=SimpleNamespace(all=lambda: [("example.sql", "b" * 64)])),
+    )
+    state = await module.inspect_schema_compatibility(connection)
+    assert state["compatible"] is False
+    assert state["changed"] == ["example.sql"]
+    assert all(str(call.args[0]).startswith("SELECT") for call in connection.execute.await_args_list)

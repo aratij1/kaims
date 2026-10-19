@@ -100,10 +100,14 @@ async def verify(*, service: str, execute: bool) -> dict[str, object]:
         artifact_response = await client.get(f"{build_url.rstrip('/')}/artifact/kaiops-result.json")
         artifact_response.raise_for_status()
         artifact = artifact_response.json()
-        if artifact.get("preflight_passed") is not True or artifact.get("recovery_validated") is not True:
-            raise RuntimeError(f"Jenkins result lacks recovery evidence: {artifact}")
-        if execute and artifact.get("executed") is not True:
-            raise RuntimeError(f"Jenkins did not record live execution: {artifact}")
+        if artifact.get("dry_run") is not (not execute):
+            raise RuntimeError("Jenkins result mode does not match the submitted execution mode")
+        if execute:
+            if any(artifact.get(key) is not True for key in ("preflight_passed", "executed", "recovery_validated")):
+                raise RuntimeError("Jenkins result lacks live execution and recovery evidence")
+        elif (artifact.get("dry_run_validated") is not True or artifact.get("executed") is not False
+              or artifact.get("recovery_validated") is not False or artifact.get("executed_script_count") != 0):
+            raise RuntimeError("Jenkins dry run incorrectly claims execution or recovery")
         return {"build_url": build_url, "incident_id": incident_id, "service": service, "dry_run": not execute, "result": artifact}
 
 

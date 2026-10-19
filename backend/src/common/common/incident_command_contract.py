@@ -84,11 +84,25 @@ class IncidentCommandWorkspace(BaseModel):
             raise ValueError("incident projection identity does not match command workspace")
         if operations_identity != self.incident_id:
             raise ValueError("operations identity does not match command workspace")
+        # Independent service reads may straddle a recommendation commit.
+        # Never compose a detail payload with another generation's operations.
+        workspace = self.operations.get("investigation_workspace") or {}
+        binding = workspace.get("binding") or {}
+        recommendation = self.incident.get("recommendation") or {}
+        metadata = recommendation.get("metadata") or {}
+        bound_id = str(binding.get("recommendation_id") or "")
+        identities = [self.incident.get("recommendation_id"), recommendation.get("id")]
+        if bound_id and any(value and str(value) != bound_id for value in identities):
+            raise ValueError("recommendation generation does not match command operations")
+        snapshot_id = str(binding.get("context_snapshot_id") or binding.get("snapshot_id") or "")
+        if bound_id and metadata.get("context_snapshot_id") and str(metadata["context_snapshot_id"]) != snapshot_id:
+            raise ValueError("recommendation snapshot does not match command operations")
         return self
 
 
 def build_incident_command_workspace(
-    *, incident_id: str, incident: dict[str, Any], operations: dict[str, Any]
+    *, incident_id: str, incident: dict[str, Any], operations: dict[str, Any],
+    include_source_records: bool = True,
 ) -> IncidentCommandWorkspace:
     # The command page reads canonical top-level context/recommendation. Older
     # lifecycle projections also embed identical copies (including metadata).
@@ -109,6 +123,20 @@ def build_incident_command_workspace(
         ):
             projection.pop("context_metadata")
         incident = {**incident, "projection_payload": projection}
+    if not include_source_records:
+        # The command overview uses canonical operations for RCA and impact.
+        # Raw collection reports are loaded only when the source browser opens.
+        # Copy containers so this read projection cannot mutate durable evidence.
+        incident = dict(incident)
+        for field in ("context", "recommendation"):
+            value = incident.get(field)
+            if isinstance(value, dict) and isinstance(value.get("metadata"), dict):
+                metadata = dict(value["metadata"])
+                for key in ("context_evidence", "investigation_report", "iterative_investigation",
+                            "discovery_report", "discovery_evidence", "context_package", "context_graph",
+                            "rag_index", "candidate_execution_plan", "model_proposed_execution_plan", "model_calls"):
+                    metadata.pop(key, None)
+                incident[field] = {**value, "metadata": metadata}
     normalized_incident_id = str(incident_id or "").strip()
     workspace = operations.get("investigation_workspace")
     workspace = workspace if isinstance(workspace, dict) else {}

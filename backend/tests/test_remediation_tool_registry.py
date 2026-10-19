@@ -65,11 +65,12 @@ def _jenkins_result(submitted: dict[str, str]) -> dict:
         "approval_id": submitted["KAI_OPS_APPROVAL_ID"],
         "target": submitted["KAI_OPS_TARGET"],
         "plan_digest": submitted["KAI_OPS_PLAN_DIGEST"],
-        "executed_script_count": len(plan.get("scripts") or []),
+        "executed_script_count": 0 if dry_run else len(plan.get("scripts") or []),
         "dry_run": dry_run,
-        "preflight_passed": True,
+        "dry_run_validated": dry_run,
+        "preflight_passed": not dry_run,
         "executed": not dry_run,
-        "recovery_validated": True,
+        "recovery_validated": not dry_run,
         "result": "SUCCESS",
     }
 

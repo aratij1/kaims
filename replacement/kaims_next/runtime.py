@@ -222,7 +222,9 @@ def create_app():
     @app.get("/healthz")
     def health():
         return {"status":"running","ui_revision":ui_revision,"broker_ready":getattr(app.state,"broker_ready",False),
-                "qualification":"incident_pipeline_preview","incident_resolution_available":bool(policies),"resolution_scope":"Configured service policies only; preview tenant approval"}
+                "qualification":"incident_pipeline_preview","incident_resolution_available":bool(policies),
+                "automatic_remediation_scopes":resolution_worker.automatic_scopes(tenant),
+                "resolution_scope":"Configured service policies only; scoped authorization or preview tenant approval"}
 
     @app.get("/source-catalog")
     def catalog(authorization:str|None=Header(default=None)):
@@ -250,7 +252,9 @@ def create_app():
             "incidents":sum(states.values()),"incident_states":states,
             "in_progress":sum(states.get(s,0) for s in ("waiting_for_context","collection_queued","analysis_queued","resolution_queued","execution_queued","verification_queued")),
             "blocked_or_failed":sum(states.get(s,0) for s in ("context_blocked","failed","resolution_failed")),
-            "capabilities":{"versioned_registration_updates":True,"automatic_remediation":False,"approval_workflow":bool(policies),"qualified_service_health":False}}
+            "capabilities":{"versioned_registration_updates":True,"automatic_remediation":bool(resolution_worker.automatic_scopes(tenant)),
+                            "automatic_remediation_scopes":resolution_worker.automatic_scopes(tenant),
+                            "approval_workflow":bool(policies),"qualified_service_health":False}}
 
     @app.get("/incidents")
     def inbox_view(q:str=Query(default="",max_length=128),state:str="",offset:int=Query(default=0,ge=0,le=100000),

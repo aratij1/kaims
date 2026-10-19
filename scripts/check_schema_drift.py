@@ -82,7 +82,8 @@ def live_columns_by_table(cursor, database: str) -> dict[str, set[str]]:
 
 
 def diff_schema(
-    modeled_columns_by_table: dict[str, set[str]], live_columns: dict[str, set[str]],
+    modeled_columns_by_table: dict[str, set[str]],
+    live_columns: dict[str, set[str]],
 ) -> tuple[list[str], dict[str, set[str]], dict[str, set[str]]]:
     """Pure comparison, independent of SQLAlchemy metadata or a live
     connection, so the exact bug class this script exists to catch (a model
@@ -103,6 +104,24 @@ def diff_schema(
     return missing_tables, missing_columns, extra_columns
 
 
+def unique_keys_by_table(cursor, database: str) -> dict[str, set[tuple[str, ...]]]:
+    cursor.execute(
+        "SELECT TABLE_NAME, INDEX_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) "
+        "FROM information_schema.statistics WHERE TABLE_SCHEMA=%s AND NON_UNIQUE=0 "
+        "GROUP BY TABLE_NAME, INDEX_NAME",
+        (database,),
+    )
+    result: dict[str, set[tuple[str, ...]]] = {}
+    for table, _, columns in cursor.fetchall():
+        result.setdefault(table, set()).add(tuple(columns.split(",")))
+    return result
+
+
+def diff_unique_keys(modeled, live):
+    """Unique-key names may differ; the column combination must be enforced."""
+    return {table: keys - live.get(table, set()) for table, keys in modeled.items() if keys - live.get(table, set())}
+
+
 def check_drift(database_url: str | None = None) -> int:
     from common.database import Base  # noqa: PLC0415 -- deliberately deferred until sys.path is set
 
@@ -117,12 +136,25 @@ def check_drift(database_url: str | None = None) -> int:
     try:
         with connection.cursor() as cursor:
             live = live_columns_by_table(cursor, connection_kwargs["database"])
+            live_unique = unique_keys_by_table(cursor, connection_kwargs["database"])
     finally:
         connection.close()
 
     modeled_columns_by_table = {
         table.name: {column.name for column in table.columns} for table in Base.metadata.sorted_tables
     }
+    from sqlalchemy import UniqueConstraint
+
+    modeled_unique = {
+        table.name: {
+            tuple(column.name for column in constraint.columns)
+            for constraint in table.constraints
+            if isinstance(constraint, UniqueConstraint)
+        }
+        | {tuple(column.name for column in index.columns) for index in table.indexes if index.unique}
+        for table in Base.metadata.sorted_tables
+    }
+    missing_unique = diff_unique_keys(modeled_unique, live_unique)
     missing_tables, missing_columns, extra_columns = diff_schema(modeled_columns_by_table, live)
     table_count = len(modeled_columns_by_table)
 
@@ -146,6 +178,13 @@ def check_drift(database_url: str | None = None) -> int:
         print("(every request touching these will fail closed, exactly like incident_projections.created_at did)")
         for table_name in sorted(missing_columns):
             print(f"  {table_name}: {', '.join(sorted(missing_columns[table_name]))}")
+        print()
+
+    if missing_unique:
+        ok = False
+        print("Modeled unique keys missing from the live schema:")
+        for table, keys in sorted(missing_unique.items()):
+            print(f"  {table}: {sorted(keys)}")
         print()
 
     if ok:

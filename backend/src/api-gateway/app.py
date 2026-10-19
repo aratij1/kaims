@@ -38,6 +38,7 @@ from common.database import (
     IncidentProjectionRecord,
     IncidentRecord,
     MonitoringConnectionHealthRecord,
+    ContextEnrichmentJobRecord,
 )
 from common.event_publishers import build_agent_event_contract, build_orchestration_envelope
 from common.incident_command_contract import build_incident_command_workspace
@@ -46,6 +47,7 @@ from common.models import Alert, GatewayAuditEvent, Incident, SafetyDecision
 from common.repository import IncidentRepository
 from common.service import create_app
 from common.telemetry import REQUEST_LATENCY
+from api_gateway.metric_labels import gateway_metric_operation
 from common.topics import ORCHESTRATION_EVENTS
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -831,6 +833,7 @@ async def guarded_proxy(
     timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     start = perf_counter()
+    metric_operation = gateway_metric_operation(request)
     safety = analyzer.analyze({"path": path, "payload": payload})
     target_url = f"{target_base.rstrip('/')}/{path.lstrip('/')}"
     tracer = trace.get_tracer("kaiops.api_gateway")
@@ -857,8 +860,8 @@ async def guarded_proxy(
             )
             AUDIT_EVENTS.appendleft(event)
             _queue_gateway_audit_event(app, event)
-            GATEWAY_REQUESTS.labels(path, safety.decision.value, "blocked").inc()
-            REQUEST_LATENCY.labels(settings.service_name, path).observe(latency_ms / 1000)
+            GATEWAY_REQUESTS.labels(metric_operation, safety.decision.value, "blocked").inc()
+            REQUEST_LATENCY.labels(settings.service_name, metric_operation).observe(latency_ms / 1000)
             raise HTTPException(
                 status_code=403,
                 detail={
@@ -928,8 +931,8 @@ async def guarded_proxy(
         )
         AUDIT_EVENTS.appendleft(event)
         _queue_gateway_audit_event(app, event)
-        GATEWAY_REQUESTS.labels(path, safety.decision.value, status).inc()
-        REQUEST_LATENCY.labels(settings.service_name, path).observe(latency_ms / 1000)
+        GATEWAY_REQUESTS.labels(metric_operation, safety.decision.value, status).inc()
+        REQUEST_LATENCY.labels(settings.service_name, metric_operation).observe(latency_ms / 1000)
 
         if status_code >= 400:
             downstream = response_payload.get("downstream") if isinstance(response_payload, dict) else None
@@ -3436,17 +3439,42 @@ async def review_knowledge_catalog_candidate(
     )
 
 
+async def _evidence_queue_health(tenant_id: str) -> dict[str, Any]:
+    factory = getattr(app.state, "session_factory", None)
+    if not settings.database_enabled or factory is None:
+        return {"status": "unavailable"}
+    try:
+        async with asyncio.timeout(2):
+            async with factory() as session:
+                rows = (await session.execute(select(
+                    ContextEnrichmentJobRecord.status, func.count(),
+                ).where(
+                    ContextEnrichmentJobRecord.tenant_id == tenant_id,
+                    ContextEnrichmentJobRecord.status.in_(["scheduled", "retry", "collecting"]),
+                ).group_by(ContextEnrichmentJobRecord.status))).all()
+        counts = {status: int(count) for status, count in rows}
+        return {"status": "available", **{status: counts.get(status, 0)
+            for status in ("scheduled", "retry", "collecting")},
+            "observed_at": datetime.now(UTC).isoformat()}
+    except (TimeoutError, SQLAlchemyError):
+        return {"status": "unavailable"}
+
+
 @app.get("/operations/queue-health")
-async def get_queue_health() -> dict[str, Any]:
+async def get_queue_health(tenant_id: str = Depends(current_tenant_id)) -> dict[str, Any]:
     """Return live RabbitMQ readiness and backlog data for the command center.
 
     Broker telemetry is intentionally bounded and read-only. A failed management
     probe returns a useful degraded contract instead of turning dashboard load
     into an HTTP 500.
     """
+    from common.alert_processing_budget import ANALYSIS_TOPICS, capacity
+    processing = await capacity(settings)
+    evidence_collection = await _evidence_queue_health(tenant_id)
     broker_url = urlparse(str(settings.rabbitmq_url or ""))
     if broker_url.scheme not in {"amqp", "amqps"} or not broker_url.hostname:
-        return {"status": "not_configured", "provider": "rabbitmq", "healthy": False, "queues": 0, "messages": 0, "ready": 0, "unacknowledged": 0}
+        return {"status": "not_configured", "provider": "rabbitmq", "healthy": False, "queues": 0, "messages": 0, "ready": 0, "unacknowledged": 0,
+                "alert_processing": processing, "evidence_collection": evidence_collection, "analysis_backlog_ready": None}
     scheme = "https" if broker_url.scheme == "amqps" else "http"
     management_url = f"{scheme}://{broker_url.hostname}:15672/api/queues"
     username = unquote(broker_url.username or "guest")
@@ -3482,6 +3510,10 @@ async def get_queue_health() -> dict[str, Any]:
         )
         return {
             "status": status, "provider": "rabbitmq",
+            "alert_processing": processing,
+            "evidence_collection": evidence_collection,
+            "analysis_backlog_ready": sum(int(row.get("messages_ready") or 0) for row in primary_rows
+                if any(str(row.get("name") or "").endswith((f".{topic}", f".{topic}.deferred")) for topic in ANALYSIS_TOPICS)),
             "healthy": intake_healthy and dead_letters == 0,
             "intake_healthy": intake_healthy, "readiness_score": readiness_score, "reason": reason,
             "queues": len(primary_rows), "dead_letter_queues": len(dead_letter_rows),
@@ -3490,7 +3522,8 @@ async def get_queue_health() -> dict[str, Any]:
         }
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         logger.warning("RabbitMQ management health probe failed: %s", exc)
-        return {"status": "unreachable", "provider": "rabbitmq", "healthy": False, "queues": 0, "messages": 0, "ready": 0, "unacknowledged": 0}
+        return {"status": "unreachable", "provider": "rabbitmq", "healthy": False, "queues": 0, "messages": 0, "ready": 0, "unacknowledged": 0,
+                "alert_processing": processing, "evidence_collection": evidence_collection, "analysis_backlog_ready": None}
 
 
 def _rabbit_management() -> tuple[str, tuple[str, str]]:
@@ -3974,45 +4007,52 @@ async def get_incident_by_id(
 async def get_incident_command_workspace(
     incident_id: str,
     request: Request,
+    include_source_records: bool = True,
     x_trace_id: str | None = Header(default=None),
     tenant_id: str = Depends(current_tenant_id),
 ) -> dict[str, Any]:
     encoded_incident_id = quote(incident_id, safe="")
     trace_id = trace_id_from_header(x_trace_id)
-    incident, operations = await asyncio.gather(
-        guarded_proxy(
-            request=request,
-            method="GET",
-            path=f"/incidents/{encoded_incident_id}?{urlencode({'tenant_id': tenant_id})}",
-            target_base=settings.monitoring_adapter_url,
-            payload={},
-            trace_id=trace_id,
-        ),
-        guarded_proxy(
-            request=request,
-            method="GET",
-            path=f"/incidents/{encoded_incident_id}/operations-state",
-            target_base=settings.context_agent_url,
-            payload=None,
-            params={"tenant_id": tenant_id},
-            trace_id=trace_id,
-            timeout_seconds=30.0,
-        ),
-    )
-    incident_payload = incident.get("data") if isinstance(incident.get("data"), dict) else incident
-    operations_payload = operations.get("data") if isinstance(operations.get("data"), dict) else operations
-    try:
-        return build_incident_command_workspace(
-            incident_id=incident_id,
-            incident=incident_payload,
-            operations=operations_payload,
-        ).model_dump(mode="json")
-    except ValidationError as exc:
-        logger.error("Incident command workspace identity mismatch for %s: %s", incident_id, exc)
-        raise HTTPException(
-            status_code=409,
-            detail="Incident read models are inconsistent; retry after reconciliation.",
-        ) from exc
+    for attempt in range(2):
+        incident, operations = await asyncio.gather(
+            guarded_proxy(
+                request=request,
+                method="GET",
+                path=f"/incidents/{encoded_incident_id}?{urlencode({'tenant_id': tenant_id})}",
+                target_base=settings.monitoring_adapter_url,
+                payload={},
+                trace_id=trace_id,
+            ),
+            guarded_proxy(
+                request=request,
+                method="GET",
+                path=f"/incidents/{encoded_incident_id}/operations-state",
+                target_base=settings.context_agent_url,
+                payload=None,
+                params={"tenant_id": tenant_id},
+                trace_id=trace_id,
+                timeout_seconds=30.0,
+            ),
+        )
+        incident_payload = incident.get("data") if isinstance(incident.get("data"), dict) else incident
+        operations_payload = operations.get("data") if isinstance(operations.get("data"), dict) else operations
+        try:
+            return build_incident_command_workspace(
+                incident_id=incident_id,
+                incident=incident_payload,
+                operations=operations_payload,
+                include_source_records=include_source_records,
+            ).model_dump(mode="json")
+        except ValidationError as exc:
+            if attempt == 0:
+                # A commit between the independent reads is recoverable by
+                # re-reading both sides; never mix generations in the UI.
+                continue
+            logger.error("Incident command workspace identity mismatch for %s: %s", incident_id, exc)
+            raise HTTPException(
+                status_code=409,
+                detail="Incident read models are inconsistent; retry after reconciliation.",
+            ) from exc
 
 
 @app.get("/incidents/inbox/feed")

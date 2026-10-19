@@ -17,6 +17,10 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["fault-lab:8080"]
+        labels:
+          synthetic: "true"
+          event_mode: simulation
+          environment: test
 
   # A dedicated bounded target for exercising the real KaiOpsServiceDown rule.
   # Fault Lab can return HTTP 503 here without disrupting its control API or KaiMS.
@@ -24,6 +28,10 @@ scrape_configs:
     metrics_path: /service-health/metrics
     static_configs:
       - targets: ["fault-lab:8080"]
+        labels:
+          synthetic: "true"
+          event_mode: simulation
+          environment: test
 
   - job_name: otel-collector
     static_configs:
@@ -108,7 +116,12 @@ scrape_configs:
           # against source — initStats() is an unimplemented TODO in every
           # service), so its uptime/latency signal comes from this same
           # blackbox-exporter probing its real health endpoint.
-          - http://ob-frontend:8080/_healthz
+      - targets: ["http://ob-frontend:8080/_healthz"]
+        labels:
+          environment: demo
+          monitoring_scope: demo
+          application: Online Boutique
+          service: ob-frontend
       - targets: ["https://opentelemetry.io/"]
         labels:
           application: opentelemetry-demo
@@ -158,6 +171,9 @@ scrape_configs:
   - job_name: online-boutique-cadvisor
     static_configs:
       - targets: ["ob-cadvisor:8080"]
+        labels:
+          environment: demo
+          monitoring_scope: demo
 
   # gRPC payment service availability. The application does not expose a
   # Prometheus endpoint, so probe its TCP listener through blackbox-exporter.
@@ -186,29 +202,47 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["rs-cart:8080"]
+        labels:
+          environment: demo
+          monitoring_scope: demo
 
   - job_name: robot-shop-payment
     metrics_path: /metrics
     static_configs:
       - targets: ["rs-payment:8080"]
+        labels:
+          environment: demo
+          monitoring_scope: demo
 
   # mongodb/redis/rabbitmq/mysql don't expose /metrics natively — standard
   # community exporters provide real infrastructure metrics instead.
   - job_name: robot-shop-mysql
     static_configs:
       - targets: ["rs-mysqld-exporter:9104"]
+        labels:
+          environment: demo
+          monitoring_scope: demo
 
   - job_name: robot-shop-redis
     static_configs:
       - targets: ["rs-redis-exporter:9121"]
+        labels:
+          environment: demo
+          monitoring_scope: demo
 
   - job_name: robot-shop-rabbitmq
     static_configs:
       - targets: ["rs-rabbitmq-exporter:9419"]
+        labels:
+          environment: demo
+          monitoring_scope: demo
 
   - job_name: robot-shop-mongodb
     static_configs:
       - targets: ["rs-mongodb-exporter:9216"]
+        labels:
+          environment: demo
+          monitoring_scope: demo
 
   - job_name: kaiops-rabbitmq
     metrics_path: /metrics
@@ -304,7 +338,28 @@ scrape_configs:
           project: telemetry
           application: Telemetry
           service: frontend-proxy
-          environment: prod
+          environment: demo
+          monitoring_scope: demo
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
+  - job_name: telemetry-catalog-journey
+    metrics_path: /probe
+    params:
+      module: [http_product_catalog]
+    static_configs:
+      - targets: ["http://host.docker.internal:18080/api/products"]
+        labels:
+          project: telemetry
+          application: Telemetry
+          service: frontend-proxy
+          environment: demo
+          monitoring_scope: demo
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
@@ -320,7 +375,8 @@ scrape_configs:
           project: telemetry
           application: Telemetry
           service: telemetry-prometheus
-          environment: prod
+          environment: demo
+          monitoring_scope: demo
 
   # Query API availability is independent of application and collector health.
   - job_name: telemetry-jaeger
@@ -333,7 +389,8 @@ scrape_configs:
           project: telemetry
           application: Telemetry
           service: jaeger
-          environment: prod
+          environment: demo
+          monitoring_scope: demo
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target

@@ -1,0 +1,25 @@
+rule_files:
+  - /etc/prometheus/alert.rules.yml
+evaluation_interval: 15s
+tests:
+  - name: one KaiMS outage has one service-down rule
+    interval: 15s
+    input_series:
+      - series: 'up{job="kaiops-closure-service",instance="closure-service:8000"}'
+        values: '0+0x16'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: KaiOpsServiceDown
+        exp_alerts:
+          - exp_labels:
+              application: KaiOps
+              project_name: KaiOps
+              severity: critical
+              job: kaiops-closure-service
+              instance: closure-service:8000
+            exp_annotations:
+              summary: KaiOps service is down
+              description: Service kaiops-closure-service is not reachable by Prometheus for more than 1 minute.
+      - eval_time: 3m
+        alertname: ServiceDown
+        exp_alerts: []

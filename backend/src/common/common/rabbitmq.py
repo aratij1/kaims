@@ -11,6 +11,7 @@ import aio_pika
 from aio_pika import DeliveryMode, ExchangeType, Message, RobustChannel, RobustConnection, RobustExchange, RobustQueue
 
 from common.config import Settings
+from common.alert_processing_budget import run_handler
 from common.errors import sanitize_handler_failure_text
 from common.logging import get_logger
 from common.message_processing import ProcessedMessageCache, extract_message_identity, processing_cancelled
@@ -332,6 +333,7 @@ async def consume_forever(
                     dlq_published = False
 
                     last_error = ""
+                    failure_type = ""
                     produced_at = decoded.get("produced_at") if isinstance(decoded, dict) else None
                     if produced_at:
                         try:
@@ -345,7 +347,7 @@ async def consume_forever(
                             with trace.get_tracer("kaiops.rabbitmq").start_as_current_span("rabbitmq.consume", context=parent_context) as span:
                                 span.set_attribute("messaging.system", "rabbitmq")
                                 span.set_attribute("messaging.destination.name", consumer._topic)
-                                await asyncio.wait_for(handler(payload), timeout=consumer._settings.rabbitmq_handler_timeout_seconds)
+                                await run_handler(consumer._settings, consumer._topic, handler, payload)
                             success = True
                             processed_cache.mark(identity)
                             break
@@ -354,6 +356,7 @@ async def consume_forever(
                             # single hung downstream call could block this consumer
                             # (and its whole prefetch batch) indefinitely.
                             last_error = str(exc) or exc.__class__.__name__
+                            failure_type = f"{type(exc).__module__}.{type(exc).__qualname__}"
                             attempts += 1
                             if attempts > max_retries:
                                 break
@@ -381,15 +384,30 @@ async def consume_forever(
                         consumer._settings.rabbitmq_transient_requeue_enabled
                         and _is_transient_handler_error(last_error)
                     ):
-                        logger.warning(
-                            "requeueing rabbitmq message after transient dependency failure: topic=%s identity=%s error=%s",
-                            consumer._topic,
-                            identity,
-                            last_error,
-                        )
-                        await asyncio.sleep(min(5.0, max(1.0, float(attempts))))
-                        await message.nack(requeue=True)
-                        continue
+                        headers = dict(getattr(message, "headers", None) or {})
+                        maximum = consumer._settings.rabbitmq_transient_max_requeues
+                        try:
+                            redeliveries = max(0, int(headers.get("kaiops-transient-requeues", 0)))
+                        except (TypeError, ValueError):
+                            redeliveries = maximum
+                        if redeliveries < maximum:
+                            await asyncio.sleep(min(5.0, max(1.0, float(attempts))))
+                            headers["kaiops-transient-requeues"] = redeliveries + 1
+                            try:
+                                # Default exchange targets this exact subscriber
+                                # queue; republishing to the topic would duplicate
+                                # deliveries to every other subscriber.
+                                await asyncio.wait_for(consumer._channel.default_exchange.publish(
+                                    Message(message.body, headers=headers, delivery_mode=DeliveryMode.PERSISTENT,
+                                            content_type="application/json", app_id="kaiops", type=consumer._topic),
+                                    routing_key=consumer._queue.name, mandatory=True,
+                                ), timeout=_PUBLISH_TIMEOUT_SECONDS)
+                            except Exception:
+                                logger.exception("transient retry handoff failed; preserving original delivery")
+                                await message.nack(requeue=True)
+                            else:
+                                await message.ack()
+                            continue
                     if consumer._exchange is not None and consumer._dlq_routing_key:
                         try:
                             if failure_handler is not None:
@@ -415,6 +433,11 @@ async def consume_forever(
                                     # persisted; a later retry can repair the handoff.
                                     raise
                             envelope = {
+                                "failure_schema": "kaiops.message-failure.v1",
+                                "failure_type": failure_type,
+                                "failure_reason": sanitize_handler_failure_text(last_error),
+                                "consumer_service": consumer._settings.service_name,
+                                "message_identity": identity,
                                 "failed_topic": consumer._topic,
                                 "payload": payload,
                                 "error": last_error or "handler_failed",

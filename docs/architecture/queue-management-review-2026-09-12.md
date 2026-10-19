@@ -1,0 +1,13 @@
+# Queue reset and management changes
+
+The context and resolution workers were stopped before the reset. The active resolution context-events queue contained 162 ready messages and zero in-flight messages at purge time; it contained zero afterward. The 54 dead letters were retained. Before/after broker snapshots are in queue-reset-before-2026-09-12.json and queue-reset-after-2026-09-12.json.
+
+Automatic approval review rejected the proposed broader database/outbox cancellation. It was not executed. Stored jobs and outbox rows remain and can enqueue again. Purging broker deliveries neither cancels an investigation nor marks it resolved.
+
+Queue inspection and exact-job mutation now live in common/queue_management.py. Inspection reads complete AMQP bodies, shares the mutation identity function, tolerates malformed or scalar JSON, follows nested context fields, bounds scans to 100 messages and stops sampling after 8 MiB of accumulated bodies. Sampled messages are requeued in cleanup. A single oversized message can exceed that byte threshold. Reruns require confirmed mandatory publication before acknowledging the original message. Existing administrator authorization and confirmation requirements remain.
+
+Management HTTP requests now use the configured virtual host. Active ready/in-flight counts exclude dead letters. The UI distinguishes missing consumers, a backlog needing investigation, and a snapshot below the backlog threshold; it no longer claims throughput health from queue depth alone.
+
+Validation: 40 backend tests passed, including queue safety and context enrichment lifecycle. Frontend quality passed: lint, architecture, types, 241 tests; one opt-in fixture test skipped. Production build and separate bundle-budget check passed. An isolated real RabbitMQ queue verified a 60 KB message through sample, rerun and exact removal without publishing incident events. All 25 backend containers were running with matching deployment images; all 24 HTTP health/readiness pairs returned 200. Context and resolution workers were restored. UI and gateway were rebuilt and deployed.
+
+At the final live API check, investigation work had returned: 15 ready, four in flight, two consumers. Dead letters remained 54. The API correctly reported Inspect backlog. This is not proof that the incident pipeline now keeps up or that end-to-end recovery is complete. Durable cancellation, stale-snapshot coalescing with terminal analysis-request bookkeeping, and processing-latency/backpressure controls still need work. Do not repeatedly purge to conceal backlog. Existing evidence gaps, human approvals and causal-validation requirements are not bypassed by these changes.

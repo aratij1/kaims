@@ -111,3 +111,20 @@ def test_preauthorized_plan_uses_durable_authorization_stage(tmp_path):
         await worker.handle(pending(store,"incident.verification.requested"))
         assert inc.get("t","a","i")["state"]=="recovered" and state["executions"]==1
     asyncio.run(run())
+
+
+def test_automatic_authority_is_rechecked_immediately_before_execution(tmp_path, monkeypatch):
+    async def run():
+        store,inc,worker,state=await prepared(tmp_path,automatic=True)
+        await worker.handle(pending(store,"incident.authorization.requested"))
+        import kaims_next.resolution as module
+        expired_at=datetime.fromisoformat(worker.policies['t/a/gateway']['automatic_until'])+timedelta(seconds=1)
+        class FutureClock(datetime):
+            @classmethod
+            def now(cls,tz=None):return expired_at
+        monkeypatch.setattr(module,'datetime',FutureClock)
+        with pytest.raises(RuntimeError,match='authorization expired'):
+            await worker.handle(pending(store,'incident.execution.requested'))
+        assert state['executions']==0
+        assert worker.automatic_scopes('t')==[]
+    asyncio.run(run())

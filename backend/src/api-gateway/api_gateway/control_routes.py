@@ -192,6 +192,21 @@ def build_control_router(
         return await forward(request, "POST", f"/incidents/{quote(incident_id, safe='')}/recovery-assessments",
                              settings.closure_service_url, body, x_trace_id, timeout_seconds=25.0)
 
+    @router.post("/incidents/{incident_id}/recovery-observation")
+    async def observe_current_recovery(incident_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+                                       x_trace_id: str | None = Header(default=None)):
+        body = await assessment_identity(request, payload, starting=False)
+        return await forward(request, "POST", f"/incidents/{quote(incident_id, safe='')}/recovery-observation",
+                             settings.closure_service_url, body, x_trace_id, timeout_seconds=25.0)
+
+    @router.post("/incidents/{incident_id}/context-collection/prioritize")
+    async def prioritize_context_collection(incident_id: str, request: Request, payload: dict[str, Any] = REQUEST_BODY,
+                                           x_trace_id: str | None = Header(default=None)):
+        identity = await assessment_identity(request, payload, starting=True)
+        body = {"tenant_id": identity["tenant_id"], "actor_id": identity["actor_id"], "reason": identity["comment"]}
+        return await forward(request, "POST", f"/internal/incidents/{quote(incident_id, safe='')}/context-collection/prioritize",
+                             settings.context_agent_url, body, x_trace_id, timeout_seconds=25.0)
+
     @router.post("/incidents/{incident_id}/recovery-assessments/{assessment_id}/evaluate")
     async def evaluate_recovery_assessment(incident_id: str, assessment_id: str, request: Request,
             payload: dict[str, Any] = REQUEST_BODY, x_trace_id: str | None = Header(default=None)):

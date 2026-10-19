@@ -96,34 +96,80 @@ class HttpModelGateway(ModelGateway):
         return value
 
     def _compact_payload(self, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        original_bytes = len(json.dumps(payload, default=str).encode("utf-8"))
-        compacted = self._compact_value(payload)
-        compacted_bytes = len(json.dumps(compacted, default=str).encode("utf-8"))
-        # Bound every branch, including iterative reports and hypothesis trees.
-        # Keep evidence as arrays of attributable records rather than replacing
-        # the entire evidence plane with an omission object.
-        def bounded(value, strings, items, depth=0):
+        # Use the same JSON-compatible values for budget accounting and HTTP
+        # transport (context includes datetime and UUID objects).
+        payload = json.loads(json.dumps(payload, default=str))
+        def size(value):
+            return len(json.dumps(value, default=str).encode("utf-8"))
+
+        protected_lists = {"evidence_ids", "evidence_used", "supporting_evidence_ids", "contradicting_evidence_ids", "diagnostic_signals"}
+
+        def bounded(value, strings, items, depth=0, key=""):
             if depth > 10:
                 return "<nested value omitted>"
             if isinstance(value, str):
+                if key in {"evidence_id", "source", "source_type", "category", "connector", "service", "observed_at", "uri", "source_uri"}:
+                    return value
                 return value if len(value) <= strings else value[:strings] + "<trimmed>"
             if isinstance(value, list):
-                return [bounded(v, strings, items, depth + 1) for v in value[:items]]
+                values = value if key in protected_lists else value[:items]
+                return [bounded(v, strings, items, depth + 1, key) for v in values]
             if isinstance(value, dict):
-                return {k: bounded(v, strings, items, depth + 1) for k, v in value.items()}
+                return {k: bounded(v, strings, items, depth + 1, k) for k, v in value.items()
+                        if k not in {"raw", "raw_payload", "projection_payload", "model_calls"}}
             return value
-        for strings, items in ((2000, 10), (1000, 5), (500, 3), (200, 1)):
-            if compacted_bytes <= self._max_payload_bytes:
-                break
-            compacted = bounded(compacted, strings, items)
-            compacted_bytes = len(json.dumps(compacted, default=str).encode("utf-8"))
+
+        original_bytes = size(payload)
+        planes = {key: value for key, value in payload.items()
+                  if key in {"discovery_evidence", "evidence"} and isinstance(value, list)}
+        context = {key: value for key, value in payload.items() if key not in planes}
+        evidence_count = sum(len(rows) for rows in planes.values())
+        compacted = bounded(context, 4000, 20)
+        # Evidence has its own budget. Large hypothesis trees must not truncate
+        # every evidence plane to its first 1/3/5 rows before the model sees it.
+        for key, rows in planes.items():
+            compacted[key] = [bounded(row, 4000, 20) for row in rows]
+        if size(compacted) > self._max_payload_bytes:
+            context_budget = int(self._max_payload_bytes * (0.35 if evidence_count else 1.0))
+            for strings, items in ((2000, 10), (1000, 5), (500, 3), (200, 1), (80, 1)):
+                compacted = bounded(context, strings, items)
+                if size(compacted) <= context_budget:
+                    break
+            evidence_base = dict(compacted)
+            for strings in (1000, 600, 300, 150, 60):
+                compacted = dict(evidence_base)
+                for key, rows in planes.items():
+                    compacted[key] = [bounded(row, strings, 6) for row in rows]
+                if size(compacted) <= self._max_payload_bytes:
+                    break
+            # If the original set cannot fit even as short attributable facts,
+            # retain source diversity, and report the omitted count explicitly.
+            if size(compacted) > self._max_payload_bytes and evidence_count:
+                buckets = {}
+                aliases = {"prometheus": "metric", "telemetry": "metric", "metrics": "metric", "logs": "log", "source_code": "code", "changes": "change"}
+                for key in planes:
+                    for row in compacted[key]:
+                        source = str(row.get("source") or row.get("source_type") or row.get("category") or "unknown") if isinstance(row, dict) else "unknown"
+                        buckets.setdefault(aliases.get(source, source), []).append((key, row))
+                compacted = dict(evidence_base)
+                compacted.update({key: [] for key in planes})
+                for index in range(max(map(len, buckets.values()), default=0)):
+                    for rows in buckets.values():
+                        if index >= len(rows):
+                            continue
+                        key, row = rows[index]
+                        compacted[key].append(row)
+                        if size(compacted) > self._max_payload_bytes:
+                            compacted[key].pop()
+        compacted_bytes = size(compacted)
         if compacted_bytes > self._max_payload_bytes:
             raise ValueError("Model payload exceeds the configured budget after compaction; narrow the investigation scope.")
+        sent_count = sum(len(compacted.get(key, [])) for key in planes)
         return compacted, {
-            "original_bytes": original_bytes,
-            "sent_bytes": compacted_bytes,
-            "trimmed": compacted_bytes < original_bytes,
-            "budget_bytes": self._max_payload_bytes,
+            "original_bytes": original_bytes, "sent_bytes": compacted_bytes,
+            "trimmed": compacted_bytes < original_bytes, "budget_bytes": self._max_payload_bytes,
+            "evidence_available": evidence_count, "evidence_sent": sent_count,
+            "evidence_omitted": evidence_count - sent_count,
         }
 
     async def generate(self, request: GenerationRequest) -> dict[str, Any]:

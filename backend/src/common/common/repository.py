@@ -13,7 +13,10 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import load_only
+from sqlalchemy.orm import aliased, load_only
+from common.queue_lifecycle import MAX_COLLECTION_ATTEMPTS
+from common.rca_timeline import build_rca_timeline, causal_steps
+from common.recovery_status import observation_id, project_observation
 
 from common.database import (
     ActionRecord,
@@ -697,7 +700,18 @@ class IncidentRepository:
             raise ValueError(f"{name} is required")
         return value
 
+    async def _require_write_scope(self, model, identity, *, tenant_id: str, incident_id=None):
+        """A globally keyed row must never be reassigned by an upsert."""
+        existing = await self.session.get(model, identity, with_for_update=True)
+        if existing is not None:
+            if existing.tenant_id != tenant_id:
+                raise ValueError(f"{model.__tablename__} tenant binding mismatch")
+            if incident_id is not None and existing.incident_id != incident_id:
+                raise ValueError(f"{model.__tablename__} incident binding mismatch")
+        return existing
+
     async def save_alert(self, alert: Alert) -> None:
+        await self._require_write_scope(AlertRecord, alert.id, tenant_id=alert.tenant_id or "default")
         await self.session.merge(
             AlertRecord(
                 id=self._require("alert.id", alert.id),
@@ -1394,6 +1408,12 @@ class IncidentRepository:
             report_stmt.order_by(RcaReportRecord.updated_at.desc(), RcaReportRecord.created_at.desc()).limit(1)
         )
         report_record = report_result.scalar_one_or_none()
+        if incident_record.status in {"closed", "resolved"}:
+            administrative_report = await self.committed_non_execution_closure_report(
+                tenant_id=normalized_tenant_id, incident_id=incident_record.id,
+            )
+            if administrative_report is not None:
+                report_record = administrative_report
         if report_record is not None and isinstance(report_record.payload, dict):
             closure_report = report_record.payload
 
@@ -2357,7 +2377,9 @@ class IncidentRepository:
     async def save_incident(self, incident: Incident) -> None:
         incident_id = self._require("incident.id", incident.id)
         incoming_status = self._require("incident.status", incident.status.value)
-        existing = await self.session.get(IncidentRecord, incident_id)
+        existing = await self._require_write_scope(
+            IncidentRecord, incident_id, tenant_id=incident.tenant_id or "default",
+        )
         if (
             existing is not None
             and str(existing.status or "").strip().lower() in _CLOSED_INCIDENT_STATUSES
@@ -2404,6 +2426,27 @@ class IncidentRepository:
         for ownership in ownership_rows:
             ownership.lifecycle_state = incoming_status
             ownership.version = int(ownership.version or 1) + 1
+
+    async def committed_non_execution_closure_report(self, *, tenant_id: str, incident_id: UUID):
+        """Read the report named by the committed closure, without inventing execution."""
+        event = await self.session.scalar(select(IncidentEventRecord).where(
+            IncidentEventRecord.tenant_id == tenant_id,
+            IncidentEventRecord.incident_id == incident_id,
+            IncidentEventRecord.event_type == "incident.closure.completed",
+        ).order_by(IncidentEventRecord.created_at.desc(), IncidentEventRecord.id.desc()).limit(1))
+        payload = event.payload if event and isinstance(event.payload, dict) else {}
+        kind = payload.get("closure_kind")
+        if kind not in {"manual", "diagnostic"} or not payload.get("report_id"):
+            return None
+        try:
+            report_id = UUID(str(payload["report_id"]))
+        except (ValueError, TypeError):
+            return None
+        return await self.session.scalar(select(RcaReportRecord).where(
+            RcaReportRecord.id == report_id, RcaReportRecord.tenant_id == tenant_id,
+            RcaReportRecord.incident_id == incident_id, RcaReportRecord.closure_kind == kind,
+            RcaReportRecord.closure_status.in_(["closed", "validation_failed"]),
+        ))
 
     async def get_incident(self, incident_id: str, *, tenant_id: str | None = None) -> dict[str, Any] | None:
         incident_uuid = self._parse_uuid(incident_id)
@@ -2556,6 +2599,34 @@ class IncidentRepository:
             related.append(payload)
         return related
 
+    async def governed_recovery_recommendation_id(self, *, tenant_id: str, incident_id: UUID) -> UUID | None:
+        """The generation owning physical execution outranks background analysis."""
+        latest = (await self.session.execute(
+            select(ActionRecord.recommendation_id, ActionRecord.status)
+            .join(ExecutionPlanRecord, ExecutionPlanRecord.id == ActionRecord.resolution_plan_id)
+            .where(ActionRecord.tenant_id == tenant_id, ActionRecord.incident_id == incident_id,
+                   ExecutionPlanRecord.tenant_id == tenant_id,
+                   ExecutionPlanRecord.incident_id == incident_id,
+                   ExecutionPlanRecord.recommendation_id == ActionRecord.recommendation_id,
+                   ExecutionPlanRecord.fingerprint == ActionRecord.plan_fingerprint)
+            .order_by(ActionRecord.created_at.desc(), ActionRecord.updated_at.desc()).limit(1)
+        )).first()
+        if latest is not None:
+            return latest[0] if latest[1] in {
+                "pending", "policy_checked", "approved", "dispatching", "executor_accepted",
+                "running", "verifying", "succeeded",
+            } else None
+        current = await self.session.scalar(select(IncidentProjectionRecord.recommendation_id).where(
+            IncidentProjectionRecord.tenant_id == tenant_id, IncidentProjectionRecord.incident_id == incident_id,
+        ))
+        if current is None:
+            return None
+        return await self.session.scalar(select(ExecutionPlanRecord.recommendation_id).where(
+            ExecutionPlanRecord.tenant_id == tenant_id, ExecutionPlanRecord.incident_id == incident_id,
+            ExecutionPlanRecord.recommendation_id == current, ExecutionPlanRecord.execution_ready.is_(True),
+            ExecutionPlanRecord.resolution_selection_id.is_not(None),
+        ).order_by(ExecutionPlanRecord.created_at.desc()).limit(1))
+
     async def get_latest_recommendation_for_incident(
         self,
         incident_id: Any,
@@ -2565,6 +2636,12 @@ class IncidentRepository:
         incident_uuid = self._parse_uuid(incident_id)
         if incident_uuid is None:
             return None
+        if tenant_id is not None:
+            governed = await self.governed_recovery_recommendation_id(tenant_id=tenant_id, incident_id=incident_uuid)
+            if governed is not None:
+                audit = await self.session.get(AuditLogRecord, governed)
+                if audit is not None and audit.tenant_id == tenant_id:
+                    return audit.payload
         audit_stmt = (
             select(AuditLogRecord)
             .where(AuditLogRecord.resource_type == "incident")
@@ -2594,6 +2671,10 @@ class IncidentRepository:
         return None
 
     async def save_approval(self, approval: Approval) -> None:
+        await self._require_write_scope(
+            ApprovalRecord, approval.id, tenant_id=approval.tenant_id, incident_id=approval.incident_id,
+        )
+        await self._require_write_scope(IncidentRecord, approval.incident_id, tenant_id=approval.tenant_id)
         await self.session.merge(
             ApprovalRecord(
                 id=self._require("approval.id", approval.id),
@@ -2647,7 +2728,9 @@ class IncidentRepository:
         if approval_uuid is None or incident_uuid is None or recommendation_uuid is None:
             return False
         normalized_tenant = str(tenant_id or "").strip()
-        if not normalized_tenant or normalized_tenant.lower() == "default" or not plan_fingerprint:
+        from common.config import get_settings
+        if (not normalized_tenant or not plan_fingerprint
+                or (normalized_tenant.lower() == "default" and get_settings().auth_mode != "local")):
             return False
         result = await self.session.execute(
             select(ApprovalRecord)
@@ -2737,6 +2820,22 @@ class IncidentRepository:
         return updated
 
     async def save_action(self, action: RemediationAction) -> None:
+        tenant_id = action.tenant_id or "default"
+        existing_action = await self._require_write_scope(
+            ActionRecord, action.id, tenant_id=tenant_id, incident_id=action.incident_id,
+        )
+        if existing_action is not None and existing_action.approval_id is not None:
+            incoming_approval_id = self._parse_uuid(action.approval_id)
+            if incoming_approval_id != existing_action.approval_id:
+                incoming = await self.session.get(ApprovalRecord, incoming_approval_id) if incoming_approval_id else None
+                previous = await self.session.get(ApprovalRecord, existing_action.approval_id)
+                if (incoming is None or previous is None or incoming.tenant_id != tenant_id
+                        or incoming.incident_id != action.incident_id
+                        or incoming.decision != "approved"
+                        or incoming.created_at.replace(tzinfo=UTC) <= previous.created_at.replace(tzinfo=UTC)):
+                    raise ValueError("Action write belongs to a superseded or unpersisted approval")
+        await self._require_write_scope(IncidentRecord, action.incident_id, tenant_id=tenant_id)
+        await self._require_write_scope(IncidentProjectionRecord, action.incident_id, tenant_id=tenant_id)
         action_status = self._require("action.status", action.status.value)
         parameters = action.parameters if isinstance(action.parameters, dict) else {}
         execution_plan = parameters.get("execution_plan") if isinstance(parameters.get("execution_plan"), dict) else {}
@@ -2807,10 +2906,18 @@ class IncidentRepository:
             projection = await self.session.get(IncidentProjectionRecord, action.incident_id)
             if (
                 projection is not None
+                and projection.tenant_id == tenant_id
                 and str(projection.status or "").strip().lower() not in _CLOSED_INCIDENT_STATUSES
             ):
                 now = utc_now()
                 projection.status = incident_status
+                if projection.tenant_id == action.tenant_id and recommendation_id and resolution_plan_id:
+                    governed = await self.session.get(ExecutionPlanRecord, resolution_plan_id)
+                    if (governed is not None and governed.tenant_id == action.tenant_id
+                            and governed.incident_id == action.incident_id
+                            and governed.recommendation_id == recommendation_id
+                            and governed.fingerprint == plan_fingerprint):
+                        projection.recommendation_id = recommendation_id
                 projection.latest_event_type = "incident.remediation.status"
                 projection.latest_event_at = now
                 projection.updated_at = now
@@ -2836,6 +2943,14 @@ class IncidentRepository:
         normalized_event_id = self._require("outbox.event_id", event_id)
         if await self.session.get(ResolutionOutboxRecord, normalized_event_id) is not None:
             return False
+        from common.config import get_settings
+        from common.outbox_context import compact_context
+
+        if get_settings().outbox_snapshot_references_enabled:
+            payload = await compact_context(
+                self.session, payload=payload, tenant_id=tenant_id or "default",
+                aggregate_id=aggregate_id, topic=topic,
+            )
         self.session.add(
             ResolutionOutboxRecord(
                 event_id=normalized_event_id,
@@ -2881,6 +2996,9 @@ class IncidentRepository:
             return None
         if await self.get_analysis_request(request_id, tenant_id=tenant_id) is not None:
             return None  # Explicit operator requests always receive their own result.
+        governed = await self.governed_recovery_recommendation_id(tenant_id=tenant_id, incident_id=incident_id)
+        if governed is not None:
+            return f"governed-recovery:{governed}"
         previous = await self.session.get(ContextSnapshotRecord, snapshot_id)
         if (previous is None or previous.tenant_id != tenant_id
                 or previous.incident_id != str(incident_id) or previous.snapshot_stage != "enriched"
@@ -2904,7 +3022,16 @@ class IncidentRepository:
         metadata = (latest.payload or {}).get("metadata") or {}
         digest = str(metadata.get("evidence_set_digest") or "")
         successor = await self.session.get(ResolutionOutboxRecord, f"context-enriched:{incident_id}:{digest}")
-        successor_context = ((successor.payload or {}).get("context") or {}) if successor else {}
+        if (successor is None or successor.tenant_id != tenant_id
+                or successor.aggregate_id != str(incident_id) or successor.topic != "context-events"
+                or successor.status not in {"pending", "retry", "published"}):
+            return None
+        from common.outbox_context import hydrate_context
+        try:
+            successor_payload = await hydrate_context(self.session, successor)
+        except (ValueError, TypeError):
+            return None  # Unverifiable coverage must never retire older work.
+        successor_context = successor_payload.get("context") or {}
         successor_metadata = successor_context.get("metadata") or {}
         if (successor is None or successor.tenant_id != tenant_id
                 or successor.aggregate_id != str(incident_id) or successor.topic != "context-events"
@@ -4124,11 +4251,14 @@ class IncidentRepository:
         ).scalar_one_or_none()
         if row is None or row.recommendation_id is None:
             return None
+        governed = await self.governed_recovery_recommendation_id(
+            tenant_id=tenant_id, incident_id=incident_uuid,
+        )
         return {
             "tenant_id": row.tenant_id,
             "incident_id": str(row.incident_id),
             "alert_id": str(row.alert_id),
-            "recommendation_id": str(row.recommendation_id),
+            "recommendation_id": str(governed or row.recommendation_id),
         }
 
     @staticmethod
@@ -4915,6 +5045,19 @@ class IncidentRepository:
             or validated.resolution_selection_id != selection.selection_id
         ):
             raise ValueError("compiled execution plan does not match its resolution selection")
+        prior = await self.session.get(ExecutionPlanRecord, validated.plan_id)
+        if prior is not None:
+            if (prior.tenant_id != selection.tenant_id
+                    or prior.resolution_selection_id != selection.selection_id):
+                raise ValueError("execution plan identity belongs to another selection")
+            binding = await self.session.get(IncidentInvestigationBindingRecord, selection.recommendation_id)
+            if binding is not None:
+                binding.resolution_plan_id = prior.id
+                binding.plan_fingerprint = prior.fingerprint
+            await self.session.flush()
+            # Redelivery must reuse the reviewed immutable plan, including its
+            # original observation times and fingerprint.
+            return ExecutionPlanV2.model_validate(prior.plan_payload).model_dump(mode="json")
         existing = (await self.session.execute(select(ExecutionPlanRecord).where(
             ExecutionPlanRecord.tenant_id == selection.tenant_id,
             ExecutionPlanRecord.fingerprint == validated.plan_fingerprint,
@@ -4949,6 +5092,10 @@ class IncidentRepository:
             projection_payload["resolution_selection"] = row.payload
             projection_payload["execution_plan"] = payload
             projection.projection_payload = projection_payload
+        binding = await self.session.get(IncidentInvestigationBindingRecord, selection.recommendation_id)
+        if binding is not None:
+            binding.resolution_plan_id = validated.plan_id
+            binding.plan_fingerprint = validated.plan_fingerprint
         self.session.add(AuditLogRecord(
             tenant_id=selection.tenant_id, actor=selection.selected_by,
             action="resolution.plan.compiled", resource_type="execution_plan",
@@ -5476,6 +5623,10 @@ class IncidentRepository:
                 payload=application.model_dump(mode="json"),
             )
         )
+        from common.diagnostic_runbooks import ensure_diagnostic_runbook
+        await ensure_diagnostic_runbook(self.session, tenant_id=application.tenant_id,
+            application=application.name, service=application.name, environment=application.environment,
+            owner=application.owner_team)
         await self.session.execute(delete(ApplicationEnvironmentRecord).where(ApplicationEnvironmentRecord.application_id == application.id))
         await self.session.execute(delete(ApplicationLabelRecord).where(ApplicationLabelRecord.application_id == application.id))
         self.session.add(
@@ -6264,6 +6415,13 @@ class IncidentRepository:
             )
         )
 
+        scoped_environment = str(environment or project_payload.get("environment") or "").strip()
+        if scoped_environment:
+            from common.diagnostic_runbooks import ensure_diagnostic_runbook
+            await ensure_diagnostic_runbook(self.session, tenant_id=tenant_id,
+                application=project_name, service=project_name, environment=scoped_environment,
+                owner=owner_team or "unassigned")
+
     async def list_onboarding_state(self, tenant_id: str = "default") -> list[dict[str, Any]]:
         result = await self.session.execute(
             select(
@@ -6539,6 +6697,23 @@ class IncidentRepository:
             return None
 
     async def _upsert_projection_from_record(self, event_record: IncidentEventRecord) -> None:
+        if event_record.event_type == "incident.recommendation.generated":
+            candidate = self._parse_uuid((event_record.payload or {}).get("recommendation_id"))
+            protected = await self.governed_recovery_recommendation_id(
+                tenant_id=event_record.tenant_id, incident_id=event_record.incident_id,
+            )
+            if protected and candidate != protected:
+                request_id = self._parse_uuid((event_record.payload or {}).get("analysis_request_id"))
+                explicit = await self.session.get(AnalysisRequestRecord, request_id) if request_id else None
+                owned_action = await self.session.scalar(select(ActionRecord.id).where(
+                    ActionRecord.tenant_id == event_record.tenant_id,
+                    ActionRecord.incident_id == event_record.incident_id,
+                    ActionRecord.recommendation_id == protected,
+                ).limit(1))
+                if explicit is None or owned_action is not None:
+                    # Retain the candidate event/audit for investigation history;
+                    # physical execution and recovery keep their reviewed binding.
+                    return
         result = await self.session.execute(
             select(IncidentProjectionRecord).where(IncidentProjectionRecord.incident_id == event_record.incident_id)
         )
@@ -7004,6 +7179,8 @@ class IncidentRepository:
             (owner.canonical_incident_id.in_(waiting_incidents), "waiting_for_human"),
             (owner.canonical_incident_id.in_(blocked_incidents), "collection_blocked"),
             (owner.canonical_incident_id.in_(unresolved_incidents), "requirements_identified"),
+            (and_(lifecycle == "detected", legacy_status == "investigating",
+                  owner.canonical_incident_id.notin_(tuple(binding_versions))), lifecycle),
             else_=legacy_status,
         )
         incident_score = case(
@@ -7833,6 +8010,23 @@ class IncidentRepository:
                 if row.alert_id is not None or canonical_alert_by_incident.get(row.incident_id) is not None
             }
             if source_alert_ids:
+                compact_labels_by_id: dict[UUID, dict[str, Any]] = {}
+                if not include_enrichment:
+                    # Keep the affected resource on compact lists without loading
+                    # full context/evidence JSON. Dropping labels made different
+                    # endpoint investigations appear to be duplicate alerts.
+                    identity_keys = ("operation", "http_route", "route", "method", "http_method",
+                                     "job", "instance", "mountpoint", "device", "monitoring_scope",
+                                     "synthetic", "event_mode", "event_authenticity")
+                    identity_result = await self.session.execute(select(
+                        AlertRecord.id,
+                        *[AlertRecord.payload["labels"][key].as_string().label(key) for key in identity_keys],
+                    ).where(AlertRecord.id.in_(source_alert_ids)))
+                    compact_labels_by_id = {
+                        values[0]: {key: value for key, value in zip(identity_keys, values[1:])
+                                    if value not in (None, "")}
+                        for values in identity_result.all()
+                    }
                 source_alert_stmt = select(AlertRecord).where(AlertRecord.id.in_(source_alert_ids))
                 if not include_enrichment:
                     source_alert_stmt = source_alert_stmt.options(load_only(
@@ -7845,7 +8039,8 @@ class IncidentRepository:
                     alert_payload = (
                         dict(alert_record.payload)
                         if include_enrichment and isinstance(alert_record.payload, dict)
-                        else {"project_id": alert_record.inbox_project} if not include_enrichment else {}
+                        else {"project_id": alert_record.inbox_project,
+                              "labels": compact_labels_by_id.get(alert_record.id, {})} if not include_enrichment else {}
                     )
                     alert_payload.setdefault("id", str(alert_record.id))
                     alert_payload.setdefault("source", alert_record.source)
@@ -8411,7 +8606,7 @@ class IncidentRepository:
                     }
                 response_context = {}
                 response_context_snapshot = None
-                response_source_alert = {}
+                response_source_alert = {"labels": source_labels} if source_labels else {}
                 response_recommendation = {}
 
             response_rows.append(
@@ -8450,6 +8645,7 @@ class IncidentRepository:
                     "jira_key": ticket_id or None,
                     "jira_url": jira_link,
                     "title": normalized_source_alert.get("name") or source_labels.get("alertname") or summary,
+                    "operation": source_labels.get("operation") or source_labels.get("http_route") or source_labels.get("route"),
                     "summary": summary,
                     "source": source_name,
                     "origin_system": origin_system,
@@ -9125,6 +9321,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
                         human.jira_sync_status = "superseded"
                         human.version += 1
             rows.append(existing)
+        for tenant, incident in {(row.tenant_id, row.incident_id) for row in rows}:
+            await self.retire_superseded_collection_jobs(tenant_id=tenant, incident_id=incident, limit=25)
         return rows
 
     async def reconcile_requirement_coverage_from_ledger(
@@ -9268,7 +9466,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
             recommendation = dict(audit.payload or {}) if audit and isinstance(audit.payload, dict) else {}
             metadata = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
             analysis = metadata.get("rca_analysis") if isinstance(metadata.get("rca_analysis"), dict) else {}
-            gaps = list(analysis.get("missing_evidence") or [])
+            from common.investigation_gaps import investigation_gaps
+            gaps = investigation_gaps(analysis, {})
             if not gaps:
                 continue
             context = dict(snapshot.payload or {}) if snapshot and isinstance(snapshot.payload, dict) else {}
@@ -9291,6 +9490,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
             candidates.append({
                 "incident_id": str(binding.incident_id), "rca_version": binding.rca_version,
                 "alert_id": str(binding.alert_id), "gaps": gaps, "context": context,
+                "reviewed_sources": dict((metadata.get("iterative_investigation") or {}).get("source_coverage") or {}),
                 "incident": dict(incident.payload or {}) if incident and isinstance(incident.payload, dict) else {},
                 "binding": {
                     "incident_id": str(binding.incident_id), "alert_id": str(binding.alert_id),
@@ -9306,12 +9506,15 @@ class ContextEnrichmentRepository(EvaluationRepository):
         return candidates
 
     async def list_context_enrichment_activity(
-        self, *, tenant_id: str, incident_id: UUID | str,
+        self, *, tenant_id: str, incident_id: UUID | str, requirement_ids: list[str] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """Return the durable machine and human work associated with a gap."""
         tenant = require_tenant_id(tenant_id, source="context enrichment activity")
         incident_uuid = self._to_uuid(incident_id)
         from sqlalchemy.orm import load_only
+        selected_ids = [self._to_uuid(value) for value in requirement_ids] if requirement_ids is not None else None
+        if selected_ids == []:
+            return {"jobs": [], "human_requests": []}
 
         # Activity summaries never use the potentially multi-megabyte query payload.
         # Keep immutable evidence in storage; fetch only fields rendered here.
@@ -9326,12 +9529,14 @@ class ContextEnrichmentRepository(EvaluationRepository):
             )).where(
                 ContextEnrichmentJobRecord.tenant_id == tenant,
                 ContextEnrichmentJobRecord.incident_id == incident_uuid,
+                ContextEnrichmentJobRecord.requirement_id.in_(selected_ids) if selected_ids is not None else True,
             ).order_by(ContextEnrichmentJobRecord.created_at.asc(), ContextEnrichmentJobRecord.job_id.asc())
         )).scalars().all()
         requests = (await self.session.execute(
             select(HumanEvidenceRequestRecord).where(
                 HumanEvidenceRequestRecord.tenant_id == tenant,
                 HumanEvidenceRequestRecord.incident_id == incident_uuid,
+                HumanEvidenceRequestRecord.requirement_id.in_(selected_ids) if selected_ids is not None else True,
             ).order_by(HumanEvidenceRequestRecord.created_at.asc(), HumanEvidenceRequestRecord.request_id.asc())
         )).scalars().all()
         return {
@@ -9371,6 +9576,16 @@ class ContextEnrichmentRepository(EvaluationRepository):
         ).order_by(ContextEnrichmentJobRecord.created_at.desc()).limit(1))
         if active_id is not None:
             return await self.session.get(ContextEnrichmentJobRecord, active_id)
+        priority = await self.session.scalar(select(AuditLogRecord.payload).where(
+            AuditLogRecord.tenant_id == tenant,
+            AuditLogRecord.resource_id == str(incident_id),
+            AuditLogRecord.action == "context.collection.prioritized",
+        ).order_by(AuditLogRecord.created_at.desc()).limit(1))
+        if isinstance(priority, dict):
+            priority_until = IncidentRepository._parse_datetime(priority.get("expires_at"))
+            if priority_until and priority_until.replace(tzinfo=UTC) > datetime.now(UTC):
+                query_payload = {**query_payload, "operator_priority": True,
+                                 "operator_priority_until": priority_until.replace(tzinfo=UTC).isoformat()}
         material = json.dumps({
             "tenant": tenant, "incident": str(incident_id), "requirement": str(requirement_id),
             "connector": connector_id, "query": query_payload,
@@ -9383,11 +9598,42 @@ class ContextEnrichmentRepository(EvaluationRepository):
         ))).scalar_one_or_none()
         if existing is not None:
             return existing
+        requirement = await self.session.get(ContextEvidenceRequirementRecord, self._to_uuid(requirement_id))
+        prior_attempts = 0
+        available_at = datetime.now(UTC)
+        if requirement is not None:
+            # A new RCA version must not reset the retry budget/backoff for
+            # the same source, question and historical observation window.
+            previous_requirement = aliased(ContextEvidenceRequirementRecord)
+            previous = (await self.session.execute(select(
+                ContextEnrichmentJobRecord.attempt_count, ContextEnrichmentJobRecord.available_at,
+            ).join(previous_requirement,
+                previous_requirement.requirement_id == ContextEnrichmentJobRecord.requirement_id,
+            ).where(
+                ContextEnrichmentJobRecord.tenant_id == tenant,
+                ContextEnrichmentJobRecord.incident_id == self._to_uuid(incident_id),
+                ContextEnrichmentJobRecord.connector_id == connector_id,
+                ContextEnrichmentJobRecord.observation_start == observation_start,
+                ContextEnrichmentJobRecord.observation_end == observation_end,
+                previous_requirement.tenant_id == tenant,
+                previous_requirement.requirement_key == requirement.requirement_key,
+                previous_requirement.rca_version < requirement.rca_version,
+                or_(ContextEnrichmentJobRecord.status.in_(["retry", "dead_letter"]), and_(
+                    ContextEnrichmentJobRecord.status == "cancelled",
+                    ContextEnrichmentJobRecord.last_error == "SUPERSEDED_EVIDENCE_REQUIREMENT")),
+            ).order_by(ContextEnrichmentJobRecord.attempt_count.desc()).limit(1))).first()
+            if previous:
+                prior_attempts = int(previous[0] or 0)
+                retry_at = previous[1]
+                if retry_at is not None:
+                    available_at = max(available_at, retry_at.replace(tzinfo=UTC) if retry_at.tzinfo is None else retry_at)
         row = ContextEnrichmentJobRecord(
             tenant_id=tenant, incident_id=self._to_uuid(incident_id),
             requirement_id=self._to_uuid(requirement_id), connector_id=self._require("connector_id", connector_id),
             idempotency_key=key, query_payload=dict(query_payload), observation_start=observation_start,
-            observation_end=observation_end, status="scheduled", attempt_count=0,
+            observation_end=observation_end, status="dead_letter" if prior_attempts >= MAX_COLLECTION_ATTEMPTS else "scheduled",
+            attempt_count=prior_attempts, available_at=available_at,
+            last_error="COLLECTION_RETRY_EXHAUSTED" if prior_attempts >= MAX_COLLECTION_ATTEMPTS else None,
         )
         try:
             async with self.session.begin_nested():
@@ -9397,7 +9643,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 ContextEvidenceRequirementRecord, self._to_uuid(requirement_id),
             )
             if requirement is not None and requirement.tenant_id == tenant:
-                requirement.status = "scheduled"
+                requirement.status = "blocked" if row.status == "dead_letter" else "scheduled"
                 requirement.retry_after = None
                 requirement.version = int(requirement.version or 0) + 1
             return row
@@ -9410,8 +9656,148 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 raise RuntimeError("concurrent enrichment job scheduling could not be resolved") from None
             return existing
 
+    async def prioritize_context_collection(self, *, tenant_id: str, incident_id: str,
+                                           actor: str, reason: str) -> dict[str, Any]:
+        tenant = require_tenant_id(tenant_id, source="collection priority")
+        incident_uuid = self._to_uuid(incident_id)
+        incident = await self.session.get(IncidentRecord, incident_uuid)
+        if incident is None or incident.tenant_id != tenant:
+            raise LookupError("Incident not found")
+        if incident.status in {"closed", "resolved", "cancelled", "canceled"}:
+            raise ValueError("Closed incident collection cannot be prioritized")
+        jobs = (await self.session.execute(select(ContextEnrichmentJobRecord).where(
+            ContextEnrichmentJobRecord.tenant_id == tenant,
+            ContextEnrichmentJobRecord.incident_id == incident_uuid,
+            ContextEnrichmentJobRecord.status.in_(["scheduled", "retry"]),
+        ).with_for_update())).scalars().all()
+        priority_until = (datetime.now(UTC) + timedelta(minutes=15)).isoformat()
+        for job in jobs:
+            job.query_payload = {**dict(job.query_payload or {}), "operator_priority": True,
+                                 "operator_priority_until": priority_until}
+        audit_id = uuid4()
+        self.session.add(AuditLogRecord(id=audit_id, tenant_id=tenant, actor=actor,
+            action="context.collection.prioritized", resource_type="incident", resource_id=str(incident_uuid),
+            payload={"reason": reason, "job_ids": [str(job.job_id) for job in jobs],
+                     "expires_at": priority_until}))
+        await self.session.flush()
+        return {"incident_id": str(incident_uuid), "jobs_prioritized": len(jobs), "audit_id": str(audit_id)}
+
+    async def retire_superseded_collection_jobs(
+        self, *, tenant_id: str, incident_id: UUID | str, limit: int = 500,
+    ) -> dict[str, Any]:
+        """Retire unleased work replaced by a committed RCA's requirements.
+
+        Keep every evidence observation and live collector. A newer binding
+        alone is insufficient: its requirement set must also be persisted.
+        """
+        tenant = require_tenant_id(tenant_id, source="superseded collection cleanup")
+        incident_uuid = self._to_uuid(incident_id)
+        latest_binding = await self.session.scalar(select(func.max(IncidentInvestigationBindingRecord.rca_version)).where(
+            IncidentInvestigationBindingRecord.tenant_id == tenant,
+            IncidentInvestigationBindingRecord.incident_id == incident_uuid,
+        ))
+        latest_requirements = await self.session.scalar(select(func.max(ContextEvidenceRequirementRecord.rca_version)).where(
+            ContextEvidenceRequirementRecord.tenant_id == tenant,
+            ContextEvidenceRequirementRecord.incident_id == incident_uuid,
+        ))
+        cutoff = min(int(latest_binding or 0), int(latest_requirements or 0))
+        if cutoff <= 1:
+            return {"jobs_retired": 0}
+        old_requirements = select(ContextEvidenceRequirementRecord.requirement_id).where(
+            ContextEvidenceRequirementRecord.tenant_id == tenant,
+            ContextEvidenceRequirementRecord.incident_id == incident_uuid,
+            ContextEvidenceRequirementRecord.rca_version < cutoff,
+        )
+        statement = select(ContextEnrichmentJobRecord).options(load_only(
+            ContextEnrichmentJobRecord.status, ContextEnrichmentJobRecord.last_error,
+            ContextEnrichmentJobRecord.lease_owner, ContextEnrichmentJobRecord.lease_expires_at,
+            ContextEnrichmentJobRecord.version,
+        )).where(
+            ContextEnrichmentJobRecord.tenant_id == tenant,
+            ContextEnrichmentJobRecord.incident_id == incident_uuid,
+            ContextEnrichmentJobRecord.requirement_id.in_(old_requirements),
+            ContextEnrichmentJobRecord.status.in_(["scheduled", "retry"]),
+        ).order_by(ContextEnrichmentJobRecord.job_id).limit(max(1, min(int(limit), 500)))
+        if self.session.bind and self.session.bind.dialect.name != "sqlite":
+            statement = statement.with_for_update(skip_locked=True)
+        rows = (await self.session.execute(statement)).scalars().all()
+        for row in rows:
+            row.status = "cancelled"
+            row.last_error = "SUPERSEDED_EVIDENCE_REQUIREMENT"
+            row.lease_owner = None
+            row.lease_expires_at = None
+            row.version = int(row.version or 0) + 1
+        if rows:
+            self.session.add(AuditLogRecord(
+                id=uuid4(), tenant_id=tenant, actor="context-scheduler",
+                action="context.collection.superseded_jobs_retired", resource_type="incident",
+                resource_id=str(incident_uuid), payload={"rca_version": cutoff,
+                    "job_ids": [str(row.job_id) for row in rows]},
+            ))
+            await self.session.flush()
+        return {"jobs_retired": len(rows), "rca_version": cutoff}
+
+    async def retire_closed_incident_collection_jobs(
+        self, *, tenant_id: str, actor: str, limit: int = 500, dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Retire obsolete work without deleting history or stealing a live lease."""
+        tenant = require_tenant_id(tenant_id, source="closed incident collection cleanup")
+        now = datetime.now(UTC)
+        # Read terminal identities separately: a locking EXISTS query can
+        # also lock incident rows owned by unrelated workflow transactions.
+        terminal_ids = list((await self.session.scalars(select(IncidentRecord.id).where(
+            IncidentRecord.tenant_id == tenant,
+            IncidentRecord.status.in_(["closed", "resolved", "cancelled", "canceled"]),
+        ))).all())
+        eligible = or_(
+            ContextEnrichmentJobRecord.status.in_(["scheduled", "retry"]),
+            and_(ContextEnrichmentJobRecord.status == "collecting", or_(
+                ContextEnrichmentJobRecord.lease_expires_at.is_(None),
+                ContextEnrichmentJobRecord.lease_expires_at < now)),
+        )
+        statement = select(ContextEnrichmentJobRecord).where(
+            ContextEnrichmentJobRecord.tenant_id == tenant, ContextEnrichmentJobRecord.incident_id.in_(terminal_ids), eligible,
+        ).order_by(ContextEnrichmentJobRecord.job_id).limit(max(1, min(int(limit), 500)))
+        if not dry_run and self.session.bind and self.session.bind.dialect.name != "sqlite":
+            statement = statement.with_for_update(skip_locked=True)
+        jobs = (await self.session.execute(statement)).scalars().all()
+        previous = [{"job_id": str(row.job_id), "status": row.status,
+                     "last_error": row.last_error, "lease_owner": row.lease_owner,
+                     "lease_expires_at": str(row.lease_expires_at) if row.lease_expires_at else None}
+                    for row in jobs]
+        if jobs and not dry_run:
+            for row in jobs:
+                row.status = "cancelled"
+                row.last_error = "INCIDENT_TERMINAL_COLLECTION_RETIRED"
+                row.lease_owner = None
+                row.lease_expires_at = None
+                row.version += 1
+            # Keep the requirement state consistent with its retired jobs, but
+            # do not cancel a requirement still owned by a live collector.
+            retired_requirements = []
+            for requirement_id in {row.requirement_id for row in jobs}:
+                pending = await self.session.scalar(select(ContextEnrichmentJobRecord.job_id).where(
+                    ContextEnrichmentJobRecord.requirement_id == requirement_id,
+                    ContextEnrichmentJobRecord.tenant_id == tenant,
+                    ContextEnrichmentJobRecord.status.in_(["scheduled", "retry", "collecting"]),
+                    ContextEnrichmentJobRecord.job_id.notin_([row.job_id for row in jobs]),
+                ).limit(1))
+                requirement = await self.session.get(ContextEvidenceRequirementRecord, requirement_id)
+                if pending is None and requirement is not None and requirement.tenant_id == tenant and requirement.incident_id in {job.incident_id for job in jobs if job.requirement_id == requirement_id} and requirement.status in {"identified", "scheduled", "collecting", "blocked"}:
+                    retired_requirements.append({"requirement_id": str(requirement_id), "status": requirement.status})
+                    requirement.status = "cancelled"
+                    requirement.retry_after = None
+                    requirement.version += 1
+            self.session.add(AuditLogRecord(id=uuid4(), tenant_id=tenant, actor=actor,
+                action="context.collection.terminal_jobs_retired", resource_type="tenant",
+                resource_id=tenant, payload={"reason": "Incident is terminal; collection is no longer actionable.",
+                                            "jobs": previous, "requirements": retired_requirements}))
+            await self.session.flush()
+        return {"tenant_id": tenant, "jobs_retired": len(jobs) if not dry_run else 0,
+                "eligible_jobs": len(jobs), "dry_run": dry_run}
+
     async def claim_context_enrichment_jobs(
-        self, *, worker_id: str, limit: int = 10, lease_seconds: int = 120,
+        self, *, worker_id: str, limit: int = 10, lease_seconds: int = 120, lane: str | None = None,
     ) -> list[dict[str, Any]]:
         """Lease due jobs for one worker using row locks across replicas."""
         now = datetime.now(UTC)
@@ -9419,15 +9805,22 @@ class ContextEnrichmentRepository(EvaluationRepository):
         bounded_limit = max(1, min(limit, 50))
         expired = and_(
             ContextEnrichmentJobRecord.status == "collecting",
+            ContextEnrichmentJobRecord.attempt_count < MAX_COLLECTION_ATTEMPTS,
             or_(ContextEnrichmentJobRecord.lease_expires_at.is_(None),
                 ContextEnrichmentJobRecord.lease_expires_at < now),
         )
         due = and_(ContextEnrichmentJobRecord.status.in_(["scheduled", "retry"]),
+                   ContextEnrichmentJobRecord.attempt_count < MAX_COLLECTION_ATTEMPTS,
                    ContextEnrichmentJobRecord.available_at <= now)
         rows = []
+        active_incident = ~exists(select(IncidentRecord.id).where(
+            IncidentRecord.id == ContextEnrichmentJobRecord.incident_id,
+            IncidentRecord.tenant_id == ContextEnrichmentJobRecord.tenant_id,
+            IncidentRecord.status.in_(["closed", "resolved", "cancelled", "canceled"]),
+        ))
 
         async def take(predicate, count):
-            statement = select(ContextEnrichmentJobRecord).where(predicate)
+            statement = select(ContextEnrichmentJobRecord).where(predicate, active_incident)
             if rows:
                 statement = statement.where(ContextEnrichmentJobRecord.job_id.notin_([row.job_id for row in rows]))
             statement = statement.order_by(ContextEnrichmentJobRecord.available_at.asc(),
@@ -9436,13 +9829,51 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 statement = statement.with_for_update(skip_locked=True)
             rows.extend((await self.session.execute(statement)).scalars().all())
 
+        async def take_fair(count):
+            history = aliased(ContextEnrichmentJobRecord)
+            last_served = select(func.max(history.updated_at)).where(
+                history.tenant_id == ContextEnrichmentJobRecord.tenant_id,
+                history.incident_id == ContextEnrichmentJobRecord.incident_id,
+                history.attempt_count > 0,
+            ).correlate(ContextEnrichmentJobRecord).scalar_subquery()
+            candidates = select(ContextEnrichmentJobRecord.tenant_id, ContextEnrichmentJobRecord.incident_id).where(
+                or_(due, expired), active_incident,
+            ).group_by(ContextEnrichmentJobRecord.tenant_id, ContextEnrichmentJobRecord.incident_id).order_by(
+                func.coalesce(last_served, datetime(1970, 1, 1)),
+                func.min(ContextEnrichmentJobRecord.available_at),
+                ContextEnrichmentJobRecord.tenant_id, ContextEnrichmentJobRecord.incident_id,
+            ).limit(max(16, count * 4))
+            for tenant_id, incident_id in (await self.session.execute(candidates)).all():
+                if count <= 0:
+                    break
+                before = len(rows)
+                await take(and_(or_(due, expired), ContextEnrichmentJobRecord.tenant_id == tenant_id,
+                                ContextEnrichmentJobRecord.incident_id == incident_id), 1)
+                count -= len(rows) - before
+
+        if lane is not None:
+            predicates = {
+                "recovery": expired,
+                "retry": and_(due, ContextEnrichmentJobRecord.status == "retry"),
+                "priority": and_(due, ContextEnrichmentJobRecord.query_payload["operator_priority"].as_boolean().is_(True),
+                    ContextEnrichmentJobRecord.query_payload["operator_priority_until"].as_string() > now.isoformat()),
+            }
+            if lane not in {*predicates, "fair"}:
+                raise ValueError("Unknown evidence collection lane")
+            if lane in predicates:
+                await take(predicates[lane], 1)
+            if len(rows) < bounded_limit:
+                await take_fair(bounded_limit - len(rows))
+
         # Reserve recovery, retry and new-work capacity. Remaining slots use
         # oldest-due order, preventing a continuous arrival stream starving
         # retries or leases abandoned by a crashed worker.
-        if bounded_limit >= 3:
+        if lane is None and bounded_limit >= 3:
             await take(expired, 1)
             await take(and_(due, ContextEnrichmentJobRecord.status == "retry"), 1)
             await take(and_(due, ContextEnrichmentJobRecord.status == "scheduled"), 1)
+        if len(rows) < bounded_limit:
+            await take_fair(bounded_limit - len(rows))
         if len(rows) < bounded_limit:
             await take(or_(due, expired), bounded_limit - len(rows))
         result = []
@@ -9677,10 +10108,15 @@ class ContextEnrichmentRepository(EvaluationRepository):
             ).limit(1)
         )
         snapshot = await self.session.get(ContextSnapshotRecord, snapshot_id) if snapshot_id else None
+        governed_recommendation = await IncidentRepository(self.session).governed_recovery_recommendation_id(
+            tenant_id=tenant, incident_id=incident_uuid,
+        )
         binding_id = await self.session.scalar(
             select(IncidentInvestigationBindingRecord.binding_id).where(
                 IncidentInvestigationBindingRecord.tenant_id == tenant,
                 IncidentInvestigationBindingRecord.incident_id == incident_uuid,
+                (IncidentInvestigationBindingRecord.recommendation_id == governed_recommendation)
+                if governed_recommendation else literal(True),
             ).order_by(
                 IncidentInvestigationBindingRecord.rca_version.desc(),
                 IncidentInvestigationBindingRecord.created_at.desc(),
@@ -9828,7 +10264,14 @@ class ContextEnrichmentRepository(EvaluationRepository):
                         and observed_report.validation_checksum == assessed.get("validation_checksum")
                         and (observed_report.payload or {}).get("metadata", {}).get("assessment_id") == str(assessment_id)):
                     report = observed_report
+        if incident and incident.status in {"closed", "resolved"}:
+            administrative_report = await IncidentRepository(self.session).committed_non_execution_closure_report(
+                tenant_id=tenant, incident_id=incident_uuid,
+            )
+            if administrative_report is not None:
+                report = administrative_report
         report_payload = dict(report.payload or {}) if report and isinstance(report.payload, dict) else {}
+        recovery_observation = await self.session.get(AuditLogRecord, observation_id(tenant, incident_uuid))
         report_metadata = report_payload.get("metadata") if isinstance(report_payload.get("metadata"), dict) else {}
         pre_state_observations = (
             report_metadata.get("pre_state_validation_observations")
@@ -9849,8 +10292,15 @@ class ContextEnrichmentRepository(EvaluationRepository):
         requirements = await self.list_context_evidence_requirements(
             tenant_id=tenant, incident_id=incident_uuid,
         )
+        current_rca_version = binding.rca_version if binding else max(
+            (int(row["rca_version"]) for row in requirements), default=0,
+        )
+        # Historical requirements remain available for audit. Their activity is
+        # not rendered by this projection and must not slow every workspace read.
         activity = await self.list_context_enrichment_activity(
             tenant_id=tenant, incident_id=incident_uuid,
+            requirement_ids=[row["requirement_id"] for row in requirements
+                             if int(row["rca_version"]) == current_rca_version],
         )
         jobs_by_requirement: dict[str, dict[str, Any]] = {}
         for job in activity["jobs"]:
@@ -9865,9 +10315,6 @@ class ContextEnrichmentRepository(EvaluationRepository):
             if str(request["status"]).lower() in active_human_statuses:
                 human_by_requirement[key] = request
 
-        current_rca_version = binding.rca_version if binding else max(
-            (int(row["rca_version"]) for row in requirements), default=0,
-        )
         active_requirements = [row for row in requirements if int(row["rca_version"]) == current_rca_version]
         requirement_projection = [{
             **row,
@@ -9984,10 +10431,24 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     },
                 }.get(persisted_state, next_action)
 
+        collection_counts = {state: sum(str(job.get("status")).lower() == state for job in active_jobs)
+                             for state in ("scheduled", "retry", "collecting", "dead_letter")}
+        collection_phase = ("collecting" if collection_counts["collecting"] else
+                            "queued" if collection_counts["scheduled"] else
+                            "retry_wait" if collection_counts["retry"] else
+                            "blocked" if unresolved else "complete")
+        if lifecycle_state == "COLLECTING":
+            next_action = {"type": "AUTONOMOUS_COLLECTION", "message": (
+                f"Evidence jobs: {collection_counts['collecting']} collecting, "
+                f"{collection_counts['scheduled']} queued, {collection_counts['retry']} waiting to retry."
+            )}
+        recorded_status = str(incident.status if incident is not None else "").upper()
+        if recorded_status in {"CLOSED", "RESOLVED", "CANCELLED"}:
+            lifecycle_state = recorded_status
         if lifecycle_state in {"CLOSED", "RESOLVED", "CANCELLED"}:
             next_action = {"type": "REVIEW_CLOSURE", "message": "Review the recorded closure and its evidence. Earlier investigation tasks are historical."}
 
-        rca_ready = lifecycle_state == "RCA_READY" and bool(quality.get("passed"))
+        rca_ready = bool(binding and str(binding.status).lower() in {"grounded", "ready", "conclusive"}) and bool(quality.get("passed"))
         governed_plan_ready = bool(
             governed_plan.get("execution_ready") is True
             and governed_plan.get("mutating") is True
@@ -10054,6 +10515,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
             "source_id": row.source_id,
             "connector": row.connector,
             "citation": row.source_reference,
+            "summary": str((row.content or {}).get("message") or (row.content or {}).get("summary") or "")[:1600],
             "freshness": row.freshness,
             "observed_at": row.observed_at,
             "collected_at": row.collected_at,
@@ -10103,6 +10565,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                         or item.get("uri") or item.get("source_uri") or ""
                     ),
                     "freshness": str(item.get("freshness") or "snapshot"),
+                    "summary": str(item.get("summary") or item.get("message") or item.get("snippet") or "")[:1600],
                     "observed_at": item.get("observed_at") or item.get("timestamp"),
                     "collected_at": item.get("collected_at") or workspace_snapshot.collected_at,
                     # Same field-name mismatch as above: these same five
@@ -10237,9 +10700,11 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 "approval_id": str(action.approval_id) if action and action.approval_id else None,
                 "updated_at": action.updated_at if action else None,
             },
+            "recovery_observation": project_observation(recovery_observation.payload if recovery_observation else None),
             "validation": {
                 "report_id": str(report.id) if report else None,
-                "status": str(report.closure_status).lower() if report and report.closure_status else "not_started",
+                "status": "closed" if report and report.closure_kind == "manual" and incident and incident.status in {"closed", "resolved"}
+                else str(report.closure_status).lower() if report and report.closure_status else "not_started",
                 "closure_kind": report.closure_kind if report else None,
                 "validation_checksum": report.validation_checksum if report else None,
                 "action_id": str(report.remediation_action_id) if report and report.remediation_action_id else None,
@@ -10258,6 +10723,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 "updated_at": report.updated_at if report else None,
             },
             "next_action": next_action,
+            "collection": {"phase": collection_phase, **collection_counts,
+                           "rca_version": current_rca_version},
             "investigation_workspace": {
                 "schema_version": "kaiops.investigation-workspace.v1",
                 "binding": {
@@ -10287,7 +10754,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     "grounded": grounded,
                     "hypothesis": hypothesis or None,
                     "supporting_signals": list(analysis.get("supporting_signals") or []),
-                    "causal_chain": list(analysis.get("causal_chain") or []),
+                    "causal_chain": causal_steps(analysis.get("causal_chain")),
+                    "timeline": build_rca_timeline(analysis.get("event_sequence"), workspace_evidence, accepted_evidence_ids),
                     "grounding_notes": str(analysis.get("grounding_notes") or ""),
                     "contradictions": list(analysis.get("contradictions") or []),
                     "alternative_causes": list(analysis.get("alternative_causes") or []),
@@ -10310,6 +10778,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                 },
                 "requirements": requirement_projection,
                 "resolution": {
+                    "proposed_remedy": str(recommendation_payload.get("recommended_action") or recommendation_payload.get("action") or ""),
                     "status": "ready" if resolution_ready and grounded else "blocked",
                     "recommendation_id": str(binding.recommendation_id) if binding else None,
                     "plan_id": str(binding.resolution_plan_id) if binding and binding.resolution_plan_id else None,
@@ -10596,10 +11065,38 @@ class ContextEnrichmentRepository(EvaluationRepository):
         expected_responder: str | None, due_at: datetime, acceptable_format: str,
         evidence_already_checked: list[str], hypothesis_impact: str,
         investigation_can_continue: bool = True, assignment_source: str | None = None,
-        assignment_failure_reason: str | None = None,
-    ) -> HumanEvidenceRequestRecord:
+        assignment_failure_reason: str | None = None, automatic_fallback: bool = False,
+    ) -> HumanEvidenceRequestRecord | None:
         tenant = require_tenant_id(tenant_id, source="human evidence request")
         requirement_uuid = self._to_uuid(requirement_id)
+        if automatic_fallback:
+            requirement = await self.session.get(ContextEvidenceRequirementRecord, requirement_uuid)
+            if requirement is None or requirement.tenant_id != tenant or requirement.incident_id != self._to_uuid(incident_id):
+                raise ValueError("evidence requirement binding mismatch")
+            if requirement.category not in {"ownership", "business_impact"}:
+                # Failed automation is a collection problem, not a mandatory human questionnaire.
+                # Keep every gap unsatisfied and preserve any submitted evidence.
+                if requirement.status not in {"collected", "answered", "satisfied", "cancelled"}:
+                    requests = (await self.session.scalars(select(HumanEvidenceRequestRecord).where(
+                        HumanEvidenceRequestRecord.tenant_id == tenant,
+                        HumanEvidenceRequestRecord.requirement_id == requirement_uuid,
+                        HumanEvidenceRequestRecord.status.in_(["pending", "assignment_blocked"]),
+                    ))).all()
+                    if requirement.status == "blocked" and not requests:
+                        return None
+                    requirement.status = "blocked"
+                    requirement.assigned_to = None
+                    requirement.version = int(requirement.version or 0) + 1
+                    for request in requests:
+                        request.status = "cancelled"
+                        request.assignment_failure_reason = "TECHNICAL_COLLECTION_REQUIRES_SOURCE"
+                        request.version = int(request.version or 0) + 1
+                    self.session.add(AuditLogRecord(id=uuid4(), tenant_id=tenant, actor="evidence-routing",
+                        action="context.technical_collection.blocked", resource_type="evidence_requirement",
+                        resource_id=str(requirement_uuid), payload={"category": requirement.category,
+                            "reason": "Configured technical source or collector repair required", "evidence_satisfied": False}))
+                    await self.session.flush()
+                return None
         existing = (await self.session.execute(select(HumanEvidenceRequestRecord).where(
             HumanEvidenceRequestRecord.tenant_id == tenant,
             HumanEvidenceRequestRecord.requirement_id == requirement_uuid,

@@ -377,6 +377,7 @@ def register_learned_runbooks(
             "validation": validation,
             "rollback": rollback,
             "source": "tenant-learned-resolution-catalog",
+            "service_scope": scopes,
             "runbook_id": str(record["runbook_id"]),
             "runbook_version": int(record["version"]),
             "success_count": successes,

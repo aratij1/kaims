@@ -20,3 +20,10 @@
 :root[data-ui-theme="dark"] .knowledge-document-reader>header { border-color:#304760;background:linear-gradient(120deg,#122137,#172e4a); }
 :root[data-ui-theme="dark"] .knowledge-document-reader h3,:root[data-ui-theme="dark"] .knowledge-document-body pre { color:#e6eef9; }
 :root[data-ui-theme="dark"] .knowledge-document-reader>footer { border-color:#304760;background:#0d1929; }
+.knowledge-document-dialog { width:min(1000px,calc(100vw - 32px));max-width:calc(100vw - 32px);max-height:calc(100dvh - 32px);padding:0;border:0;border-radius:16px;overflow:auto;color:inherit;background:var(--surface,#fff); }
+.knowledge-document-dialog::backdrop { background:rgba(9,24,45,.58); }
+.knowledge-document-dialog>.knowledge-document-reader { display:flex;flex-direction:column;max-height:calc(100dvh - 32px);margin:0; }
+.knowledge-document-dialog .knowledge-document-body { flex:1;min-height:0;max-height:none;overflow:auto; }
+.knowledge-document-dialog .knowledge-document-reader>header,.knowledge-document-dialog .knowledge-document-reader>footer { flex-shrink:0; }
+.knowledge-document-dialog h3,.knowledge-document-dialog header p { overflow-wrap:anywhere; }
+.knowledge-document-dialog code { white-space:normal; }

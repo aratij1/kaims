@@ -7,7 +7,7 @@ export type EvidenceGap = { category: string; reason?: string };
 type Job = { connector_id: string; status: string; attempt?: number; attempt_count?: number; last_error_code?: string | null; last_error?: string | null };
 type HumanRequest = { request_id: string; expected_responder?: string | null; due_at?: string | null; status: string; assignment_failure_reason?: string | null };
 type Requirement = { requirement_id: string; rca_version?: number | null; category: string; question: string; reason?: string | null; acceptable_format?: string | null; suggested_source_reference?: string | null; status: string; created_at?: string | null; updated_at?: string | null; evidence_ids?: string[]; latest_job?: Job | null; active_human_request?: HumanRequest | null };
-type OperationsState = {
+export type OperationsState = {
   schema_version: "kaiops.operations-state.v1"; lifecycle_state: string; updated_at?: string | null;
   context?: { snapshot_id?: string | null; version?: number; evidence_ids?: string[] };
   investigation?: { rca_version?: number; snapshot_id?: string | null };
@@ -24,8 +24,10 @@ const TERMINAL_STATES = new Set(["CLOSED"]);
 
 function requirementStatus(item: Requirement) {
   if (["collected", "answered", "satisfied"].includes(item.status.toLowerCase())) return item.status;
+  if (item.status === "blocked" && !["pending", "assignment_blocked"].includes(item.active_human_request?.status || "")) return "collection needs attention";
   if (item.active_human_request?.status === "pending" || item.status === "human_requested") return "waiting for human evidence";
-  return (item.active_human_request?.status || item.status || item.latest_job?.status || "unknown").replaceAll("_", " ");
+  if (item.latest_job?.status === "dead_letter") return "collection failed";
+  return (item.latest_job?.status || item.status || "unknown").replaceAll("_", " ");
 }
 
 
@@ -55,9 +57,9 @@ function actionableFailure(item: Requirement) {
   return "";
 }
 
-export type ContextEnrichmentPanelProps = { incidentId: string; alertId?: string; accessToken: string; declaredGaps: EvidenceGap[]; proposedRcaDraft?: string; reviewRequestToken?: number; onIncidentRefresh: () => Promise<void> };
+export type ContextEnrichmentPanelProps = { incidentId: string; alertId?: string; accessToken: string; declaredGaps: EvidenceGap[]; proposedRcaDraft?: string; reviewRequestToken?: number; onIncidentRefresh: () => Promise<void>; operationsState?: OperationsState };
 
-export default function ContextEnrichmentPanel({ incidentId, alertId, accessToken, declaredGaps, proposedRcaDraft = "", reviewRequestToken = 0, onIncidentRefresh }: ContextEnrichmentPanelProps) {
+export default function ContextEnrichmentPanel({ incidentId, alertId, accessToken, declaredGaps, proposedRcaDraft = "", reviewRequestToken = 0, onIncidentRefresh, operationsState }: ContextEnrichmentPanelProps) {
   const [state, setState] = useState<OperationsState | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -66,6 +68,9 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   const [expandedRequirements, setExpandedRequirements] = useState<Set<string>>(new Set());
   const [activeRequirementId, setActiveRequirementId] = useState("");
   const [announcement, setAnnouncement] = useState("");
+  const [workFilter, setWorkFilter] = useState<"all" | "attention" | "running" | "complete">("all");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyLimit, setHistoryLimit] = useState(20);
   const inFlight = useRef(false);
   const previousState = useRef("");
   const previousProjection = useRef("");
@@ -74,12 +79,20 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   const panelRef = useRef<HTMLElement | null>(null);
   const refreshButtonRef = useRef<HTMLButtonElement | null>(null);
   const handledReviewRequest = useRef(0);
+  const reviewFocusPending = useRef(false);
+  const focusedReviewInput = useRef<HTMLTextAreaElement | null>(null);
   const headers = useMemo(() => ({ Authorization: `Bearer ${accessToken}` }), [accessToken]);
 
   useEffect(() => { incidentRefresh.current = onIncidentRefresh; }, [onIncidentRefresh]);
 
   const load = useCallback(async (manual = false) => {
     if (!incidentId || !accessToken || inFlight.current) return;
+    // Embedded mode shares the parent's verified command generation. A local
+    // operations-only refresh would put this panel ahead of the other tabs.
+    if (operationsState) {
+      if (manual) await incidentRefresh.current();
+      return;
+    }
     inFlight.current = true;
     if (manual) setLoading(true);
     try {
@@ -100,9 +113,13 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
       previousProjection.current = projectionIdentity;
     } catch (reason) { failureCount.current += 1; setError(friendlyFailure(reason)); }
     finally { inFlight.current = false; setLoading(false); }
-  }, [accessToken, headers, incidentId]);
+  }, [accessToken, headers, incidentId, operationsState]);
 
   useEffect(() => {
+    if (operationsState) {
+      setState(operationsState);
+      return;
+    }
     let cancelled = false; let timer: number | undefined;
     previousState.current = ""; previousProjection.current = ""; failureCount.current = 0;
     const poll = async () => {
@@ -115,7 +132,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
     const resume = () => { if (!document.hidden && !inFlight.current) void load(false); };
     document.addEventListener("visibilitychange", resume);
     return () => { cancelled = true; if (timer) window.clearTimeout(timer); document.removeEventListener("visibilitychange", resume); };
-  }, [incidentId, load]);
+  }, [incidentId, load, operationsState]);
 
   const submit = async (requirementId: string) => {
     const response = String(answers[requirementId] || "").trim();
@@ -132,9 +149,28 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
     } catch (reason) { setError(friendlyFailure(reason)); setLoading(false); }
   };
 
-  const current = state?.requirements || [];
-  const history = state?.requirement_history || [];
   const rcaVersion = state?.investigation?.rca_version || 0;
+  const current = useMemo(() => (state?.requirements || []).filter(item => item.status !== "cancelled"
+    && (!rcaVersion || item.rca_version == null || item.rca_version === rcaVersion)), [state?.requirements, rcaVersion]);
+  const history = [...new Map([...(state?.requirement_history || []), ...(state?.requirements || []).filter(item =>
+    rcaVersion && item.rca_version != null && item.rca_version !== rcaVersion,
+  )].map(item => [item.requirement_id, item])).values()];
+  const workGroup = (item: Requirement) => ["collected", "answered", "satisfied", "cancelled"].includes(item.status.toLowerCase()) ? "complete"
+    : ["human_requested", "assignment_blocked", "blocked"].includes(item.status) || item.latest_job?.status === "dead_letter" || item.active_human_request?.status === "pending" ? "attention" : "running";
+  const visibleWork = current.filter((item) => workFilter === "all" || workGroup(item) === workFilter);
+  const selectedWork = visibleWork.find((item) => item.requirement_id === activeRequirementId) || visibleWork[0];
+  const humanRequirements = current.filter((item) => !["collected", "answered", "satisfied", "cancelled"].includes(item.status.toLowerCase())
+    && (item.status === "human_requested" || ["pending", "assignment_blocked"].includes(item.active_human_request?.status || "")));
+  const openHumanEvidence = (item: Requirement) => {
+    reviewFocusPending.current = true;
+    setActiveRequirementId(item.requirement_id);
+    setExpandedRequirements((values) => new Set([...values, item.requirement_id]));
+    window.requestAnimationFrame(() => {
+      const input = Array.from(panelRef.current?.querySelectorAll<HTMLTextAreaElement>("[data-requirement-response]") || []).find((node) => node.dataset.requirementResponse === item.requirement_id);
+      input?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+      input?.focus();
+    });
+  };
   const evidenceIds = state?.context?.evidence_ids || [];
   const evidenceSummary = state?.investigation_workspace?.evidence_summary;
   const latestContextCount = evidenceSummary?.latest_context_records ?? evidenceIds.length;
@@ -162,6 +198,10 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
       return;
     }
     handledReviewRequest.current = reviewRequestToken;
+    setWorkFilter("all");
+    reviewFocusPending.current = true;
+    setActiveRequirementId(item.requirement_id);
+    setExpandedRequirements((values) => new Set([...values, item.requirement_id]));
     const gap = declaredGaps.find((candidate) => candidate.category.toLowerCase() === item.category.toLowerCase());
     const draft = [
       `Evidence requirement: ${item.question}`,
@@ -175,16 +215,12 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
       setReferences((values) => values[item.requirement_id]?.trim() ? values : { ...values, [item.requirement_id]: String(item.suggested_source_reference) });
     }
     panelRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" });
-    window.setTimeout(() => {
-      document.querySelector<HTMLTextAreaElement>(`[data-requirement-response="${item.requirement_id}"]`)?.focus();
-    }, 250);
     setAnnouncement(`Review form opened for ${item.category.replaceAll("_", " ")} evidence.`);
   }, [current, declaredGaps, proposedRcaDraft, reviewRequestToken]);
 
   useEffect(() => {
     if (!current.length) return;
     setActiveRequirementId((value) => current.some((item) => item.requirement_id === value) ? value : current[0].requirement_id);
-    setExpandedRequirements((values) => values.size ? values : new Set([current[0].requirement_id]));
     setAnswers((values) => {
       const next = { ...values };
       current.forEach((item) => {
@@ -222,15 +258,17 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
         <div><strong>{item.category.replaceAll("_", " ")}</strong><p>{item.question}</p><small className="context-enrichment-version">{item.rca_version == null ? "RCA version unavailable" : `RCA v${item.rca_version}`}{recordedAt ? ` · updated ${formatUtcTimestamp(recordedAt)}` : ""}</small></div>
         <span>{status.replaceAll("_", " ")}</span>
       </div>
-      <div className="context-enrichment-study-brief">
+
+      {!historical ? <div className="evidence-next-action"><strong>{complete ? "Evidence recorded" : request?.status === "pending" ? "Your next action" : workGroup(item) === "attention" ? "Collection needs attention" : "Automatic collection"}</strong><p>{complete ? "Review the recorded evidence references below. Collection alone does not confirm the cause." : request?.status === "pending" ? "Open the response form below and provide an attributable observation." : workGroup(item) === "attention" ? "Review the collector details and repair or configure the required source. You can also add verified evidence." : job?.status === "collecting" ? "The collector is running. Status refreshes automatically." : job?.status === "retry" ? "A retry is scheduled. Status refreshes automatically." : !job ? "No collection job is recorded. Review the source requirements in collector details." : "This request is waiting for collection capacity. Status refreshes automatically."}</p></div> : null}
+      <details className="context-request-diagnostics"><summary>Question context and collector details</summary><div className="context-enrichment-study-brief">
         <strong>What KaiMS needs to establish</strong>
-        <p>{item.question}</p>
         <dl>
           <div><dt>Why this matters</dt><dd>{item.reason || "Required to test and strengthen the current RCA hypothesis."}</dd></div>
           <div><dt>Preferred source</dt><dd>{item.suggested_source_reference || `${item.category.replaceAll("_", " ")} dashboard, ticket, catalog, or another attributable source`}</dd></div>
         </dl>
       </div>
       {job ? <small>Latest attempt {job.attempt_count || job.attempt || 1} · connector {job.connector_id} · {job.status.replaceAll("_", " ")}</small> : null}
+      </details>
       {item.evidence_ids?.length ? <details className="context-enrichment-evidence">
         <summary>Collected evidence ({item.evidence_ids.length})</summary>
         <p>Collection confirms records were retrieved. It does not establish the cause or satisfy execution approval.</p>
@@ -239,17 +277,25 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
         </ul>
       </details> : null}
       {failure ? <p className="context-enrichment-action" role="status">{failure}</p> : null}
+      {!historical && item.status === "blocked" && !["pending", "assignment_blocked"].includes(request?.status || "") ? <p className="context-enrichment-action" role="status">A configured technical source or collector repair is needed. Human input is optional; this requirement remains unresolved.</p> : null}
       {!historical && !complete && !job ? <p className="context-enrichment-action" role="status">No automated collection job is recorded for this requirement. A verified observation or a configured evidence source is needed.</p> : null}
+
       {!historical && !complete ? <details className="context-enrichment-response-shell" open={expandedRequirements.has(item.requirement_id)} onToggle={(event) => {
         const open = event.currentTarget.open;
         setExpandedRequirements((values) => { const next = new Set(values); if (open) next.add(item.requirement_id); else next.delete(item.requirement_id); return next; });
       }}>
-        <summary><span>{request?.status === "assignment_blocked" ? "Provide evidence yourself" : "Review and provide evidence"}</span><small>{expandedRequirements.has(item.requirement_id) ? "Hide form" : "Open form"}</small></summary>
+        <summary><span>{request?.status === "assignment_blocked" ? "Provide evidence yourself" : request?.status === "pending" ? "Review and provide evidence" : "Add optional evidence"}</span><small>{expandedRequirements.has(item.requirement_id) ? "Hide form" : "Open form"}</small></summary>
         <div className="context-enrichment-response">
-        <small>{request?.status === "assignment_blocked" ? "Human evidence assignment is blocked. An authorized operator can provide a verified observation here." : request ? `Assigned to ${request.expected_responder || "an authorized responder"}${request.due_at ? ` · due ${formatUtcTimestamp(request.due_at)}` : ""}` : "A verified user response may be submitted here. Collection progress is shown only when a job is recorded."}</small>
-        <div className="context-enrichment-ai-draft"><div><strong>AI-generated editable draft</strong><p>KaiMS prepared this from the current incident and RCA. Update it with verified facts and cite their source.</p></div></div>
-        <textarea data-requirement-response={item.requirement_id} aria-label={`Response for ${item.category}`} value={answers[item.requirement_id] || ""} onChange={(event) => setAnswers((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="State the verified factual observation. Remove any AI claim you could not confirm." />
-        <input aria-label={`Source reference for ${item.category}`} value={references[item.requirement_id] || ""} onChange={(event) => setReferences((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Source reference (ticket, dashboard, or catalog URL)" />
+        <small>{request?.status === "assignment_blocked" ? "Human evidence assignment is blocked. An authorized operator can provide a verified observation here." : request?.status === "pending" ? `Assigned to ${request.expected_responder || "an authorized responder"}${request.due_at ? ` · due ${formatUtcTimestamp(request.due_at)}` : ""}` : "A verified user response may be submitted here. Collection progress is shown only when a job is recorded."}</small>
+        <small>Replace the prepared draft with verified facts and a supporting source.</small>
+        <label>Verified observation<textarea rows={6} ref={(node) => {
+          if (!node && focusedReviewInput.current?.dataset.requirementResponse === item.requirement_id
+            && document.activeElement === focusedReviewInput.current) reviewFocusPending.current = true;
+          if (node && reviewFocusPending.current && !historical && item.requirement_id === activeRequirementId) {
+            node.focus(); focusedReviewInput.current = node; reviewFocusPending.current = false;
+          }
+        }} data-requirement-response={item.requirement_id} aria-label={`Response for ${item.category}`} value={answers[item.requirement_id] || ""} onChange={(event) => setAnswers((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="State the verified factual observation. Remove any AI claim you could not confirm." /></label>
+        <label>Supporting source<input aria-label={`Source reference for ${item.category}`} value={references[item.requirement_id] || ""} onChange={(event) => setReferences((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Source reference (ticket, dashboard, or catalog URL)" /></label>
         <button type="button" className="button-primary" disabled={loading || !String(answers[item.requirement_id] || "").trim() || !String(references[item.requirement_id] || "").trim()} onClick={() => void submit(item.requirement_id)}>Submit reviewed evidence and rerun RCA</button>
         </div>
       </details> : null}
@@ -258,10 +304,24 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
 
   return <section ref={panelRef} className="context-enrichment-panel" aria-labelledby="context-enrichment-title">
     <div className="sr-only" aria-live="polite">{announcement}</div>
-    <header><div><span className="discovery-eyebrow">Missing evidence</span><h3 id="context-enrichment-title">Automated evidence collection</h3><p>This section shows recorded collection attempts and outstanding requests. A request does not establish that its source exists or is accessible.</p></div><button ref={refreshButtonRef} type="button" className="button-secondary" onClick={() => void load(true)} disabled={loading}><RefreshCw size={15} className={loading ? "is-spinning" : ""} /> Reload status</button></header>
+    <header><div><span className="discovery-eyebrow">Missing evidence</span><h3 id="context-enrichment-title">Evidence collection and human input</h3><p>Review automated collection or provide a verified observation with a supporting source.</p></div><button ref={refreshButtonRef} type="button" className="button-secondary" onClick={() => void load(true)} disabled={loading}><RefreshCw size={15} className={loading ? "is-spinning" : ""} /> Reload status</button></header>
     {announcement ? <p className="context-enrichment-action" role="status">{announcement}</p> : null}
+    {state ? <div className="evidence-work-summary" aria-label="Evidence work summary">
+      {([['all', 'All requests'], ['attention', 'Needs attention'], ['running', 'Queued / collecting'], ['complete', 'Recorded']] as const).map(([filter, label]) => <button type="button" key={filter} aria-pressed={workFilter === filter} onClick={() => setWorkFilter(filter)}><strong>{filter === "all" ? current.length : current.filter(item => workGroup(item) === filter).length}</strong><span>{label}</span></button>)}
+    </div> : !error ? <p role="status">Loading evidence work?</p> : null}
+    {humanRequirements.length ? <div className="evidence-human-shortcuts" aria-label="Human evidence requests"><strong>Human input requested</strong>{humanRequirements.map(item => <button key={item.requirement_id} className="button-secondary" onClick={() => { setWorkFilter("all"); openHumanEvidence(item); }}>Provide human evidence<span className="sr-only"> for {item.category.replaceAll("_", " ")}</span><small aria-hidden="true"> / {item.category.replaceAll("_", " ")}</small></button>)}</div> : null}
     {state?.context?.snapshot_id && state?.investigation?.snapshot_id && state.context.snapshot_id !== state.investigation.snapshot_id ? <p className="context-enrichment-action" role="status">Newer context is available. The displayed RCA still uses an earlier evidence snapshot; collection alone does not update its conclusion.</p> : null}
-    {state ? <section className="context-evidence-ledger" aria-labelledby="evidence-ledger-title">
+
+    {error ? <p className="context-enrichment-error" role="alert"><CircleAlert size={17} />{error}</p> : null}
+    {!alertId && declaredGaps.length ? <p className="context-enrichment-error" role="status"><CircleAlert size={17} />Canonical alert binding is missing. Backend orchestration will regenerate analysis after a governed snapshot is committed.</p> : null}
+    {!error && state && !current.length ? <p className="context-enrichment-empty">{declaredGaps.length ? "Evidence requirements have not been projected yet. KaiMS will continue monitoring this incident." : state.investigation_workspace?.rca?.grounded !== true ? "No active collection requests are published. This does not establish evidence sufficiency; review the RCA limitations and publish targeted evidence requirements." : "No unresolved evidence gaps are declared."}</p> : null}
+    {current.length ? <section className="context-enrichment-current" aria-labelledby="current-evidence-title"><div className="context-enrichment-group-heading"><div><span>Evidence requests</span><h4 id="current-evidence-title">{current.filter(item => workGroup(item) !== "complete").length} open · {current.filter(item => workGroup(item) === "complete").length} recorded</h4><small>{rcaVersion ? `Analysis revision ${rcaVersion}. ` : ""}{state?.investigation_workspace?.rca?.grounded === true ? "Cause established." : "Cause not established; these requests support the investigation."}</small></div><small>{current.length} requirement{current.length === 1 ? "" : "s"}</small></div>
+      <div className="evidence-workspace"><div className="context-enrichment-tabs" role="group" aria-label="Evidence collection tasks">{visibleWork.map((item) => <button key={item.requirement_id} type="button" aria-pressed={item.requirement_id === selectedWork?.requirement_id} onClick={() => {
+        setActiveRequirementId(item.requirement_id);
+      }}><strong>{item.category.replaceAll("_", " ")}</strong><span>{requirementStatus(item)}</span></button>)}</div>
+      <div className="context-enrichment-list">{selectedWork ? card(selectedWork) : <p className="context-enrichment-empty">No requests in this category. Choose another filter.</p>}</div></div>
+    </section> : null}
+    {state ? <details className="context-accounting-details"><summary>Evidence accounting and snapshot versions</summary><section className="context-evidence-ledger" aria-labelledby="evidence-ledger-title">
       <div className="context-evidence-ledger-heading"><div><span>Evidence accounting</span><h4 id="evidence-ledger-title">Current RCA evidence funnel</h4></div><strong>{lifecycleLabel(state.lifecycle_state, latestContextCount)}</strong></div>
       <ol>
         <li><span>Latest context</span><strong>{latestContextCount}</strong><small>records in snapshot v{state.context?.version || 0}</small></li>
@@ -271,17 +331,7 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
       </ol>
       {unresolvedBindings ? <p className="context-evidence-integrity" role="alert"><CircleAlert size={16} />{unresolvedBindings} RCA evidence binding{unresolvedBindings === 1 ? " does" : "s do"} not resolve inside the bound snapshot. Grounding remains blocked.</p> : null}
       <footer><span>Latest: {state.context?.snapshot_id || "not published"}</span><span>RCA-bound: {state.investigation_workspace?.binding?.snapshot_id || state.investigation?.snapshot_id || "not bound"}</span><span>Updated {state.updated_at ? formatUtcTimestamp(state.updated_at) : "unavailable"}</span></footer>
-    </section> : null}
-    {error ? <p className="context-enrichment-error" role="alert"><CircleAlert size={17} />{error}</p> : null}
-    {!alertId && declaredGaps.length ? <p className="context-enrichment-error" role="status"><CircleAlert size={17} />Canonical alert binding is missing. Backend orchestration will regenerate analysis after a governed snapshot is committed.</p> : null}
-    {!error && state && !current.length ? <p className="context-enrichment-empty">{declaredGaps.length ? "Evidence requirements have not been projected yet. KaiMS will continue monitoring this incident." : state.investigation_workspace?.rca?.grounded !== true ? "No active collection requests are published. This does not establish evidence sufficiency; review the RCA limitations and publish targeted evidence requirements." : "No unresolved evidence gaps are declared."}</p> : null}
-    {current.length ? <section className="context-enrichment-current" aria-labelledby="current-evidence-title"><div className="context-enrichment-group-heading"><div><span>Active evidence work</span><h4 id="current-evidence-title">{rcaVersion ? `Current RCA · v${rcaVersion}` : "Current investigation"}</h4></div><small>{current.length} requirement{current.length === 1 ? "" : "s"}</small></div>
-      <div className="context-enrichment-tabs" role="tablist" aria-label="Evidence collection tasks">{current.map((item) => <button key={item.requirement_id} type="button" role="tab" aria-selected={item.requirement_id === activeRequirementId} onClick={() => {
-        setActiveRequirementId(item.requirement_id);
-        setExpandedRequirements((values) => new Set([...values, item.requirement_id]));
-      }}><strong>{item.category.replaceAll("_", " ")}</strong><span>{requirementStatus(item)}</span></button>)}</div>
-      <div className="context-enrichment-list">{current.filter((item) => item.requirement_id === activeRequirementId).map((item) => card(item))}</div>
-    </section> : null}
-    {history.length ? <details className="context-enrichment-history"><summary>Previous RCA versions <span>{history.length} archived requirement{history.length === 1 ? "" : "s"}</span></summary><p>Retained for audit history. Responses can only be submitted against active backend-projected work.</p><div className="context-enrichment-list">{history.map((item) => card(item, true))}</div></details> : null}
+    </section></details> : null}
+    {history.length ? <details className="context-enrichment-history" onToggle={event => setHistoryOpen(event.currentTarget.open)}><summary>Previous RCA versions <span>{history.length} archived requirement{history.length === 1 ? "" : "s"}</span></summary><p>Retained for audit history. Responses can only be submitted against active backend-projected work.</p><div className="context-enrichment-list">{historyOpen ? history.slice(0, historyLimit).map((item) => card(item, true)) : null}{historyOpen && history.length > historyLimit ? <button className="button-secondary" onClick={() => setHistoryLimit(value => value + 20)}>Show 20 more archived requests</button> : null}</div></details> : null}
   </section>;
 }

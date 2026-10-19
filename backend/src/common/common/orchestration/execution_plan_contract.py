@@ -70,8 +70,8 @@ class PlanAction(BaseModel):
 class ApprovalPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    decision: Literal["recommend_only", "hitl_required", "denied"]
-    required_approver_role: Literal["admin", "hitl-reviewer"] = "hitl-reviewer"
+    decision: Literal["recommend_only", "hitl_required", "policy_required", "denied"]
+    required_approver_role: Literal["admin", "hitl-reviewer", "policy-engine"] = "hitl-reviewer"
     reason_codes: list[str] = Field(default_factory=list)
     approval_expiry_seconds: int = Field(default=900, ge=60, le=86400)
 
@@ -231,8 +231,13 @@ class ExecutionPlanV2(BaseModel):
             raise ValueError("execution-ready mutation requires validation")
         if self.execution_ready and not self.rollback and not recovery_strategy_exempt:
             raise ValueError("execution-ready mutation requires rollback or an acknowledged recovery strategy")
-        if self.execution_ready and self.approval_policy.decision != "hitl_required":
-            raise ValueError("P0 execution-ready plans require HITL")
+        if self.execution_ready and self.approval_policy.decision == "policy_required":
+            policy = getattr(self, "policy_decision", {}) or {}
+            if (self.approval_policy.required_approver_role != "policy-engine" or policy.get("decision") != "hotl"
+                    or self.risk_tier != "low" or len(self.actions) != 1):
+                raise ValueError("Automatic execution requires a bound policy-engine decision")
+        elif self.execution_ready and self.approval_policy.decision != "hitl_required":
+            raise ValueError("Execution-ready plans require human or explicit policy authorization")
         if self.commands != [str(action.inputs.get("catalog_command") or "") for action in self.actions]:
             raise ValueError("flat commands must be the exact typed-action compatibility projection")
         if self.execution_ready:

@@ -13,6 +13,21 @@ from resolution_agent import ResolutionIntelligenceAgent
 
 
 @pytest.mark.asyncio
+async def test_infrastructure_manifest_uses_claim_specific_source_policy():
+    alert = Alert(tenant_id="tenant-a", source="prometheus", name="DiskSpaceLow", service="node-exporter", description="Disk utilization exceeds 90%", severity=AlertSeverity.CRITICAL)
+    context = Context(tenant_id="tenant-a", incident_id=uuid4(), alert=alert)
+    agent = ResolutionIntelligenceAgent(model_router=static_router())
+    state = await agent.plan_investigation({"context": context, "gathered_context": {"alert": {"service": "node-exporter"}}})
+    missing = state["investigation_report"]["missing_sources"]
+    assert "telemetry" in missing
+    # A disk symptom alone does not establish that a deployment/change plane
+    # exists or is required to diagnose the issue.
+    assert "changes" not in missing
+    assert "code" not in missing
+    assert "history" not in missing
+
+
+@pytest.mark.asyncio
 async def test_resolution_runtime_accepts_explicit_zero_confidence_abstention() -> None:
     recommendation = Recommendation(
         root_cause="Insufficient evidence", confidence=0, impact="Unknown",
@@ -463,6 +478,8 @@ async def test_resolution_ingests_current_enrichment_evidence_categories() -> No
     assert evidence["METRIC-DOWN-1"]["connector"] == "prometheus"
     assert evidence["METRIC-DOWN-1"]["uri"] == "prometheus://query?expr=up"
     assert '"value": 0' in evidence["METRIC-DOWN-1"]["snippet"]
+    assert evidence["METRIC-DOWN-1"]["metadata"]["value"] == 0
+    assert evidence["METRIC-DOWN-1"]["metadata"]["metric_name"] == "up"
 
 
 @pytest.mark.asyncio

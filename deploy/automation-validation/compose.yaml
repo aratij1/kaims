@@ -1,0 +1,45 @@
+services:
+  api:
+    image: kaims-auto-validation-api:local
+    build:
+      context: ../..
+      dockerfile: deploy/automation-validation/Dockerfile
+    ports: ["127.0.0.1:${AUTO_QUAL_PORT:-18503}:8000"]
+    environment:
+      NEXT_API_TOKEN: ${AUTO_QUAL_TOKEN:?Qualification token required}
+      NEXT_TENANT_ID: qualification
+      NEXT_DATABASE_URL: sqlite:////state/workflow.db
+      NEXT_RABBITMQ_URL: amqp://qualification:${AUTO_QUAL_BROKER_PASSWORD:?Broker password required}@rabbitmq/
+      NEXT_RABBITMQ_NAMESPACE: auto-qualification
+      NEXT_DOCUMENT_ROOTS_FILE: /config/roots.json
+      NEXT_TELEMETRY_SOURCES_FILE: /config/telemetry.json
+      NEXT_RESOLUTION_POLICIES_FILE: /config/policy.json
+      NEXT_AUTO_INCIDENT_APPLICATIONS: ""
+    volumes:
+      - workflow-state:/state
+      - ${AUTO_QUAL_CONFIG_DIR:?Qualification config directory required}:/config:ro
+    depends_on:
+      rabbitmq: {condition: service_healthy}
+      target: {condition: service_started}
+    mem_limit: 512m
+  target:
+    image: kaims-auto-validation-api:local
+    command: [python, -m, kaims_next.validation_target]
+    volumes: [target-state:/state]
+    mem_limit: 64m
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: qualification
+      RABBITMQ_DEFAULT_PASS: ${AUTO_QUAL_BROKER_PASSWORD:?Broker password required}
+    volumes: [broker-state:/var/lib/rabbitmq]
+    healthcheck:
+      test: [CMD, rabbitmq-diagnostics, -q, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    mem_limit: 512m
+volumes:
+  workflow-state:
+  target-state:
+  broker-state:

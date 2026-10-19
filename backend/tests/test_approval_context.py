@@ -60,6 +60,14 @@ def _set_pending_plan(module, incident_id: str, recommendation_id: str) -> dict:
         async def get_current_execution_plan_for_incident(self, **_kwargs):
             return plan
     module.IncidentRepository = CanonicalPlanRepository
+    # These tests exercise approval mutation gates using an explicit context
+    # double. Durable context hydration is covered by governed handoff tests.
+    async def load_context(incident_id, *, tenant_id):
+        value = module.PENDING_INCIDENTS.get(module._pending_key(tenant_id, str(incident_id)))
+        if value is None:
+            raise module.HTTPException(status_code=404, detail="No tenant-scoped incident")
+        return value
+    module._load_approval_context = load_context
     if not hasattr(module.app.state, "session_factory"):
         class _Session:
             async def __aenter__(self): return self
@@ -630,3 +638,33 @@ async def test_approval_rejects_expired_plan() -> None:
 
     with pytest.raises(module.HTTPException, match="expired"):
         await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
+
+@pytest.mark.asyncio
+async def test_durable_context_does_not_sign_eligible_for_unpersisted_plan(monkeypatch):
+    from uuid import UUID
+    module = load_approval_app_module()
+    module.settings.database_enabled = True
+    module.settings.service_internal_token = 'internal-test-token'
+    incident_id = '11111111-1111-1111-1111-111111111111'
+    plan = _approval_plan(incident_id)
+    recommendation = {'id': plan['recommendation_id'], 'tenant_id': 'tenant-a',
+                      'incident_id': incident_id, 'metadata': _readiness_metadata(plan)}
+    class Session:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+    class Repository:
+        async def get_incident(self, *args, **kwargs):
+            return {'id': incident_id, 'tenant_id': 'tenant-a'}
+        async def get_latest_recommendation_for_incident(self, *args, **kwargs):
+            return recommendation
+        async def get_current_execution_plan_for_incident(self, **kwargs): return None
+        async def get_pending_workflow(self, *args): return None
+    module.app.state.session_factory = Session
+    monkeypatch.setattr(module, 'IncidentRepository', lambda session: Repository())
+    context = await module._load_approval_context(UUID(incident_id), tenant_id='tenant-a')
+    metadata = context['recommendation']['metadata']
+    assert 'execution_plan' not in metadata
+    assert metadata['model_proposed_execution_plan'] == plan
+    receipt = module._signed_approval_readiness(context)
+    assert receipt['state'] == 'blocked'
+    assert 'valid_plan' in receipt['missing']

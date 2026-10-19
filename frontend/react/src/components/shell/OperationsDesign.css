@@ -1,0 +1,131 @@
+/* Shared operational design language. Detail routes own their information hierarchy. */
+.kai-shell { --kai-ink: #172b40; --kai-muted: #53677b; --kai-line: #dfe6ed; --kai-panel: #fff; --kai-canvas: #f6f8fa; --kai-blue: #215cc5; font-family: var(--k-font-body); font-size: 14px; line-height: 1.55; }
+.kai-shell *, .kai-shell *::before, .kai-shell *::after { box-sizing: border-box; }
+.kai-shell :is(button, a, input, select, textarea, summary):focus-visible { outline: 2px solid #3478da; outline-offset: 3px; }
+.kai-shell :is(button, a) { -webkit-tap-highlight-color: transparent; }
+.kai-shell button { cursor: pointer; }
+.kai-shell button:disabled { cursor: not-allowed; }
+.kai-shell .button-primary { background: #215cc5; border: 1px solid #215cc5; border-radius: 7px; color: #fff; box-shadow: none; font-size: 13px; padding: 10px 16px; min-height: 40px; line-height: 1.45; }
+.kai-shell .button-primary:hover:not(:disabled) { background: #19499f; }
+.kai-shell .button-secondary { background: var(--kai-panel); border: 1px solid #c9d5e0; border-radius: 7px; color: var(--kai-ink); box-shadow: none; font-size: 13px; padding: 9px 14px; min-height: 40px; line-height: 1.45; }
+.kai-shell .button-secondary:hover:not(:disabled) { background: #eff4f9; border-color: #a8bdd2; }
+.kai-shell .kai-operations-bar { height: 68px; padding-inline: 24px; box-shadow: none; backdrop-filter: none; background: var(--kai-panel); }
+.kai-shell .kai-route-content { padding: 26px 30px 48px; max-width: 1800px; margin-inline: auto; }
+.kai-shell .kai-route-context { align-items: center; margin-bottom: 24px; }
+.kai-shell .kai-route-context h1 { font-size: 26px; letter-spacing: -.035em; }
+.kai-shell .kai-route-context>div>span { font-size: 10px; letter-spacing: .1em; }
+.kai-shell .kai-route-context p,.kai-shell .kai-page-guide summary { font-size: 12px; }
+.kai-shell .kai-navigation-groups button { font-size: 13px; padding: 11px 12px; border-radius: 7px; }
+.kai-shell .kai-navigation-groups h2 { font-size: 10px; margin-top: 14px; }
+.kai-shell .kai-brand-lockup strong { font-size: 18px; letter-spacing: -.03em; }
+.kai-shell .kai-brand-lockup small { font-size: 10px; }
+.kai-shell .kai-search-trigger { height: 39px; border-radius: 7px; background: var(--kai-canvas); }
+.kai-shell .kai-search-trigger>span { font-size: 12px; }
+.kai-shell .kai-context-selectors select { font-size: 12px; }
+.kai-shell .kai-context-selectors label span,.kai-shell .kai-environment small { font-size: 9px; }
+.kai-shell .kai-environment strong { font-size: 11px; }
+.kai-shell .kai-user-menu summary { font-size: 12px; }
+.kai-shell .kai-health span,.kai-shell .kai-autonomy span { font-size: 10px; }
+.kai-shell .kai-health strong,.kai-shell .kai-autonomy strong { font-size: 11px; }
+.kai-shell .kai-brain-status header span { font-size: 12px; }
+.kai-shell .kai-brain-status>div small { font-size: 10px; }
+.kai-shell .kai-brain-status>div strong { font-size: 13px; }
+.kai-shell .operations-home { display: flex; flex-direction: column; gap: 22px; max-width: 1440px; margin-inline: auto; }
+.kai-shell .oh-status { padding: 24px; border: 1px solid var(--kai-line); border-left: 3px solid #258575; border-radius: 12px; background: var(--kai-panel); box-shadow: none; }
+.kai-shell .oh-status.needs-attention { border-left-color: #b76d19; }
+.kai-shell .oh-status h2 { font-size: 26px; letter-spacing: -.03em; line-height: 1.3; }
+.kai-shell .oh-status p { font-size: 13px; line-height: 1.65; max-width: 74ch; }
+.kai-shell .oh-status>div>span,.kai-shell .oh-scope>span { font-size: 10px; }
+.kai-shell .oh-scope small { font-size: 12px; }
+.kai-shell .oh-pulse { border: 1px solid var(--kai-line); border-radius: 12px; background: var(--kai-panel); box-shadow: none; overflow: hidden; }
+.kai-shell .oh-pulse header { padding: 13px 20px; }
+.kai-shell .oh-pulse header span { font-size: 11px; }
+.kai-shell .oh-pulse header small { font-size: 11px; }
+.kai-shell .oh-pulse>div>button { padding: 22px; min-height: 100px; }
+.kai-shell .oh-pulse button span { font-size: 12px; }
+.kai-shell .oh-pulse button strong { font-size: 28px; font-weight: 650; letter-spacing: -.04em; }
+.kai-shell .oh-lane,.kai-shell .oh-resolved { background: var(--kai-panel); border: 1px solid var(--kai-line); border-radius: 12px; box-shadow: none; overflow: hidden; }
+.kai-shell .oh-lane>header,.kai-shell .oh-resolved>header { background: var(--kai-panel); padding: 18px 20px; }
+.kai-shell .oh-lane header strong { font-size: 14px; }
+.kai-shell .oh-lane header small { font-size: 10px; }
+.kai-shell .oh-work-item { padding: 17px 20px; gap: 14px; background: transparent; min-height: 96px; }
+.kai-shell .oh-work-item strong { font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.kai-shell .oh-work-item small { font-size: 11px; line-height: 1.7; }
+.kai-shell .oh-work-action { font-size: 11px; }
+.kai-shell .oh-severity { font-size: 10px; border-radius: 5px; }
+.kai-shell .oh-lane-link { font-size: 12px; padding: 15px 20px; }
+.kai-shell .oh-truth { font-size: 12px; line-height: 1.7; margin: 0; color: var(--kai-muted); }
+.kai-shell .oh-empty { padding: 28px 22px; }
+.kai-shell .oh-empty strong { font-size: 14px; }
+.kai-shell .oh-empty small { font-size: 12px; line-height: 1.65; }
+.kai-shell .oh-resolved h3 { font-size: 17px; }
+.kai-shell .oh-resolved button strong { font-size: 13px; }
+.kai-shell .oh-resolved button small { font-size: 11px; }
+.kai-shell .unified-inbox-stack { display: flex; flex-direction: column; gap: 0; border: 1px solid var(--kai-line); border-radius: 12px; overflow: hidden; background: var(--kai-panel); }
+.kai-shell .unified-inbox-card { margin: 0; min-height: 0; border: 0; border-bottom: 1px solid var(--kai-line); border-left: 3px solid #8da1b4; border-radius: 0; padding: 19px 20px; box-shadow: none; }
+.kai-shell .unified-inbox-card:last-child { border-bottom: 0; }
+.kai-shell .unified-inbox-card.severity-critical { border-left-color: #b52c49; }
+.kai-shell .unified-card-title { font-size: 16px; font-weight: 650; letter-spacing: -.015em; line-height: 1.5; overflow-wrap: anywhere; }
+.kai-shell .unified-card-kicker { font-size: 10px; }
+.kai-shell .unified-card-meta { font-size: 12px; }
+.kai-shell .unified-card-progress { padding: 8px 10px; border: 0; background: var(--kai-canvas); box-shadow: none; }
+.kai-shell .unified-card-progress strong { font-size: 12px; }
+.kai-shell .unified-card-progress small { font-size: 9px; }
+.kai-shell .unified-card-progress span { font-size: 11px; }
+.kai-shell .incident-table-wrap { border: 1px solid var(--kai-line); border-radius: 10px; }
+.kai-shell .incident-summary-table :is(th, td) { padding: 15px 16px; font-size: 12px; line-height: 1.6; }
+.kai-shell .incident-table-title { font-size: 13px; }
+.kai-shell .incident-summary-table code { display: block; font-size: 10px; overflow-wrap: anywhere; }
+.kai-shell .incident-inbox-views button { font-size: 12px; min-height: 42px; }
+.kai-shell .compact-filter-bar { border: 1px solid var(--kai-line); border-radius: 10px; padding: 14px; box-shadow: none; }
+.kai-shell :is(input, select, textarea) { font-family: var(--k-font-body); }
+.dm-theme-dark .kai-shell { --kai-ink: #e2ebf4; --kai-muted: #a5b6c7; --kai-line: #324457; --kai-panel: #142235; --kai-canvas: #0e1928; --kai-blue: #8ab7ff; }
+.dm-theme-dark .kai-shell .button-secondary { background: var(--kai-panel); color: var(--kai-ink); border-color: var(--kai-line); }
+@media (max-width: 1150px) { .kai-shell .kai-health,.kai-shell .kai-autonomy { display: none; } .kai-shell .oh-attention-grid { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .kai-shell .kai-route-content { padding: 18px 14px 32px; } .kai-shell .kai-operations-bar { padding-inline: 12px; } .kai-shell .oh-status { padding: 18px; } .kai-shell .oh-status h2 { font-size: 22px; } .kai-shell .oh-pulse>div { grid-template-columns: repeat(2, minmax(0, 1fr)); } .kai-shell .oh-work-item { grid-template-columns: auto minmax(0, 1fr); } .kai-shell .oh-work-action { grid-column: 2; } .kai-shell .unified-inbox-card { padding: 16px 12px; } }
+
+.kai-shell .oh-capacity { border: 1px solid var(--kai-line); border-radius: 10px; background: var(--kai-panel); }
+.kai-shell .oh-capacity>summary { display: flex; gap: 10px; align-items: center; padding: 16px 20px; color: var(--kai-ink); font-size: 13px; font-weight: 600; cursor: pointer; }
+.kai-shell .oh-capacity>summary span { margin-left: auto; font-size: 12px; font-weight: 400; color: var(--kai-muted); }
+.kai-shell .oh-capacity>section { padding: 0 20px 20px; }
+@media (max-width: 650px) { .kai-shell .oh-capacity>summary { flex-wrap: wrap; } .kai-shell .oh-capacity>summary span { margin-left: 26px; } }
+
+.kai-shell .panel { border: 1px solid var(--kai-line); border-radius: 12px; background: var(--kai-panel); box-shadow: none; }
+.kai-shell .panel-head { margin-bottom: 20px; align-items: flex-start; }
+.kai-shell .panel-head h3 { font-size: 19px; letter-spacing: -.025em; line-height: 1.5; }
+.kai-shell .panel-head .subtitle { font-size: 13px; line-height: 1.7; color: var(--kai-muted); }
+.kai-shell .table-wrap { border: 1px solid var(--kai-line); border-radius: 10px; }
+.kai-shell .table-wrap :is(th,td) { padding: 15px 16px; font-size: 13px; line-height: 1.65; text-align: left; }
+.kai-shell .table-wrap th { font-size: 11px; letter-spacing: .04em; color: var(--kai-muted); background: var(--kai-canvas); }
+.kai-shell .table-wrap td { overflow-wrap: anywhere; }
+.kai-shell .table-wrap tbody tr:hover { background: var(--kai-canvas); }
+.kai-shell .development-data-tabs,.kai-shell .settings-tabs { gap: 6px; padding: 6px; border: 1px solid var(--kai-line); border-radius: 10px; box-shadow: none; background: var(--kai-panel); }
+.kai-shell .development-data-tabs button,.kai-shell .settings-tabs button { font-size: 13px; border-radius: 7px; box-shadow: none; min-height: 44px; padding: 10px 15px; }
+.kai-shell .ingestion-stream-panel,.kai-shell .ingestion-control-panel { padding: 22px; }
+.kai-shell .ingestion-stream-toolbar { padding-block: 14px; gap: 12px; }
+.kai-shell .ingestion-event-main strong { font-size: 14px; line-height: 1.5; }
+.kai-shell .ingestion-event-main small { font-size: 12px; line-height: 1.7; }
+.kai-shell .approval-hero { padding: 24px; }
+.kai-shell .approval-decision-story h3 { font-size: 21px; letter-spacing: -.025em; }
+.kai-shell .approval-review-summary { box-shadow: none; border-radius: 10px; }
+.kai-shell .approval-review-summary p { font-size: 14px; line-height: 1.75; }
+.kai-shell .ai-hub-hero { padding: 24px; box-shadow: none; }
+.kai-shell .ai-hub-section-head h3 { font-size: 19px; }
+.kai-shell .ai-hub-section-head p { font-size: 13px; line-height: 1.7; }
+.kai-shell .knowledge-document-link { font-size: 13px; text-align: left; line-height: 1.6; }
+
+.skip-link:not(:focus) { width: 1px; height: 1px; min-height: 0; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+.kai-shell .oh-pulse>div { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 700px) { .kai-shell .oh-pulse>div { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+.kai-shell .k-status-badge.is-success { color: #126344; background: #edf8f2; border-color: #9cccb3; }
+.kai-shell .k-status-badge.is-warning { color: #814b08; background: #fff7e6; border-color: #dec18a; }
+.kai-shell .k-status-badge.is-critical { color: #9f2243; background: #fff1f4; border-color: #dfadba; }
+.kai-shell .k-status-badge.is-info { color: #214f91; background: #eef5ff; border-color: #adc8ec; }
+.kai-shell .k-status-badge.is-inactive { color: #526173; background: #f1f4f7; border-color: #c9d3de; }
+.dm-theme-dark .kai-shell .k-status-badge.is-success { color: #91e1ba; background: #15382b; border-color: #3a7457; }
+.dm-theme-dark .kai-shell .k-status-badge.is-warning { color: #f4cf88; background: #382a13; border-color: #806435; }
+.dm-theme-dark .kai-shell .k-status-badge.is-critical { color: #ffb3c5; background: #3c1d29; border-color: #895368; }
+.dm-theme-dark .kai-shell .k-status-badge.is-info { color: #accbff; background: #1b304b; border-color: #4d719d; }
+.dm-theme-dark .kai-shell .k-status-badge.is-inactive { color: #bbcbdc; background: #263444; border-color: #52677b; }

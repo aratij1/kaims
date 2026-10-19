@@ -199,7 +199,7 @@ async def sync_closed_assessment_projection(session, assessment_id):
 async def collect_assessment(registry, profile, record, *, now=None, observer=None):
     now = now or datetime.now(UTC)
     observer = observer or PrometheusRecoveryObserver()
-    boundary = datetime.fromisoformat(record["requested_at"])
+    boundary = datetime.fromisoformat(record.get("observation_window_start") or record["requested_at"])
     binding = {"assessment_id": record["assessment_id"], "profile_digest": record["binding"]["profile_digest"],
                "phase": "post_assessment"}
     semaphore = asyncio.Semaphore(4)

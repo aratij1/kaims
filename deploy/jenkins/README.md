@@ -9,6 +9,11 @@ that a build was queued; KaiOps must wait until the build API reports both
 `building=false` and a non-empty terminal `result` before publishing
 `incident.remediation.executed`.
 
+A successful dry run records `dry_run_validated=true`, `executed=false`,
+`recovery_validated=false`, and zero executed scripts. It proves plan validation,
+not service recovery. Live execution rejects artifacts from dry runs and requires
+matching approval, target, plan digest, script count, execution and recovery evidence.
+
 For the current Docker Compose environment Jenkins remains the compatibility
 executor because the governed job and allowlist already exist. The preferred
 production direction is:

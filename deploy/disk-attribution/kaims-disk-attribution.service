@@ -1,0 +1,21 @@
+[Unit]
+Description=KaiMS bounded host filesystem modification evidence
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# Adjust installation paths and register the exact host/alert volume first.
+ExecStart=/opt/kaims/.venv/bin/python /opt/kaims/scripts/disk_attribution.py --config /etc/kaims/disk-attribution.json --output /opt/kaims/backend/host-evidence/disk-attribution --backend fanotify --interval 30
+User=root
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ReadWritePaths=/opt/kaims/backend/host-evidence/disk-attribution
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=96M
+TasksMax=8
+TimeoutStartSec=40

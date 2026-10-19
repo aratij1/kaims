@@ -73,7 +73,7 @@ def fake_connection(monkeypatch: pytest.MonkeyPatch) -> _FakeConnection:
 
 
 async def test_start_sets_configured_prefetch(fake_connection: _FakeConnection) -> None:
-    settings = Settings(RABBITMQ_CONSUMER_PREFETCH_COUNT=7)
+    settings = Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, RABBITMQ_CONSUMER_PREFETCH_COUNT=7)
     consumer = RabbitMQConsumer(settings, "raw-alerts")
 
     await consumer.start()
@@ -82,7 +82,7 @@ async def test_start_sets_configured_prefetch(fake_connection: _FakeConnection) 
 
 
 async def test_start_defaults_prefetch_to_ten(fake_connection: _FakeConnection) -> None:
-    consumer = RabbitMQConsumer(Settings(), "raw-alerts")
+    consumer = RabbitMQConsumer(Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, ), "raw-alerts")
 
     await consumer.start()
 
@@ -145,7 +145,7 @@ class _FakeConsumerQueue:
 
 
 async def test_hung_handler_times_out_and_nacks_instead_of_blocking_forever() -> None:
-    settings = Settings(RABBITMQ_HANDLER_TIMEOUT_SECONDS=0.05, RABBITMQ_CONSUMER_MAX_RETRIES=0)
+    settings = Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, RABBITMQ_HANDLER_TIMEOUT_SECONDS=0.05, RABBITMQ_CONSUMER_MAX_RETRIES=0)
     consumer = RabbitMQConsumer(settings, "raw-alerts")
     consumer._connection = object()  # bypass real start(): already "connected"
     consumer._exchange = None
@@ -182,6 +182,35 @@ class _FakeExchange:
         self.published.append({"routing_key": routing_key, "body": json.loads(message.body)})
 
 
+async def test_failed_transient_retry_publish_preserves_original_delivery():
+    from types import SimpleNamespace
+    settings = Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, RABBITMQ_CONSUMER_MAX_RETRIES=0,
+                        RABBITMQ_TRANSIENT_REQUEUE_ENABLED=True, RABBITMQ_TRANSIENT_MAX_REQUEUES=1)
+    consumer = RabbitMQConsumer(settings, "context-events")
+    consumer._connection = object()
+    message = _FakeMessage(json.dumps({"payload": {"event_id": "retry-handoff"}}).encode())
+    consumer._queue = _FakeConsumerQueue([message])
+    consumer._queue.name = "isolated-subscriber"
+    async def failed_publish(*args, **kwargs):
+        assert kwargs["routing_key"] == "isolated-subscriber"
+        raise ConnectionError("test handoff unavailable")
+    consumer._channel = SimpleNamespace(default_exchange=SimpleNamespace(publish=failed_publish))
+    async def handler(payload):
+        raise TimeoutError("test dependency timeout")
+    task = asyncio.create_task(consume_forever(consumer, handler))
+    try:
+        for _ in range(250):
+            if message.nacked:
+                break
+            await asyncio.sleep(0.01)
+        assert message.nacked == [True]
+        assert message.acked == 0
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_handler_failure_reaches_failure_handler_sanitized_but_dlq_keeps_raw_detail() -> None:
     """Reproduces the exact production leak: a redelivered event hit a real
     MySQL unique-constraint violation, and that raw exception text --
@@ -193,7 +222,7 @@ async def test_handler_failure_reaches_failure_handler_sanitized_but_dlq_keeps_r
     operator/internal surface, never displayed to an end user) keeps the raw
     detail so nothing useful for debugging is lost.
     """
-    settings = Settings(RABBITMQ_HANDLER_TIMEOUT_SECONDS=1.0, RABBITMQ_CONSUMER_MAX_RETRIES=0)
+    settings = Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, RABBITMQ_HANDLER_TIMEOUT_SECONDS=1.0, RABBITMQ_CONSUMER_MAX_RETRIES=0)
     consumer = RabbitMQConsumer(settings, "orchestration-events")
     consumer._connection = object()
     consumer._exchange = _FakeExchange()
@@ -239,6 +268,10 @@ async def test_handler_failure_reaches_failure_handler_sanitized_but_dlq_keeps_r
     # end user's UI displays -- it must keep the full original detail.
     dlq_body = consumer._exchange.published[0]["body"]
     assert "uq_incident_events_idempotency" in dlq_body["error"]
+    assert dlq_body["failure_schema"] == "kaiops.message-failure.v1"
+    assert dlq_body["failure_type"] == "builtins.RuntimeError"
+    assert dlq_body["failure_reason"] == sanitized
+    assert "message_identity" in dlq_body
 
 
 def test_new_consumer_exposes_zero_deadletters_without_resetting_existing_count(monkeypatch):
@@ -248,18 +281,18 @@ def test_new_consumer_exposes_zero_deadletters_without_resetting_existing_count(
     registry = CollectorRegistry()
     counter = Counter("test_deadletters", "Failures", ["provider", "queue", "reason"], registry=registry)
     monkeypatch.setattr(rabbitmq, "DEAD_LETTER_EVENTS", counter)
-    rabbitmq.RabbitMQConsumer(Settings(), "context-events")
+    rabbitmq.RabbitMQConsumer(Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, ), "context-events")
     labels = {"provider":"rabbitmq", "queue":"context-events", "reason":"handler_failed"}
     assert registry.get_sample_value("test_deadletters_total", labels) == 0
     counter.labels(**labels).inc(2)
-    rabbitmq.RabbitMQConsumer(Settings(), "context-events")
+    rabbitmq.RabbitMQConsumer(Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, ), "context-events")
     assert registry.get_sample_value("test_deadletters_total", labels) == 2
 
 
 @pytest.mark.parametrize("body", [b"not-json", b'{"payload": []}'])
 async def test_malformed_input_is_quarantined_before_ack(body):
     import base64
-    consumer = RabbitMQConsumer(Settings(), "raw-alerts")
+    consumer = RabbitMQConsumer(Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, ), "raw-alerts")
     consumer._connection = object()
     consumer._exchange = _FakeExchange()
     consumer._dlq_routing_key = "raw-alerts.dlq"
@@ -283,7 +316,7 @@ async def test_malformed_input_is_quarantined_before_ack(body):
 
 async def test_failed_quarantine_keeps_message_for_redelivery():
     from common.rabbitmq import _quarantine_invalid_message
-    consumer = RabbitMQConsumer(Settings(), "raw-alerts")
+    consumer = RabbitMQConsumer(Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, ), "raw-alerts")
     message = _FakeMessage(b"broken")
     await _quarantine_invalid_message(consumer, message, "decode_failed")
     assert message.acked == 0
@@ -296,7 +329,7 @@ async def test_terminal_handoff_is_bounded_and_ack_requires_durable_state(monkey
     from unittest.mock import AsyncMock
     monkeypatch.setattr(module, "processing_cancelled", AsyncMock(return_value=False))
     monkeypatch.setattr(module, "_PUBLISH_TIMEOUT_SECONDS", 0.03)
-    consumer = RabbitMQConsumer(Settings(RABBITMQ_CONSUMER_MAX_RETRIES=0,
+    consumer = RabbitMQConsumer(Settings(ALERT_PROCESSING_LIMIT_ENABLED=False, RABBITMQ_CONSUMER_MAX_RETRIES=0,
         RABBITMQ_TRANSIENT_REQUEUE_ENABLED=False), "context-events")
     consumer._connection = object()
     consumer._dlq_routing_key = "context-events.dlq"

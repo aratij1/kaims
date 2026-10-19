@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from common.config import Settings
+from common.alert_processing_budget import run_handler
 from common.logging import get_logger
 from common.resilience import retry_async
 
@@ -209,7 +210,7 @@ async def consume_forever(
                     success = False
                     while attempts <= max_retries:
                         try:
-                            await handler(payload)
+                            await run_handler(consumer._settings, consumer._topic, handler, payload)
                             success = True
                             break
                         except Exception:

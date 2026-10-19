@@ -12,6 +12,64 @@ assert SPEC and SPEC.loader
 SPEC.loader.exec_module(MODULE)
 
 
+def test_operator_project_alias_wins_over_onboarded_alias(monkeypatch, tmp_path):
+    catalog = tmp_path / "projects.json"
+    catalog.write_text(json.dumps({"projects": {"kaiops": {
+        "aliases": ["kaims"], "telemetry": {"signal_metric_bindings": {"alert": {"metric_name": "registered"}}}
+    }}}))
+    monkeypatch.setenv("DISCOVERY_MCP_PROJECTS_FILE", str(catalog))
+    monkeypatch.setattr(MODULE, "_ONBOARDED_PROJECTS_CACHE", {"kaims": {"name": "kaims", "telemetry": {}}})
+    project_id, project = MODULE._project_for({"project": "kaims", "terms": ["rabbitmq"]})
+    assert project_id == "kaiops"
+    assert project["telemetry"]["signal_metric_bindings"]
+    assert "kaims" in MODULE._project_catalog()  # onboarding data is retained
+
+
+@pytest.mark.asyncio
+async def test_registered_external_probe_uses_its_own_monitoring_source(monkeypatch):
+    import httpx
+    from datetime import datetime, UTC
+    monkeypatch.setattr(MODULE, "_project_for", lambda args: ("telemetry", {"telemetry": {
+        "prometheus_url": "http://application-metrics:9090",
+        "probe_job_sources": {"telemetry-application": "http://independent-probes:9090"}}}))
+    calls = []
+    def handle(request):
+        calls.append(request)
+        assert request.url.host == "independent-probes"
+        assert "probe_success" in request.url.params["query"]
+        assert 'job="telemetry-application"' in request.url.params["query"]
+        return httpx.Response(200, json={"data": {"result": [{"metric": {
+            "__name__": "probe_success", "service": "frontend-proxy", "job": "telemetry-application"},
+            "value": [datetime.now(UTC).timestamp(), "0"]}]}})
+    factory = httpx.AsyncClient
+    monkeypatch.setattr(MODULE.httpx, "AsyncClient", lambda **kw: factory(transport=httpx.MockTransport(handle), **kw))
+    result = await MODULE._search_telemetry({"project": "telemetry", "service": "frontend-proxy",
+        "evidence_category": "metrics", "target_labels": {"job": "telemetry-application"}})
+    assert len(calls) == 1
+    assert result["evidence"][0]["metric"]["__name__"] == "probe_success"
+
+
+@pytest.mark.asyncio
+async def test_probe_range_never_requests_future_evaluation_timestamps(monkeypatch):
+    import httpx
+    from datetime import UTC, datetime, timedelta
+    now = datetime.now(UTC)
+    monkeypatch.setattr(MODULE, "_project_for", lambda args: ("telemetry", {"telemetry": {
+        "probe_job_sources": {"telemetry-application": "http://independent-probes:9090"}}}))
+    def handle(request):
+        assert request.url.path.endswith("/query_range")
+        assert float(request.url.params["end"]) <= datetime.now(UTC).timestamp()
+        assert float(request.url.params["start"]) < float(request.url.params["end"])
+        return httpx.Response(200, json={"data": {"result": []}})
+    factory = httpx.AsyncClient
+    monkeypatch.setattr(MODULE.httpx, "AsyncClient", lambda **kw: factory(transport=httpx.MockTransport(handle), **kw))
+    result = await MODULE._search_telemetry({"project": "telemetry", "service": "frontend-proxy",
+        "evidence_category": "metrics", "target_labels": {"job": "telemetry-application"},
+        "start_time": (now - timedelta(minutes=5)).isoformat(),
+        "end_time": (now + timedelta(minutes=15)).isoformat()})
+    assert result["sources"][0]["status"] == "completed"
+
+
 def test_telemetry_project_routes_code_search_to_astronomy_shop(monkeypatch):
     project_root = Path("/workspace/external/telemetry/opentelemetry-demo")
     monkeypatch.setattr(
@@ -634,3 +692,87 @@ async def test_traces_search_still_queries_the_shared_jaeger_for_a_service_no_pr
 
     assert result["result_count"] == 1
     assert result["evidence"][0]["trace_id"] == "payments-trace"
+
+@pytest.mark.asyncio
+async def test_platform_runtime_probe_survives_scrape_job_scope_and_limit(monkeypatch):
+    import httpx
+    from datetime import UTC, datetime
+    monkeypatch.setattr(MODULE, '_project_for', lambda args: ('kaiops', {'telemetry': {
+        'prometheus_url': 'http://metrics:9090', 'runtime_probe_job': 'kaims-recovery-http'}}))
+    def handle(request):
+        query = request.url.params['query']
+        assert 'job="kaiops-closure-service"' in query
+        assert 'job="kaims-recovery-http"' in query
+        assert 'tenant_id="tenant-a"' in query
+        rows = [{'metric': {'__name__': 'up', 'job': 'kaiops-closure-service'},
+                 'value': [datetime.now(UTC).timestamp(), '0']}]
+        for tenant in ['other', 'tenant-a']:
+            rows.append({'metric': {'__name__': 'probe_success', 'job': 'kaims-recovery-http',
+                'service': 'kaiops-closure-service', 'tenant_id': tenant},
+                'value': [datetime.now(UTC).timestamp(), '0']})
+        return httpx.Response(200, json={'data': {'result': rows}})
+    factory = httpx.AsyncClient
+    monkeypatch.setattr(MODULE.httpx, 'AsyncClient', lambda **kw: factory(transport=httpx.MockTransport(handle), **kw))
+    result = await MODULE._search_telemetry({'project': 'kaiops', 'service': 'kaiops-closure-service',
+        'tenant_id': 'tenant-a', 'evidence_category': 'metrics', 'limit': 1,
+        'target_labels': {'job': 'kaiops-closure-service', 'instance': 'closure-service:8000'}})
+    assert len(result['evidence']) == 1
+    assert result['evidence'][0]['metric']['__name__'] == 'probe_success'
+    assert result['evidence'][0]['metric']['tenant_id'] == 'tenant-a'
+
+def test_trace_summary_preserves_exception_types_without_sensitive_event_text():
+    trace = {"traceID": "timeout", "processes": {"p": {"serviceName": "api"}}, "spans": [{
+        "spanID": "client", "processID": "p", "operationName": "GET", "duration": 5000000,
+        "tags": [{"key": "span.kind", "value": "client"}],
+        "logs": [{"fields": [{"key": "exception.type", "value": "httpx.ConnectTimeout"},
+                              {"key": "exception.message", "value": "sensitive-request"}]}],
+    }]}
+    summary = MODULE._trace_evidence_summary(trace)
+    assert summary["slowest_spans"][0]["exception_types"] == ["httpx.ConnectTimeout"]
+    assert summary["error_span_count"] == 1
+    assert "sensitive-request" not in str(summary)
+
+
+def test_trace_summary_preserves_timing_and_parentage_without_false_errors():
+    trace = {'traceID': 't', 'processes': {'p': {'serviceName': 'api'}}, 'spans': [
+        {'spanID': 'root', 'processID': 'p', 'operationName': 'GET /inbox', 'startTime': 1000000,
+         'duration': 14000000, 'tags': [{'key': 'http.status_code', 'value': 500}]},
+        {'spanID': 'child', 'processID': 'p', 'operationName': 'SELECT', 'startTime': 2000000,
+         'duration': 4000000, 'references': [{'refType': 'CHILD_OF', 'traceID': 't', 'spanID': 'root'}],
+         'logs': [{'fields': [{'key': 'event', 'value': 'connection opened'}]}]},
+    ]}
+    summary = MODULE._trace_evidence_summary(trace)
+    assert summary['error_span_count'] == 1
+    child = next(s for s in summary['slowest_spans'] if s['span_id'] == 'child')
+    assert child['parent_span_ids'] == ['root']
+    assert child['start_time_us'] == 2000000
+    assert child['duration_ms'] == 4000
+
+@pytest.mark.asyncio
+async def test_registered_dead_letter_signal_keeps_consumer_queue_and_reason(monkeypatch):
+    import httpx
+    from datetime import UTC, datetime
+    telemetry = {'prometheus_url': 'http://metrics:9090', 'signal_metric_bindings': {
+        'KaiOpsDeadLettersIncreasing': {'service': 'rabbitmq', 'tenant_id': 'tenant-a', 'environment': 'prod',
+            'metric_name': 'kaiops_dead_letter_events_total', 'labels': {'provider': 'rabbitmq'}}}}
+    monkeypatch.setattr(MODULE, '_project_for', lambda args: ('kaiops', {'telemetry': telemetry}))
+    def handle(request):
+        assert 'provider="rabbitmq"' in request.url.params['query']
+        return httpx.Response(200, json={'data': {'result': [
+            {'metric': {'__name__': 'kaiops_dead_letter_events_total', 'provider': 'rabbitmq',
+                'job': 'kaiops-approval-service', 'queue': 'idle-queue', 'reason': 'handler_failed'},
+             'values': [[datetime.now(UTC).timestamp() - 30, '0'], [datetime.now(UTC).timestamp(), '0']]},
+            {'metric': {'__name__': 'kaiops_dead_letter_events_total', 'provider': 'rabbitmq',
+                'job': 'kaiops-resolution-agent', 'queue': 'context-events', 'reason': 'handler_failed'},
+             'values': [[datetime.now(UTC).timestamp() - 30, '0'], [datetime.now(UTC).timestamp(), '2']]},
+            {'metric': {'__name__': 'kaiops_dead_letter_events_total', 'provider': 'kafka'},
+             'value': [datetime.now(UTC).timestamp(), '99']}]}})
+    factory = httpx.AsyncClient
+    monkeypatch.setattr(MODULE.httpx, 'AsyncClient', lambda **kw: factory(transport=httpx.MockTransport(handle), **kw))
+    result = await MODULE._search_telemetry({'project': 'kaiops', 'service': 'rabbitmq',
+        'tenant_id': 'tenant-a', 'environment': 'prod', 'alert_name': 'KaiOpsDeadLettersIncreasing',
+        'evidence_category': 'metrics', 'limit': 1})
+    assert len(result['evidence']) == 1
+    metric = result['evidence'][0]['metric']
+    assert metric['queue'] == 'context-events' and metric['reason'] == 'handler_failed'
+    assert metric['job'] == 'kaiops-resolution-agent'

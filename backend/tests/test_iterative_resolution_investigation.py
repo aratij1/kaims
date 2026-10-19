@@ -238,7 +238,7 @@ def test_saturated_container_supports_a_resource_hypothesis() -> None:
     assert investigator._structured_mechanism_support(hypothesis, resource_row) is True
 
 
-def test_healthy_container_contradicts_a_resource_hypothesis() -> None:
+def test_healthy_container_does_not_disprove_a_data_path_constraint() -> None:
     investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
     hypothesis = {"claim": "Resource saturation or a data-path constraint is affecting checkout."}
     resource_row = {
@@ -247,13 +247,14 @@ def test_healthy_container_contradicts_a_resource_hypothesis() -> None:
         "metadata": {"service": "checkout", "saturated": False, "cpu_percent": 12.0, "cpu_throttled_ratio": 0.0},
     }
 
-    assert investigator._structured_mechanism_contradiction(hypothesis, resource_row) is True
+    assert investigator._structured_mechanism_contradiction(hypothesis, resource_row) is False
+    assert investigator._structured_mechanism_contradiction(
+        {"claim": "Resource saturation is affecting checkout."}, resource_row,
+    ) is True
 
 
-def test_resource_health_evidence_binds_as_support_despite_being_observed_after_the_incident_window() -> None:
-    """Same freshness gap as the dependency case: resource-health.search is
-    always a live cgroup snapshot taken at query time, so it is virtually
-    always outside the incident's historical window."""
+def test_later_resource_health_is_not_support_for_a_historical_cause() -> None:
+    """Later cgroup state cannot corroborate a historical resource bottleneck."""
     investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
     context = make_context()
     checked_now = context.alert.starts_at + timedelta(hours=2)
@@ -283,7 +284,7 @@ def test_resource_health_evidence_binds_as_support_despite_being_observed_after_
     revised = investigator._revise_hypotheses(hypotheses, evidence, context=context)
     resource_hyp = next(row for row in revised if row["hypothesis_id"] == "resource-hyp")
 
-    assert "RESOURCE-SATURATED" in resource_hyp["supporting_evidence_ids"]
+    assert "RESOURCE-SATURATED" not in resource_hyp["supporting_evidence_ids"]
 
 
 def test_select_tool_pursues_topology_before_a_leading_dependency_hypothesis_can_go_unchecked() -> None:
@@ -348,6 +349,39 @@ async def test_investigation_queries_missing_sources_and_returns_inconclusive() 
     assert report["investigation_plan"]["recommended_tool_calls"]
     assert report["correlation_id"]
     assert all("start_time" in arguments and "end_time" in arguments for _, arguments in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_full_accumulated_context_leaves_capacity_for_targeted_diagnostics() -> None:
+    context = make_context()
+    context.metadata["context_evidence"] = {"code": [
+        {"evidence_id": f"CODE-{index}", "source": "code", "snippet": "instrumentation only"}
+        for index in range(200)
+    ]}
+    client = FakeDiscoveryClient({"logs.search": [
+        {"evidence_id": "LOG-targeted", "source": "logs", "snippet": "read-only diagnostic result"}
+    ]})
+    investigator = IterativeInvestigator(client=client)
+    investigator.max_steps = 4
+    report = await investigator.investigate(context)
+
+    assert report["steps_used"] == 4
+    assert all(arguments["limit"] > 0 for _, arguments in client.calls)
+    assert report["stop_reason"] != "evidence_budget_exhausted"
+    assert report["evidence_count"] <= investigator.max_evidence
+    assert any(row["evidence_id"] == "LOG-targeted" for row in report["evidence"])
+    assert report["conclusive"] is False
+
+
+def test_failed_outbound_connection_does_not_require_a_downstream_server_span() -> None:
+    row = {"source_type": "trace", "metadata": {"slowest_spans": [{
+        "tags": {"span.kind": "client"}, "exception_types": ["httpx.ConnectTimeout"],
+        "duration_ms": 5002,
+    }]}}
+    claim = {"claim": "Outbound dependency connection timeouts are delaying checkout requests."}
+    assert IterativeInvestigator._structured_mechanism_support(claim, row)
+    row["metadata"]["slowest_spans"][0]["exception_types"] = ["httpx.ReadTimeout"]
+    assert not IterativeInvestigator._structured_mechanism_support(claim, row)
 
 
 def test_generic_change_candidate_does_not_override_latency_evidence_priority() -> None:
@@ -882,22 +916,8 @@ def test_unhealthy_dependency_in_incident_window_is_typed_support() -> None:
     assert investigator._structured_mechanism_support(hypothesis, dependency) is True
 
 
-def test_dependency_health_evidence_binds_as_support_despite_being_observed_after_the_incident_window() -> None:
-    """Real, live-reproduced gap: a dependency-health check is, by
-    construction, always a live snapshot taken at query time (discovery-mcp's
-    _search_runtime_topology stamps observed_at as "now") -- so once an
-    incident is more than ~15 minutes old, that check is virtually always
-    outside the incident's observation window, and `_operational_for_support`
-    (gating support/contradiction eligibility ahead of
-    _structured_mechanism_support/_structured_mechanism_contradiction) marked
-    it "not current" unconditionally, regardless of what it actually said.
-    Confirmed live: a real, correctly-targeted dependency-health query
-    against a genuinely different downstream service never once moved a
-    "dependency" hypothesis's confidence, with or without that evidence in
-    the pool, because it was silently excluded before the structured checks
-    ever ran. This test builds evidence with a realistic "checked long after
-    the alert fired" timestamp (unlike the existing "observed at alert
-    onset" fixtures) and requires it to still count."""
+def test_later_dependency_failure_is_not_support_for_a_historical_cause() -> None:
+    """A query-time snapshot cannot establish the cause two hours earlier."""
     investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
     context = make_context()
     checked_now = context.alert.starts_at + timedelta(hours=2)
@@ -927,10 +947,10 @@ def test_dependency_health_evidence_binds_as_support_despite_being_observed_afte
     revised = investigator._revise_hypotheses(hypotheses, evidence, context=context)
     dependency_hyp = next(row for row in revised if row["hypothesis_id"] == "dependency-hyp")
 
-    assert "DEPENDENCY-UNHEALTHY" in dependency_hyp["supporting_evidence_ids"]
+    assert "DEPENDENCY-UNHEALTHY" not in dependency_hyp["supporting_evidence_ids"]
 
 
-def test_healthy_dependency_evidence_contradicts_despite_being_observed_after_the_incident_window() -> None:
+def test_later_healthy_dependency_does_not_contradict_historical_trace() -> None:
     investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
     context = make_context()
     checked_now = context.alert.starts_at + timedelta(hours=2)
@@ -971,7 +991,7 @@ def test_healthy_dependency_evidence_contradicts_despite_being_observed_after_th
     revised = investigator._revise_hypotheses(hypotheses, evidence, context=context)
     dependency_hyp = next(row for row in revised if row["hypothesis_id"] == "dependency-hyp")
 
-    assert "DEPENDENCY-HEALTHY-NOW" in dependency_hyp["contradicting_evidence_ids"]
+    assert "DEPENDENCY-HEALTHY-NOW" not in dependency_hyp["contradicting_evidence_ids"]
 
 
 @pytest.mark.asyncio
@@ -1231,3 +1251,21 @@ def test_latency_alert_and_unrelated_log_do_not_prove_impact():
     impact = next(claim for claim in claims if claim.kind == ClaimKind.IMPACT)
     assert impact.status == ClaimStatus.NOT_ESTABLISHED
     assert impact.supporting_evidence_ids == []
+
+def test_supported_mechanism_gets_investigation_priority_over_unconfirmable_symptom():
+    symptom = {'source': 'derived_observation', 'status': 'leading', 'confidence': .95,
+               'supporting_evidence_ids': ['healthy-container']}
+    mechanism = {'source': 'mechanism_candidate', 'status': 'leading', 'confidence': .55,
+                 'supporting_evidence_ids': ['slow-trace']}
+    unsupported = {'source': 'mechanism_candidate', 'status': 'candidate', 'confidence': .9}
+    assert sorted([symptom, mechanism, unsupported], key=IterativeInvestigator._hypothesis_rank,
+                  reverse=True)[0] == mechanism
+    assert mechanism['status'] != 'confirmed'
+
+def test_running_dependency_is_not_a_performance_counterexample():
+    hypothesis = {'claim': 'An unhealthy downstream dependency is degrading checkout.'}
+    row = {'source_type': 'dependency', 'metadata': {'service': 'payments', 'related_to': 'checkout',
+           'healthy': True, 'runtime_state': 'running'}}
+    assert IterativeInvestigator._structured_mechanism_contradiction(hypothesis, row) is False
+    row['metadata']['health_scope'] = 'performance'
+    assert IterativeInvestigator._structured_mechanism_contradiction(hypothesis, row) is True

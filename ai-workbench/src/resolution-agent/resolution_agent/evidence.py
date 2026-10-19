@@ -8,13 +8,30 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from common.evidence_source_policy import is_alert_artifact
+from common.evidence_source_policy import is_alert_artifact, is_derived_observation
 
 
 EvidenceSourceType = Literal[
     "alert", "metric", "log", "trace", "topology", "dependency", "change", "code", "ticket", "runbook", "database",
     "resource",
 ]
+
+DIAGNOSTIC_FIELDS = frozenset({
+    "metric", "value", "values", "query", "trace_id", "span_id", "duration_ms",
+    "slowest_spans", "dependency_edges", "operations", "http_status_codes",
+    "runtime_lifecycle", "change_evidence_kind", "observation_scope", "deployment_id",
+})
+
+
+def source_metadata(value: Any) -> dict[str, Any]:
+    """Read bounded legacy wrappers; outer normalized fields stay authoritative."""
+    layers = []
+    for _ in range(8):
+        if not isinstance(value, dict):
+            break
+        layers.append({key: item for key, item in value.items() if key != "metadata"})
+        value = value.get("metadata")
+    return {key: item for layer in reversed(layers) for key, item in layer.items()}
 
 
 class EvidenceRecord(BaseModel):
@@ -179,7 +196,7 @@ class EvidenceCompiler:
             before_incident_window = bool(incident_started_at and observed < incident_started_at)
             after_incident_window = bool(incident_ended_at and observed > incident_ended_at)
             outside_incident_window = before_incident_window or after_incident_window
-            guidance_only = source_type in self.GUIDANCE_TYPES
+            guidance_only = source_type in self.GUIDANCE_TYPES or is_derived_observation(row)
             reliability = float(row.get("reliability_score") or row.get("confidence") or self.RELIABILITY[source_type])
             reliability = max(0.0, min(reliability, 1.0))
             current_operational = (not timestamp_missing and not guidance_only and not outside_incident_window
@@ -234,7 +251,13 @@ class EvidenceCompiler:
                     freshness_seconds=freshness,
                     reliability_score=reliability,
                     metadata={
-                        **{key: value for key, value in row.items() if key not in {"content", "snippet"}},
+                        # Normalized and previously compiled records carry
+                        # source structure inside metadata. Keep span/metric
+                        # fields at the same depth across every compilation.
+                        **source_metadata(row.get("metadata")),
+                        **({key: value for key, value in row["content"].items()
+                            if key in DIAGNOSTIC_FIELDS} if isinstance(row.get("content"), dict) else {}),
+                        **{key: value for key, value in row.items() if key not in {"content", "snippet", "metadata"}},
                         "guidance_only": guidance_only,
                         "current_operational_evidence": current_operational,
                         "timestamp_missing": timestamp_missing,

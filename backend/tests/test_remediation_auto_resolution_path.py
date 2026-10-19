@@ -779,3 +779,60 @@ def test_build_policy_blocked_action_returns_approval_wait_state() -> None:
     assert action.action_type == "policy-blocked"
     assert action.status.value == "awaiting_approval"
     assert action.metadata.get("policy_blocked") is True
+
+@pytest.mark.asyncio
+async def test_runbook_governance_uses_immutable_plan_identity(monkeypatch):
+    from unittest.mock import AsyncMock
+    from types import SimpleNamespace
+    module = load_remediation_app_module()
+    class Session:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+    governance = {'status': 'approved', 'payload': {'checksum_sha256': 'sha256:approved',
+                   'approval_expires_at': '2099-01-01T00:00:00Z'}}
+    repository = SimpleNamespace(get_runbook_governance=AsyncMock(return_value=governance))
+    monkeypatch.setattr(module, 'IncidentRepository', lambda _: repository)
+    module.app.state.session_factory = Session
+    module.settings.database_enabled = True
+    approval = SimpleNamespace(tenant_id='tenant-a', metadata={'execution_plan': {
+        'runbook_governance_id': 'governed-id', 'playbook_version': 3,
+        'runbook_checksum': 'sha256:approved'}})
+    await module._require_persisted_approved_runbook(approval)
+    repository.get_runbook_governance.assert_awaited_once_with('governed-id',3,tenant_id='tenant-a')
+    approval.metadata['execution_plan']['runbook_checksum'] = 'sha256:tampered'
+    with pytest.raises(module.PolicyViolation, match='checksum'):
+        await module._require_persisted_approved_runbook(approval)
+    approval.metadata['execution_plan']['runbook_checksum'] = 'sha256:approved'
+    governance['status'] = 'suspended'
+    with pytest.raises(module.PolicyViolation, match='suspended'):
+        await module._require_persisted_approved_runbook(approval)
+
+
+def test_successful_async_receipt_advances_canonical_lifecycle_without_faking_recovery():
+    from types import SimpleNamespace
+    from uuid import uuid4
+    module = load_remediation_app_module()
+    incident, recommendation = uuid4(), uuid4()
+    lifecycle = module.create_lifecycle(tenant_id='tenant-a',incident_id=incident,recommendation_id=recommendation,
+        plan={},state=module.ResolutionState.READY_TO_EXECUTE)
+    action = SimpleNamespace(id=uuid4(),status=RemediationStatus.SUCCEEDED,error=None,
+        parameters={'resolution_lifecycle':lifecycle,'execution_result':{'executed':True,'recovery_validated':True}},metadata={})
+    module._advance_action_lifecycle(action)
+    assert action.parameters['resolution_lifecycle']['state']=='validating'
+    assert action.parameters['resolution_lifecycle']['state']!='recovered'
+    action.parameters={'resolution_lifecycle':lifecycle,'execution_result':{'executed':False}}
+    with pytest.raises(ValueError,match='illegal resolution lifecycle transition'):
+        module._advance_action_lifecycle(action)
+
+
+def test_dispatch_failure_before_executor_acceptance_remains_a_truthful_retry_block():
+    from types import SimpleNamespace
+    from uuid import uuid4
+    module=load_remediation_app_module()
+    lifecycle=module.create_lifecycle(tenant_id='tenant-a',incident_id=uuid4(),recommendation_id=uuid4(),
+        plan={},state=module.ResolutionState.READY_TO_EXECUTE)
+    action=SimpleNamespace(id=uuid4(),status=RemediationStatus.FAILED,error='Executor transport unavailable',
+        parameters={'resolution_lifecycle':lifecycle},metadata={})
+    module._advance_action_lifecycle(action)
+    assert action.parameters['resolution_lifecycle']['state']=='blocked_retryable'
+    assert action.parameters['resolution_lifecycle']['reason_code']=='dispatch_not_accepted'

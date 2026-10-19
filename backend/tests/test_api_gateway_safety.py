@@ -981,3 +981,24 @@ def test_linked_documents_uses_bounded_exact_alert_lookup() -> None:
 
     assert "/processed-result?" in route
     assert 'alerts_path = f"/alerts/all?' not in route
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('persistent', [False, True])
+async def test_command_retries_generation_race_without_mixing_results(monkeypatch, persistent):
+    module = load_api_gateway_app_module()
+    counts = {'incident': 0, 'operations': 0}
+    async def proxy(**kwargs):
+        if kwargs['target_base'] == module.settings.monitoring_adapter_url:
+            counts['incident'] += 1
+            return {'incident_id':'i', 'recommendation_id':'old' if persistent or counts['incident'] == 1 else 'new'}
+        counts['operations'] += 1
+        return {'incident_id':'i', 'investigation_workspace':{'binding':{'recommendation_id':'new'}}}
+    monkeypatch.setattr(module, 'guarded_proxy', proxy)
+    if persistent:
+        with pytest.raises(module.HTTPException) as error:
+            await module.get_incident_command_workspace('i', SimpleNamespace(), tenant_id='tenant-a')
+        assert error.value.status_code == 409
+    else:
+        result = await module.get_incident_command_workspace('i', SimpleNamespace(), tenant_id='tenant-a')
+        assert result['incident']['recommendation_id'] == 'new'
+    assert counts == {'incident':2, 'operations':2}

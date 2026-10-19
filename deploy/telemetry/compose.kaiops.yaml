@@ -13,6 +13,14 @@ services:
     container_name: telemetry-email
   flagd:
     container_name: telemetry-flagd
+    environment:
+      GOMAXPROCS: "2"
+      GOMEMLIMIT: 96MiB
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.25"
   flagd-ui:
     container_name: telemetry-flagd-ui
   frontend:
@@ -26,6 +34,16 @@ services:
     container_name: telemetry-image-provider
   load-generator:
     container_name: telemetry-load-generator
+    environment:
+      LOCUST_USERS: "1"
+      LOCUST_HTTP_USER_WEIGHT: "1"
+      LOCUST_BROWSER_USER_WEIGHT: "0"
+      LOCUST_BROWSER_TRAFFIC_ENABLED: "false"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
   payment:
     container_name: telemetry-payment
     healthcheck:
@@ -40,6 +58,10 @@ services:
       retries: 10
   product-catalog:
     container_name: telemetry-product-catalog
+    deploy:
+      resources:
+        limits:
+          memory: 96M
     healthcheck:
       start_period: 30s
       interval: 15s
@@ -81,6 +103,14 @@ services:
       - "9200:9200"
   grafana:
     container_name: telemetry-grafana
+    environment:
+      GOMAXPROCS: "2"
+      GOMEMLIMIT: 384MiB
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.5"
     ports: !override
       - "13000:3000"
 

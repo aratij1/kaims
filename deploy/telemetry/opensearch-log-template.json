@@ -1,0 +1,14 @@
+{
+  "index_patterns": ["otel-logs-v2-*"],
+  "priority": 200,
+  "template": {
+    "mappings": {
+      "properties": {
+        "attributes": {"type": "flat_object"},
+        "instrumentationScope": {
+          "properties": {"attributes": {"type": "flat_object"}}
+        }
+      }
+    }
+  }
+}

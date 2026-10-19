@@ -43,6 +43,11 @@ class ResolutionWorker:
     def policy(self,tenant,application,service):
         return self.policies.get(policy_key(tenant,application,service))
 
+    def automatic_scopes(self, tenant):
+        now=datetime.now(timezone.utc)
+        return sorted(key for key,policy in self.policies.items() if key.split('/')[0]==tenant
+                      and policy.get('automatic_until') and instant(policy['automatic_until'])>now)
+
     async def request(self,policy,kind,body=None,key=None):
         headers=dict(policy.get("headers",{}))
         if key:headers["Idempotency-Key"]=key
@@ -139,11 +144,14 @@ class ResolutionWorker:
             try:return self.approve(tenant,application,incident,digest(plan),"approve",envelope)
             except ValueError as error:raise RuntimeError(str(error)) from error
         with self.store.engine.connect() as c:
-            approved=c.execute(select(approvals.c.decision).where(approvals.c.tenant_id==tenant,
+            approval=c.execute(select(approvals.c.decision,approvals.c.authority).where(approvals.c.tenant_id==tenant,
                 approvals.c.application_id==application,approvals.c.incident_id==incident,
-                approvals.c.plan_digest==digest(plan))).scalar_one_or_none()
-        if approved!="approve":raise RuntimeError("Missing bound approval")
+                approvals.c.plan_digest==digest(plan))).first()
+        if not approval or approval.decision!="approve":raise RuntimeError("Missing bound approval")
         if consumer=="resolution-execution":
+            if approval.authority=="preauthorized_policy" and (not policy.get('automatic_until')
+                    or instant(policy['automatic_until'])<=datetime.now(timezone.utc)):
+                raise RuntimeError("Automatic execution authorization expired")
             if instant(plan["expires_at"])<=datetime.now(timezone.utc):raise RuntimeError("Approved plan expired")
             key=digest({"tenant":tenant,"application":application,"incident":incident,"plan":digest(plan)})
             response=await self.request(policy,"execution",{"action":plan["action"],"service":service,

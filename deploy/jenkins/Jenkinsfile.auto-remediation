@@ -5,10 +5,20 @@ def approvedComposeLabelCommand(String command) {
     def project = labels.group(1)
     def service = labels.group(2)
     def filters = "%7B%22label%22%3A%5B%22com.docker.compose.project%3D${project}%22%2C%22com.docker.compose.service%3D${service}%22%5D%7D"
-    def listUrl = "http://docker-socket-proxy:2375/containers/json?filters=${filters}"
+    def pinned = value =~ /%22id%22%3A%5B%22([0-9a-f]{64})%22%5D/
+    def operation = 'restart?t=30'
+    def listPrefix = 'all=true&filters='
+    if (pinned.find()) {
+        def id = pinned.group(1)
+        filters = filters.substring(0, filters.length() - 3) + "%2C%22id%22%3A%5B%22${id}%22%5D%2C%22status%22%3A%5B%22exited%22%2C%22dead%22%5D%7D"
+        operation = 'start'
+    } else if (!value.contains('all=true&filters=')) {
+        listPrefix = 'filters=' // Previously approved internal restart plans.
+    }
+    def listUrl = "http://docker-socket-proxy:2375/containers/json?${listPrefix}${filters}"
     def lookup = "curl --fail --silent --show-error '${listUrl}' | grep -o '\"Id\":\"[^\"]*\"' | head -n 1 | cut -d'\"' -f4"
     def preflight = "${lookup} | grep --quiet ."
-    def restart = "container_id=\$(${lookup}); test -n \"\$container_id\" && curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 -X POST http://docker-socket-proxy:2375/containers/\$container_id/restart?t=30"
+    def restart = "container_id=\$(${lookup}); test -n \"\$container_id\" && curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 -X POST http://docker-socket-proxy:2375/containers/\$container_id/${operation}"
     return value == preflight || value == restart
 }
 
@@ -46,7 +56,7 @@ def approvedCommand(String command) {
         ~/^redis-cli\s+-h\s+[A-Za-z0-9_.-]+\s+-n\s+\d+\s+FLUSHDB$/,
         ~/^terraform\s+(init|apply)\b.*/,
         ~/^mysql\s+-e\s+"CALL mysql\.rds_failover\(\);"$/,
-        ~/^curl --fail --silent --show-error( --output \/dev\/null)?( --retry \d+)?( --retry-all-errors)?( --retry-connrefused)?( --retry-delay \d+)?( -X POST)? http:\/\/[A-Za-z0-9_.:-]+\/[A-Za-z0-9_.\/?=&-]+$/
+        ~/^curl --fail --silent --show-error( --output \/dev\/null)?( --retry \d+)?( --retry-all-errors)?( --retry-connrefused)?( --retry-delay \d+)?( -X POST)? http:\/\/[A-Za-z0-9_.:-]+\/[A-Za-z0-9_.\/?=&-]*$/
     ]
     return value && value.length() <= 2000 && !value.contains('\n') &&
         (patterns.any { value ==~ it } || approvedComposeLabelCommand(value) || approvedComposeScaleCommand(value))
@@ -108,7 +118,7 @@ pipeline {
                     def mutating = params.KAI_OPS_RESOLUTION_ID != 'investigate-first'
                     def commands = plan.commands instanceof List ? plan.commands : []
                     def scripts = plan.scripts instanceof List ? plan.scripts : []
-                    def preflight = plan.preflight instanceof List ? plan.preflight : []
+                    def preflight = plan.preflight_commands instanceof List ? plan.preflight_commands : (plan.preflight instanceof List ? plan.preflight : [])
                     def validation = plan.validation_commands instanceof List ? plan.validation_commands : []
                     def rollback = plan.rollback_commands instanceof List ? plan.rollback_commands : []
                     def rollbackMode = (plan.rollback_mode ?: 'automatic') as String
@@ -133,7 +143,7 @@ pipeline {
             steps { script {
                 def plan = readJSON text: env.KAI_OPS_PLAN_JSON, returnPojo: true
                 plan.preflight.each { runGovernedCommand('Preflight evidence', it as String, params.KAI_OPS_DRY_RUN) }
-                env.KAI_OPS_PREFLIGHT_PASSED = 'true'
+                env.KAI_OPS_PREFLIGHT_PASSED = params.KAI_OPS_DRY_RUN ? 'false' : 'true'
             } }
         }
         stage('Remediate, verify, recover') {
@@ -144,9 +154,10 @@ pipeline {
                     try {
                         plan.scripts.each { runGovernedScript(it as String, params.KAI_OPS_DRY_RUN) }
                         plan.commands.each { runGovernedCommand('Approved remediation', it as String, params.KAI_OPS_DRY_RUN) }
-                        env.KAI_OPS_EXECUTED = 'true'
+                        env.KAI_OPS_EXECUTED = params.KAI_OPS_DRY_RUN ? 'false' : 'true'
                         retry(3) { plan.validation.each { runGovernedCommand('Recovery validation', it as String, params.KAI_OPS_DRY_RUN) } }
-                        env.KAI_OPS_VALIDATED = 'true'
+                        env.KAI_OPS_VALIDATED = params.KAI_OPS_DRY_RUN ? 'false' : 'true'
+                        env.KAI_OPS_DRY_RUN_VALIDATED = params.KAI_OPS_DRY_RUN ? 'true' : 'false'
                     } catch (failure) {
                         env.KAI_OPS_FAILURE = failure.message.take(500)
                         if (!params.KAI_OPS_DRY_RUN && env.KAI_OPS_EXECUTED == 'true' && plan.rollback_mode == 'automatic' && plan.rollback) {
@@ -162,13 +173,13 @@ pipeline {
         stage('Publish recovery evidence') {
             steps {
                 milestone ordinal: 30, label: 'validated-recovery'
-                script { def plan = readJSON text: env.KAI_OPS_PLAN_JSON, returnPojo: true; writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, plan_digest:params.KAI_OPS_PLAN_DIGEST, executed_script_count:(plan.scripts instanceof List ? plan.scripts.size() : 0), dry_run:params.KAI_OPS_DRY_RUN, preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:env.KAI_OPS_VALIDATED == 'true', rollback_attempted:env.KAI_OPS_ROLLBACK_ATTEMPTED == 'true', rollback_succeeded:env.KAI_OPS_ROLLBACK_SUCCEEDED == 'true', result:'SUCCESS', completed_at:new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")] }
+                script { def plan = readJSON text: env.KAI_OPS_PLAN_JSON, returnPojo: true; writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, plan_digest:params.KAI_OPS_PLAN_DIGEST, executed_script_count:(!params.KAI_OPS_DRY_RUN && plan.scripts instanceof List ? plan.scripts.size() : 0), dry_run:params.KAI_OPS_DRY_RUN, dry_run_validated:env.KAI_OPS_DRY_RUN_VALIDATED == 'true', preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:env.KAI_OPS_VALIDATED == 'true', rollback_attempted:env.KAI_OPS_ROLLBACK_ATTEMPTED == 'true', rollback_succeeded:env.KAI_OPS_ROLLBACK_SUCCEEDED == 'true', result:'SUCCESS', completed_at:new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")] }
             }
         }
     }
     post {
         always { script {
-            if (!fileExists('kaiops-result.json')) { writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, plan_digest:params.KAI_OPS_PLAN_DIGEST, executed_script_count:0, dry_run:params.KAI_OPS_DRY_RUN, preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:false, rollback_attempted:env.KAI_OPS_ROLLBACK_ATTEMPTED == 'true', rollback_succeeded:env.KAI_OPS_ROLLBACK_SUCCEEDED == 'true', result:currentBuild.currentResult, failure:env.KAI_OPS_FAILURE ?: ''] }
+            if (!fileExists('kaiops-result.json')) { writeJSON file: 'kaiops-result.json', json: [schema_version:'kaiops.remediation.result.v2', incident_id:params.KAI_OPS_INCIDENT_ID, approval_id:params.KAI_OPS_APPROVAL_ID, resolution_id:params.KAI_OPS_RESOLUTION_ID, target:params.KAI_OPS_TARGET, plan_digest:params.KAI_OPS_PLAN_DIGEST, executed_script_count:0, dry_run:params.KAI_OPS_DRY_RUN, dry_run_validated:env.KAI_OPS_DRY_RUN_VALIDATED == 'true', preflight_passed:env.KAI_OPS_PREFLIGHT_PASSED == 'true', executed:env.KAI_OPS_EXECUTED == 'true', recovery_validated:false, rollback_attempted:env.KAI_OPS_ROLLBACK_ATTEMPTED == 'true', rollback_succeeded:env.KAI_OPS_ROLLBACK_SUCCEEDED == 'true', result:currentBuild.currentResult, failure:env.KAI_OPS_FAILURE ?: ''] }
             archiveArtifacts artifacts: 'kaiops-request.json,kaiops-result.json', fingerprint: true, allowEmptyArchive: false
         } }
     }

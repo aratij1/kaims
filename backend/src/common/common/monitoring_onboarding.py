@@ -648,11 +648,16 @@ class RuleGenerationAgent:
                 annotations={"summary": f"{application.name} memory usage high", "description": "Sustained memory growth detected."},
             ),
         ]
+        # Missing resource metrics are a coverage gap, never a resource alarm.
+        alert_rules = [rule for rule in alert_rules
+                       if not (rule.name.endswith("-cpu-high") and cpu_metric == "up")
+                       and not (rule.name.endswith("-memory-high") and mem_metric == "up")]
         if latency_metric:
             alert_rules.append(
                 PrometheusRuleSpec(
                     name=f"{slug}-latency-p95-high",
-                    expr=f'histogram_quantile(0.95, sum(rate({latency_metric}{{job="{slug}"}}[5m])) by (le)) > 1',
+                    expr=(f'{latency_metric}{{job="{slug}"}} > 1000' if latency_metric == "request_latency_ms_p95"
+                          else f'histogram_quantile(0.95, sum(rate({latency_metric}{{job="{slug}"}}[5m])) by (le)) > 1'),
                     duration="5m",
                     severity="critical",
                     labels={"team": application.owner_team},
@@ -697,6 +702,7 @@ class RuleGenerationAgent:
         if len({rule.name for rule in alert_rules}) != len(alert_rules):
             governance_issues.append("duplicate alert rule names detected")
         governance = {
+            "coverage_gaps": [name for name, metric in (("cpu", cpu_metric), ("memory", mem_metric)) if metric == "up"],
             "decision": "approved" if not governance_issues else "requires_approval",
             "issues": governance_issues,
             "naming_convention_ok": all(rule.name.startswith(slug) for rule in alert_rules),

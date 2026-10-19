@@ -1,0 +1,11 @@
+[Unit]
+Description=Repeat bounded KaiMS filesystem observations
+
+[Timer]
+OnBootSec=30
+OnUnitInactiveSec=1
+AccuracySec=1
+Unit=kaims-disk-attribution.service
+
+[Install]
+WantedBy=timers.target

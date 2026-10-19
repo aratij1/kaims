@@ -1,0 +1,43 @@
+rule_files:
+  - /etc/prometheus/telemetry-alerts.yml
+evaluation_interval: 1m
+tests:
+  - name: stopped-kaims-monitoring-fires
+    interval: 1m
+    input_series:
+      - series: 'up{job="kaims-monitoring",instance="monitoring-prometheus-1:9090"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: KaiMSMonitoringUnavailable
+        exp_alerts:
+          - exp_labels:
+              job: kaims-monitoring
+              instance: monitoring-prometheus-1:9090
+              severity: critical
+              project: kaims
+              application: KaiMS
+              service: prometheus
+              environment: prod
+              source_system: prometheus
+            exp_annotations:
+              summary: KaiMS monitoring is unavailable
+              description: The independent Telemetry monitor cannot scrape KaiMS Prometheus. Incident metrics and KaiMS alert evaluation are unavailable.
+  - name: healthy-monitoring-does-not-fire
+    interval: 1m
+    input_series:
+      - series: 'up{job="kaims-monitoring"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: KaiMSMonitoringUnavailable
+        exp_alerts: []
+  - name: recovered-monitoring-clears-alert
+    interval: 1m
+    input_series:
+      - series: 'up{job="kaims-monitoring"}'
+        values: '0 0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: KaiMSMonitoringUnavailable
+        exp_alerts: []

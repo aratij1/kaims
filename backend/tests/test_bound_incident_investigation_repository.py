@@ -833,7 +833,8 @@ async def test_compact_projection_does_not_load_source_or_workflow_documents(sql
     iid, aid, rid = uuid4(), uuid4(), uuid4()
     async with sqlite_session_factory() as session:
         session.add(AlertRecord(id=aid, tenant_id="compact", source="prometheus", name="Latency", service="api",
-            environment="prod", severity="high", payload={"project_id": "kaims", "evidence": "x" * 100000}))
+            environment="prod", severity="high", payload={"project_id": "kaims", "evidence": "x" * 100000,
+                "labels": {"operation": "/checkout", "method": "POST", "unrelated_payload": "not-returned"}}))
         session.add(IncidentProjectionRecord(incident_id=iid, alert_id=aid, tenant_id="compact", service="api",
             environment="prod", severity="high", status="investigating", first_seen_at=datetime.now(UTC), projection_payload={}))
         session.add(PendingWorkflowRecord(incident_id=iid, recommendation_id=rid, flow_id="flow-1", payload={"evidence": "x" * 100000}))
@@ -850,5 +851,8 @@ async def test_compact_projection_does_not_load_source_or_workflow_documents(sql
         assert rows[0]["flow_id"] == "flow-1"
         assert rows[0]["title"] == "Latency"
         assert rows[0]["alert_id"] == str(aid)
-        assert rows[0]["source_alert"] == {}
-        assert all("alerts.payload" not in sql and "pending_workflows.payload" not in sql for sql in statements)
+        assert rows[0]["operation"] == "/checkout"
+        assert rows[0]["source_alert"] == {"labels": {"operation": "/checkout", "method": "POST"}}
+        import re
+        assert all(not re.search(r"(?<!\()alerts\.payload(?=\s*(?:,|AS|FROM))", sql, re.I)
+                   and "pending_workflows.payload" not in sql for sql in statements)

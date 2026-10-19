@@ -4123,6 +4123,11 @@ def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = No
     environment_value = str(payload.get("environment", labels.get("env", labels.get("environment", "prod"))) or "prod")
     description_value = str(payload.get("description", annotations.get("summary", "")) or "")
 
+    from monitoring_adapter.alert_identity import alert_source_times
+    try:
+        observed_times = alert_source_times(payload, annotations)
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=422, detail="Invalid alert source timestamps") from error
     return Alert(
         source=source_value,
         name=name_value,
@@ -4134,6 +4139,7 @@ def _build_alert_from_payload(payload: dict[str, Any], trace_id: str | None = No
         annotations=annotations,
         correlation_id=str(payload.get("correlation_id") or labels.get("incident_correlation_id") or "") or None,
         trace_id=trace_id,
+        **observed_times,
     )
 
 
@@ -5149,19 +5155,11 @@ async def _ingest_one_alertmanager_alert(mapped_payload: dict[str, Any], item: d
 
 
 def _alertmanager_delivery_key(item: dict[str, Any], labels: dict[str, Any], status: str) -> str:
-    fingerprint = str(item.get("fingerprint") or "").strip()
-    if fingerprint:
-        return f"{status}:{fingerprint}"
-    stable_payload = json.dumps(
-        {
-            "status": status,
-            "labels": labels,
-            "startsAt": item.get("startsAt"),
-        },
-        sort_keys=True,
-        default=str,
-    )
-    return hashlib.sha256(stable_payload.encode("utf-8")).hexdigest()
+    from monitoring_adapter.alert_identity import alertmanager_delivery_key
+    try:
+        return alertmanager_delivery_key(item, labels, status)
+    except (ValueError, TypeError) as error:
+        raise HTTPException(status_code=422, detail="Invalid Alertmanager source timestamp") from error
 
 
 def _claim_alertmanager_delivery(delivery_key: str) -> bool:
@@ -5220,7 +5218,12 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
         ).strip().lower() or "prometheus"
         event_mode = str(merged_labels.get("event_mode") or merged_labels.get("test_mode") or "real").strip().lower()
         alert_name = str(merged_labels.get("alertname") or "prometheus-alert")
-        synthetic = event_mode in {"synthetic", "test", "validation", "simulation"} or "ingestion validation" in alert_name.lower()
+        synthetic = (
+            event_mode in {"synthetic", "test", "validation", "simulation"}
+            or str(merged_labels.get("synthetic") or "").strip().lower() in {"true", "1", "yes"}
+            or str(merged_labels.get("event_authenticity") or "").strip().lower() == "synthetic"
+            or "ingestion validation" in alert_name.lower()
+        )
         # This handler is the dedicated Alertmanager webhook receiver, so every
         # request genuinely arrives via Alertmanager regardless of the
         # display-oriented "source" label an individual alert rule sets (e.g.
@@ -5266,7 +5269,9 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "generatorURL": str(item.get("generatorURL") or ""),
             },
         }
-        if authenticity in {"synthetic", "unverified"}:
+        from common.signal_scope import demo_analysis_enabled, is_demo_signal
+        demo_monitoring_only = is_demo_signal(mapped_payload) and not demo_analysis_enabled(mapped_payload)
+        if authenticity in {"synthetic", "unverified"} or demo_monitoring_only:
             landing_pad_file = _persist_alert_to_landing_pad(mapped_payload, item, status="processed")
             skipped_rows.append({
                 "status": "quarantined",
@@ -5274,7 +5279,7 @@ async def ingest_alertmanager_webhook(payload: dict = ALERT_BODY, x_trace_id: st
                 "service": mapped_payload["service"],
                 "authenticity": authenticity,
                 "landing_pad_file": landing_pad_file,
-                "reason": "Synthetic validation is not a real incident." if synthetic else f"{origin_system} must use its registered provider webhook endpoint.",
+                "reason": "Demo monitoring is excluded from production incident intake." if demo_monitoring_only else "Synthetic validation is not a real incident." if synthetic else f"{origin_system} must use its registered provider webhook endpoint.",
             })
             continue
         if status != "firing":
@@ -5657,6 +5662,7 @@ async def _route_and_trigger_investigation(
             fingerprint=fingerprint,
             source=source,
             severity=severity,
+            episode_start=str(raw_item.get("startsAt") or "") or None,
         )
         result = {
             "routed": decision.allowed,

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0" Author="KaiMS">
+  <Profiles>
+    <SystemCollector Id="KaiMSFileNamesCollector" Name="KaiMSFileNames">
+      <BufferSize Value="64" />
+      <Buffers Value="32" />
+    </SystemCollector>
+    <SystemProvider Id="KaiMSFileNamesProvider">
+      <Keywords><Keyword Value="Filename" /></Keywords>
+    </SystemProvider>
+    <Profile Id="KaiMSFileNames.Light.Memory" Name="KaiMSFileNames" Description="Bounded open-file name rundown" LoggingMode="Memory" DetailLevel="Light">
+      <Collectors>
+        <SystemCollectorId Value="KaiMSFileNamesCollector"><SystemProviderId Value="KaiMSFileNamesProvider" /></SystemCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

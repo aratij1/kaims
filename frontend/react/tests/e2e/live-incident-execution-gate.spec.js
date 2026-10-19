@@ -15,8 +15,8 @@ test("live diagnostic incident does not expose execution controls", async ({ pag
   await page.getByRole("button", { name: /sign in/i }).click();
 
   await expect(page.locator(".incident-command")).toBeVisible({ timeout: 45_000 });
-  await expect(page.locator(".ic-command-header")).toContainText("investigating");
-  await expect(page.getByRole("button", { name: "Execution unavailable — collect evidence" })).toBeDisabled();
+  await expect(page.locator(".ic-command-header")).toContainText(/collecting|investigating|collection.blocked/i);
+  await expect(page.getByRole("button", { name: /Open technical execution workspace|Approve & let Kai resolve|Take control in governed workspace/ })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "No execution to control" })).toBeDisabled();
   await expect(page.getByRole("button", { name: /Approve & let Kai resolve/ })).toHaveCount(0);
 });

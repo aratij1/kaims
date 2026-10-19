@@ -36,7 +36,7 @@ async function requestNetwork<T>(path: string, options: RouteRequestOptions): Pr
       const headers = new Headers(request.headers);
       if (!headers.has("Accept")) headers.set("Accept", "application/json");
       if (request.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-      const response = await fetch(path, { ...request, headers, signal: controller.signal });
+      const response = await fetch(path, { ...request, cache: "no-store", headers, signal: controller.signal });
       const text = await response.text();
       if (!response.ok) {
         const error = new Error(`HTTP ${response.status}: ${text || "request failed"}`);

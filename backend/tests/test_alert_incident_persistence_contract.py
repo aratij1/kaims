@@ -709,3 +709,31 @@ async def test_inbox_search_matches_partial_service_project_and_signal_without_c
             assert (await repo.list_unified_inbox(tenant_id="search-test", service=query))["filtered_count"] == 0
         assert (await repo.list_unified_inbox(tenant_id="other", service="front"))["filtered_count"] == 0
         assert (await repo.list_unified_inbox(tenant_id="search-test", project_id="kaims", service="front"))["filtered_count"] == 0
+
+@pytest.mark.asyncio
+async def test_same_prometheus_fingerprint_new_onset_creates_new_generation_after_closure(sqlite_session_factory):
+    from common.models import Alert
+    module=_load_alert_app()
+    now=datetime.now(UTC)
+    first=Incident(service='checkout',environment='prod',severity='critical',status=IncidentStatus.INVESTIGATING,title='Checkout down')
+    alert=Alert(tenant_id=first.tenant_id,source='prometheus',name='ServiceDown',service='checkout',environment='prod',
+        severity='critical',description='HTTP down',starts_at=now)
+    first_key=module._occurrence_idempotency_key('same-prometheus-fingerprint',alert)
+    assert first_key==module._occurrence_idempotency_key('same-prometheus-fingerprint',alert.model_copy(update={'id':uuid4()}))
+    async with sqlite_session_factory() as session:
+        repo=IncidentRepository(session)
+        a=await repo.acquire_canonical_incident(incident=first,occurrence_id=alert.id,correlation_key='same-rule',
+            project_id='commerce',idempotency_key=first_key,observed_at=alert.starts_at)
+        await repo.save_incident(first)
+        first.status=IncidentStatus.CLOSED
+        await repo.save_incident(first)
+        recurrence=first.model_copy(update={'id':uuid4(),'status':IncidentStatus.INVESTIGATING})
+        next_alert=alert.model_copy(update={'id':uuid4(),'starts_at':now+timedelta(minutes=10)})
+        second_key=module._occurrence_idempotency_key('same-prometheus-fingerprint',next_alert)
+        assert second_key!=first_key
+        b=await repo.acquire_canonical_incident(incident=recurrence,occurrence_id=next_alert.id,correlation_key='same-rule',
+            project_id='commerce',idempotency_key=second_key,observed_at=next_alert.starts_at)
+        await session.commit()
+    assert b['canonical_incident_id']==recurrence.id and b['canonical_incident_id']!=a['canonical_incident_id']
+    assert b['correlation_generation']==2
+    assert b['correlation_family_id']==a['correlation_family_id']

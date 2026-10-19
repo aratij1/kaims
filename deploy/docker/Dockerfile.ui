@@ -22,6 +22,7 @@ RUN printf '%s\n' \
   '}' > dist/build-info.json
 
 FROM nginx:1.27-alpine
+RUN sed -i -E 's/worker_processes[[:space:]]+auto;/worker_processes 2;/' /etc/nginx/nginx.conf
 ARG KAIMS_RELEASE_SHA=dev
 ARG KAIMS_BUILD_TIME=unknown
 LABEL org.opencontainers.image.revision=${KAIMS_RELEASE_SHA} \

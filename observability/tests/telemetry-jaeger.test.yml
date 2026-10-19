@@ -1,0 +1,66 @@
+rule_files:
+- /etc/prometheus/alert.rules.yml
+evaluation_interval: 15s
+tests:
+- name: probe_success failure fires and recovery clears
+  interval: 15s
+  input_series:
+  - series: probe_success{job="telemetry-jaeger",instance="http://host.docker.internal:26686/jaeger/ui/api/services",project="telemetry",application="Telemetry",service="jaeger",environment="demo"}
+    values: 1 0 0 0 1 1 1
+  - series: up{job="telemetry-jaeger",instance="http://host.docker.internal:26686/jaeger/ui/api/services",project="telemetry",application="Telemetry",service="jaeger",environment="demo"}
+    values: 1 1 1 1 1 1 1
+  alert_rule_test:
+  - eval_time: 30s
+    alertname: TelemetryJaegerUnavailable
+    exp_alerts: []
+  - eval_time: 45s
+    alertname: TelemetryJaegerUnavailable
+    exp_alerts:
+    - exp_labels:
+        job: telemetry-jaeger
+        instance: http://host.docker.internal:26686/jaeger/ui/api/services
+        project: telemetry
+        application: Telemetry
+        service: jaeger
+        environment: demo
+        monitoring_scope: demo
+        severity: high
+        project_name: Telemetry
+        source_system: telemetry
+      exp_annotations: &id001
+        summary: Telemetry Jaeger query API is unavailable
+        description: The independent Jaeger query API probe failed or could not be
+          collected. Trace investigation through Jaeger is unavailable or unverified;
+          this does not establish a customer application outage.
+  - eval_time: 90s
+    alertname: TelemetryJaegerUnavailable
+    exp_alerts: []
+- name: up failure fires and recovery clears
+  interval: 15s
+  input_series:
+  - series: probe_success{job="telemetry-jaeger",instance="http://host.docker.internal:26686/jaeger/ui/api/services",project="telemetry",application="Telemetry",service="jaeger",environment="demo"}
+    values: 1 1 1 1 1 1 1
+  - series: up{job="telemetry-jaeger",instance="http://host.docker.internal:26686/jaeger/ui/api/services",project="telemetry",application="Telemetry",service="jaeger",environment="demo"}
+    values: 1 0 0 0 1 1 1
+  alert_rule_test:
+  - eval_time: 30s
+    alertname: TelemetryJaegerUnavailable
+    exp_alerts: []
+  - eval_time: 45s
+    alertname: TelemetryJaegerUnavailable
+    exp_alerts:
+    - exp_labels:
+        job: telemetry-jaeger
+        instance: http://host.docker.internal:26686/jaeger/ui/api/services
+        project: telemetry
+        application: Telemetry
+        service: jaeger
+        environment: demo
+        monitoring_scope: demo
+        severity: high
+        project_name: Telemetry
+        source_system: telemetry
+      exp_annotations: *id001
+  - eval_time: 90s
+    alertname: TelemetryJaegerUnavailable
+    exp_alerts: []

@@ -166,7 +166,7 @@ groups:
           description: "Memory utilization is above 85% for more than 5 minutes on {{ $labels.instance }}."
 
       - alert: DiskSpaceLow
-        expr: ((1 - (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"})) * 100) > 90
+        expr: ((1 - (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint!~"/parent-distro/.*|/usr/lib/wsl/.*|/run/desktop/mnt/host/.*"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs",mountpoint!~"/parent-distro/.*|/usr/lib/wsl/.*|/run/desktop/mnt/host/.*"})) * 100) > 90 and on(instance,device,mountpoint) (node_filesystem_readonly == 0)
         for: 5m
         labels:
           severity: critical
@@ -201,17 +201,6 @@ groups:
           summary: "Pod in CrashLoopBackOff"
           description: "Pod {{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }} is in CrashLoopBackOff."
 
-      - alert: ServiceDown
-        expr: up{job=~"kaiops-.*"} == 0
-        for: 2m
-        labels:
-          severity: critical
-          project_name: KaiOps
-          application: KaiOps
-        annotations:
-          summary: "Service down"
-          description: "Endpoint {{ $labels.job }} is unreachable."
-
       - alert: HighErrorRate
         expr: (sum(rate(kaiops_gateway_requests_total{status!="ok"}[5m])) / clamp_min(sum(rate(kaiops_gateway_requests_total[5m])), 1)) > 0.08
         for: 5m
@@ -235,7 +224,7 @@ groups:
           description: "P95 latency is above 500ms for {{ $labels.service }} {{ $labels.operation }}."
 
       - alert: LowRequestThroughput
-        expr: sum(rate(kaiops_gateway_requests_total[5m])) < 0.2
+        expr: sum(rate(kaiops_gateway_requests_total[5m])) < on() max(kaiops_expected_min_request_rate)
         for: 15m
         labels:
           severity: warning
@@ -243,7 +232,7 @@ groups:
           application: KaiOps
         annotations:
           summary: "Low request throughput"
-          description: "Request throughput dropped below expected baseline."
+          description: "Request throughput is below the explicitly configured kaiops_expected_min_request_rate baseline."
 
       - alert: NodeNotReady
         expr: (kube_node_status_condition{condition="Ready", status="true"} == 0) and on() (count(up{job="kube-state-metrics"}) > 0)
@@ -264,7 +253,7 @@ groups:
           description: "Container {{ $labels.container }} in pod {{ $labels.namespace }}/{{ $labels.pod }} was OOMKilled."
 
       - alert: HighNetworkLatency
-        expr: probe_duration_seconds{job="blackbox"} > 0.2
+        expr: (probe_duration_seconds{job="blackbox"} > 0.2) and on(instance,job) (probe_success{job="blackbox"} == 1)
         for: 5m
         labels:
           severity: warning
@@ -272,13 +261,13 @@ groups:
           summary: "High network latency"
           description: "HTTP probe duration is above 200ms for target {{ $labels.instance }}."
 
-      - alert: HighNetworkPacketLoss
+      - alert: HTTPProbeSuccessRateLow
         expr: avg_over_time(probe_success{job="blackbox"}[5m]) < 0.95
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "High network packet loss"
+          summary: "HTTP health probe failures"
           description: "HTTP probe success ratio dropped below 95% for target {{ $labels.instance }}."
 
       - alert: ExternalApplicationUnavailable
@@ -475,6 +464,8 @@ groups:
         labels:
           severity: critical
           source: robot-shop
+          environment: demo
+          monitoring_scope: demo
         annotations:
           summary: "Robot Shop dependency {{ $labels.job }} is unreachable"
           description: "Prometheus cannot scrape {{ $labels.job }} for more than 20s."
@@ -485,6 +476,8 @@ groups:
         labels:
           severity: warning
           source: robot-shop
+          environment: demo
+          monitoring_scope: demo
         annotations:
           summary: "Robot Shop MySQL connections high"
           description: "mysql_global_status_threads_connected is {{ $value }}."
@@ -495,6 +488,8 @@ groups:
         labels:
           severity: warning
           source: robot-shop
+          environment: demo
+          monitoring_scope: demo
         annotations:
           summary: "Robot Shop RabbitMQ queue backlog"
           description: "{{ $value }} messages ready and unconsumed across queues."
@@ -505,6 +500,8 @@ groups:
         labels:
           severity: critical
           source: robot-shop
+          environment: demo
+          monitoring_scope: demo
         annotations:
           summary: "Robot Shop Redis is unreachable"
           description: "redis_exporter cannot reach the Redis instance."
@@ -515,6 +512,8 @@ groups:
         labels:
           severity: critical
           source: robot-shop
+          environment: demo
+          monitoring_scope: demo
         annotations:
           summary: "Robot Shop MongoDB is unreachable"
           description: "mongodb_exporter cannot reach the MongoDB instance."
@@ -534,6 +533,8 @@ groups:
         labels:
           severity: critical
           source: online-boutique
+          environment: demo
+          monitoring_scope: demo
         annotations:
           summary: "Online Boutique frontend is not responding"
           description: "blackbox probe against ob-frontend /_healthz has been failing for 15s."
@@ -544,6 +545,8 @@ groups:
         labels:
           severity: warning
           source: online-boutique
+          environment: demo
+          monitoring_scope: demo
         annotations:
           summary: "Online Boutique frontend responding slowly"
           description: "Health-check probe duration is {{ $value }}s."
@@ -628,12 +631,12 @@ groups:
   - name: kaiops-production-telemetry
     rules:
       - alert: KaiOpsSSEDisconnected
-        expr: sum(kaiops_sse_connections) == 0
+        expr: (sum(kaiops_sse_connections) == 0) and on() (max(kaiops_expected_sse_clients) > 0)
         for: 15m
         labels: {severity: warning, component: sse, source_system: telemetry, project: kaims, project_name: KaiMS, application: KaiMS, service: api-gateway, environment: prod}
         annotations:
           summary: "No KaiOps live-update clients are connected"
-          description: "No authenticated SSE connection has been observed for 15 minutes; clients may be using polling fallback."
+          description: "No authenticated SSE connection has been observed for 15 minutes while kaiops_expected_sse_clients requires connected clients."
 
       - alert: KaiOpsDeadLettersIncreasing
         expr: sum(increase(kaiops_dead_letter_events_total[10m])) > 0
@@ -678,7 +681,8 @@ groups:
           project_name: Telemetry
           application: Telemetry
           service: frontend-proxy
-          environment: prod
+          environment: demo
+          monitoring_scope: demo
           source_system: telemetry
         annotations:
           summary: Local Telemetry application is unavailable
@@ -693,7 +697,8 @@ groups:
           project_name: Telemetry
           application: Telemetry
           service: telemetry-prometheus
-          environment: prod
+          environment: demo
+          monitoring_scope: demo
           source_system: telemetry
         annotations:
           summary: Telemetry monitoring is unavailable
@@ -710,7 +715,8 @@ groups:
           project_name: Telemetry
           application: Telemetry
           service: jaeger
-          environment: prod
+          environment: demo
+          monitoring_scope: demo
           source_system: telemetry
         annotations:
           summary: Telemetry Jaeger query API is unavailable

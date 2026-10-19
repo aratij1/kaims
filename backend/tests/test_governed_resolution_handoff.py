@@ -90,6 +90,12 @@ async def test_incident_and_approval_use_exact_persisted_execution_plan(sqlite_s
             selection_id=selection["selection_id"], plan=plan, blocking_reasons=[],
         )
         await session.commit()
+        retry = await repo.persist_compiled_execution_plan(
+            selection_id=selection["selection_id"], plan=plan, blocking_reasons=[],
+        )
+        assert retry == persisted
+        assert binding.resolution_plan_id == UUID(persisted["plan_id"])
+        assert binding.plan_fingerprint == persisted["plan_fingerprint"]
         canonical = await repo.get_current_execution_plan_for_incident(
             tenant_id="tenant-a", incident_id=incident_id,
             recommendation_id=recommendation_id, rca_version=1,
@@ -99,6 +105,32 @@ async def test_incident_and_approval_use_exact_persisted_execution_plan(sqlite_s
     assert persisted and canonical
     assert projection.projection_payload["execution_plan"]["plan_id"] == canonical["plan_id"]
     assert projection.projection_payload["execution_plan"]["plan_fingerprint"] == canonical["plan_fingerprint"]
+
+    from common.database import AuditLogRecord
+    from common.event_publishers import build_event_envelope
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        background_id = uuid4()
+        session.add(AuditLogRecord(id=background_id, tenant_id="tenant-a", actor="resolution-agent",
+            action="recommendation.generated", resource_type="incident", resource_id=str(incident_id),
+            payload={"id": str(background_id), "incident_id": str(incident_id), "root_cause": "New observation"}))
+        await session.commit()
+        await repo.save_incident_event(build_event_envelope(
+            event_type="incident.recommendation.generated",
+            identity={"incident_id": str(incident_id), "alert_id": str(alert_id)},
+            scope={"tenant_id": "tenant-a", "service": "api-gateway", "environment": "prod"},
+            state={"status": "investigating"}, policy={}, transport={"provider": "test"},
+            payload={"recommendation_id": str(background_id), "analysis_request_id": str(uuid4())},
+        ))
+        await session.commit()
+        projection = await session.get(IncidentProjectionRecord, incident_id)
+        assert projection.recommendation_id == recommendation_id
+        assert (await repo.get_latest_recommendation_for_incident(incident_id, tenant_id="tenant-a"))["id"] == str(recommendation_id)
+        assert await session.get(AuditLogRecord, background_id) is not None
+        assert await repo.coalesce_superseded_background_rca(
+            tenant_id="tenant-a", incident_id=incident_id, snapshot_id=snapshot_id,
+            request_id=uuid5(NAMESPACE_URL, f"kaims:enriched-analysis:{snapshot_id}"),
+        ) == f"governed-recovery:{recommendation_id}"
 
     approval_module = load_approval_module()
     approval_module.app.state.session_factory = sqlite_session_factory
@@ -118,6 +150,15 @@ async def test_incident_and_approval_use_exact_persisted_execution_plan(sqlite_s
         "recommendation": {"id": str(recommendation_id), "incident_id": str(incident_id),
                            "tenant_id": "tenant-a", "metadata": metadata},
     }
+    # Durable approval must ignore a stale in-memory view and hydrate the
+    # selected immutable plan from the database.
+    from common.database import AuditLogRecord, IncidentRecord
+    async with sqlite_session_factory() as session:
+        session.add(IncidentRecord(id=incident_id, tenant_id="tenant-a", service="api-gateway",
+            environment="prod", severity="critical", status="awaiting_approval", title="API down", payload={}))
+        audit = await session.get(AuditLogRecord, recommendation_id)
+        audit.payload = {**audit.payload, "metadata": {**audit.payload["metadata"], **metadata}}
+        await session.commit()
     approval_module.ApprovalRequest.model_rebuild(_types_namespace={"UUID": UUID})
     request = approval_module.ApprovalRequest(
         incident_id=incident_id, recommendation_id=recommendation_id, tenant_id="tenant-a",

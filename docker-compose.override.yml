@@ -1,7 +1,85 @@
+x-local-logging: &local-logging
+  driver: json-file
+  options: {max-size: "10m", max-file: "3"}
+
 services:
+  # Existing data volumes can take several minutes to recover on a cold
+  # Docker Desktop start. Keep dependent services waiting during recovery.
+  mysql:
+    mem_limit: 2g
+    logging: *local-logging
+    healthcheck:
+      start_period: 3m
+  redis:
+    mem_limit: 256m
+    # Admission leases must survive memory pressure: refuse new writes rather
+    # than evicting locks and accidentally admitting duplicate work.
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction"]
+    logging: *local-logging
+  jaeger:
+    mem_limit: 3g
+    environment:
+      GOMEMLIMIT: 768MiB
+      COLLECTOR_QUEUE_SIZE_MEMORY: "64"
+    logging: *local-logging
+  # Local throughput is deliberately bounded. Production settings remain in
+  # docker-compose.yml; Compose merges these local environment overrides.
+  alert-intelligence:
+    logging: *local-logging
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${LOCAL_ALERT_WORKERS:-2}
+  context-agent:
+    logging: *local-logging
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${LOCAL_CONTEXT_WORKERS:-1}
+  resolution-agent:
+    logging: *local-logging
+    environment:
+      MESSAGE_BUS_WORKER_COUNT: ${LOCAL_RESOLUTION_WORKERS:-1}
+  monitoring-ingestion-worker:
+    logging: *local-logging
+    environment:
+      DB_POOL_SIZE: ${LOCAL_MONITORING_DB_POOL_SIZE:-4}
+      DB_MAX_OVERFLOW: ${LOCAL_MONITORING_DB_MAX_OVERFLOW:-2}
+    mem_limit: 768m
+  jenkins:
+    logging: *local-logging
+    mem_limit: 1g
+    environment:
+      JAVA_OPTS: -Xms128m -Xmx512m -Djenkins.install.runSetupWizard=false
+  rabbitmq:
+    healthcheck:
+      start_period: 3m
+    # Avoid the broker ports used by other local projects.
+    ports: !override
+      - "127.0.0.1:${KAIMS_RABBITMQ_HOST_PORT:-5673}:5672"
+      - "127.0.0.1:${KAIMS_RABBITMQ_MANAGEMENT_HOST_PORT:-15673}:15672"
   ui:
+    mem_limit: 128m
+    logging: *local-logging
     # Keep the documented/legacy KaiMS address working while port 80 remains
     # the primary local endpoint. Both ports terminate on the same Wave 9
     # nginx container, so an old bookmark cannot open a stale UI deployment.
     ports:
       - "${UI_BIND_ADDRESS:-127.0.0.1}:${UI_COMPAT_HOST_PORT:-8501}:80"
+  api-gateway:
+    mem_limit: 768m
+    logging: *local-logging
+  monitoring-adapter:
+    mem_limit: 1g
+    environment:
+      DB_POOL_SIZE: ${LOCAL_MONITORING_DB_POOL_SIZE:-4}
+      DB_MAX_OVERFLOW: ${LOCAL_MONITORING_DB_MAX_OVERFLOW:-2}
+    logging: *local-logging
+  discovery-mcp:
+    logging: *local-logging
+  model-router:
+    logging: *local-logging
+  orchestrator:
+    logging: *local-logging
+  audit-service:
+    logging: *local-logging
+  closure-service:
+    logging: *local-logging
+  knowledge-development-worker:
+    logging: *local-logging

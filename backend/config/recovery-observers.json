@@ -4205,17 +4205,17 @@
             "connector_id": "prometheus-local-kaims",
             "target_resource_id": "api-gateway",
             "kind": "error_rate",
-            "check_reference": "promql:sha256:a28d47f9c0ab0e26d7b5daa2f797b662f775bbd6acd3fdeaa0419f1e1be09865",
+            "check_reference": "promql:sha256:8ceac58416209b54a27ec0d13f7c483d70f52b43e7964971ee93c4a21be22286",
             "expected_condition": "error_rate eq 0",
-            "evaluation_operator": "eq",
-            "threshold": 0,
+            "evaluation_operator": "lte",
+            "threshold": 0.01,
             "observation_window_seconds": 300,
             "minimum_sample_count": 11,
             "timeout_seconds": 10,
             "authoritative_source": "prometheus-local-kaims",
             "onboarding_registry_reference": "validator-registry:kaims-65e65d1cce-error_rate"
           },
-          "query": "1 - min(probe_success{job=\"kaims-recovery-http\",tenant_id=\"default\",environment=\"prod\",service=\"kaiops-api-gateway\"})",
+          "query": "(sum(rate(kaiops_gateway_requests_total{job=\"kaiops-api-gateway\",status=\"error\"}[5m])) or vector(0)) / sum(rate(kaiops_gateway_requests_total{job=\"kaiops-api-gateway\"}[5m]))",
           "step_seconds": 30
         },
         {
@@ -4225,7 +4225,7 @@
             "connector_id": "prometheus-local-kaims",
             "target_resource_id": "api-gateway",
             "kind": "latency",
-            "check_reference": "promql:sha256:87fac8c6e22cfc5d521a9fbc34fb44130d50de4a40ceb59c57344c0e559efa48",
+            "check_reference": "promql:sha256:7ab020be84a5b6e7bd9646a43697faca17fca6b6c1e1ce73ea2ad2ea517498e6",
             "expected_condition": "latency lte 1.5",
             "evaluation_operator": "lte",
             "threshold": 1.5,
@@ -4235,7 +4235,7 @@
             "authoritative_source": "prometheus-local-kaims",
             "onboarding_registry_reference": "validator-registry:kaims-65e65d1cce-latency"
           },
-          "query": "max(histogram_quantile(0.95,sum by(le,operation)(rate(kaiops_request_latency_seconds_bucket{service=\"api-gateway\"}[5m]))))",
+          "query": "max(histogram_quantile(0.99,sum by(le,operation)(rate(kaiops_request_latency_seconds_bucket{service=\"api-gateway\"}[5m]))))",
           "step_seconds": 30
         },
         {
@@ -4288,7 +4288,8 @@
         "8520eb4c-41dc-4ab0-8109-786ad2bb592a",
         "8a3c3d3b-76c7-4a6a-a524-5326a2a7f490",
         "c115cedf-1dbc-4782-bf40-0fde961895a1"
-      ]
+      ],
+      "allow_automatic_observation": true
     },
     {
       "tenant_id": "default",
@@ -5249,6 +5250,138 @@
       ],
       "operator_verified_incident_ids": [
         "ac38a842-83cd-4a3b-baea-10888b611dc4"
+      ]
+    },
+    {
+      "tenant_id": "default",
+      "environment": "demo",
+      "target_resource_id": "frontend-proxy",
+      "alert_name": "TelemetryApplicationUnavailable",
+      "required_alert_labels": {
+        "project": "telemetry"
+      },
+      "allow_automatic_observation": true,
+      "checks": [
+        {
+          "spec": {
+            "validator_id": "telemetry-frontend-availability",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "frontend-proxy",
+            "kind": "availability",
+            "check_reference": "promql:sha256:f4fa8bf9fd24f819ca46f668b1f0a5297e3332b1b32208b4d888e89e4e25aa0c",
+            "expected_condition": "Independent Astronomy Shop HTTP probe and its scrape both succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:telemetry-frontend-availability"
+          },
+          "query": "min(probe_success{job=\"telemetry-application\",project=\"telemetry\",service=\"frontend-proxy\",environment=\"demo\"}) * min(up{job=\"telemetry-application\",project=\"telemetry\",service=\"frontend-proxy\",environment=\"demo\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "telemetry-frontend-alert_clearance",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "frontend-proxy",
+            "kind": "alert_clearance",
+            "check_reference": "promql:sha256:b351864d244a192cf90e15530964a3a017c0bcbbb05027359ee8d5cd4fe767a1",
+            "expected_condition": "The originating availability alert is clear and the observer is still scrapeable",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:telemetry-frontend-alert_clearance"
+          },
+          "query": "(sum(ALERTS{alertname=\"TelemetryApplicationUnavailable\",project=\"telemetry\",service=\"frontend-proxy\",environment=\"demo\",alertstate=~\"pending|firing\"}) or vector(0)) + (1 - min(up{job=\"telemetry-application\",project=\"telemetry\",service=\"frontend-proxy\",environment=\"demo\"}))",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "telemetry-frontend-error_rate",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "frontend-proxy",
+            "kind": "error_rate",
+            "check_reference": "promql:sha256:2100c6f83dad8de5dbcd9eec94921bd14585f2ffcca9e49cea9f97edeaa8cd5f",
+            "expected_condition": "Independent HTTP health probe failure fraction is zero; customer error rate remains unquantified",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:telemetry-frontend-error_rate"
+          },
+          "query": "1 - min(probe_success{job=\"telemetry-application\",project=\"telemetry\",service=\"frontend-proxy\",environment=\"demo\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "telemetry-frontend-latency",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "frontend-proxy",
+            "kind": "latency",
+            "check_reference": "promql:sha256:fe9fe97d27e4cc2deb938986ebab3e2ba131afa8c0dc765a55a4e3de453f7ab0",
+            "expected_condition": "Independent root HTTP probe completes within two seconds",
+            "evaluation_operator": "lt",
+            "threshold": 2,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:telemetry-frontend-latency"
+          },
+          "query": "max(probe_duration_seconds{job=\"telemetry-application\",project=\"telemetry\",service=\"frontend-proxy\",environment=\"demo\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "telemetry-frontend-dependency_health",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "frontend-proxy",
+            "kind": "dependency_health",
+            "check_reference": "promql:sha256:efabfbc181ced7aa0a4f213dedd9a1eddbd6d75f925c7384f34d5ff0896aa3db",
+            "expected_condition": "The frontend-to-product-catalog read path returns HTTP 200 and a nonempty product identity",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:telemetry-frontend-dependency_health"
+          },
+          "query": "min(probe_success{job=\"telemetry-catalog-journey\",project=\"telemetry\",service=\"frontend-proxy\",environment=\"demo\"}) * min(up{job=\"telemetry-catalog-journey\",project=\"telemetry\",service=\"frontend-proxy\",environment=\"demo\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "telemetry-frontend-critical_alerts",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "frontend-proxy",
+            "kind": "critical_alerts",
+            "check_reference": "promql:sha256:1f81ec0bbfb6a8b59ef79ee2705a2ffe916ee018954a2e0d8561680581d46fb0",
+            "expected_condition": "No critical alerts are pending or firing in the scoped telemetry demo",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:telemetry-frontend-critical_alerts"
+          },
+          "query": "sum(ALERTS{project=\"telemetry\",environment=\"demo\",severity=\"critical\",alertstate=~\"pending|firing\"}) or vector(0)",
+          "step_seconds": 30
+        }
       ]
     }
   ]

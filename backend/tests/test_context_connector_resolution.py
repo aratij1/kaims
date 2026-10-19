@@ -10,6 +10,28 @@ from context_agent.connectors import PrometheusConnector
 
 
 @pytest.mark.asyncio
+async def test_filesystem_enrichment_collects_measurements_instead_of_repeating_threshold(monkeypatch):
+    captured = {}
+    def handler(request):
+        captured["request"] = request
+        return httpx.Response(200, json={"status": "success", "data": {"resultType": "matrix", "result": []}})
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
+    alert = Alert(tenant_id="tenant-a", source="prometheus", name="DiskSpaceLow", service="node-exporter",
+        description="Disk capacity exceeded", severity=AlertSeverity.CRITICAL,
+        labels={"job": "node-exporter", "instance": "host:9100", "mountpoint": "/mnt/host/d"},
+        metadata={"context_requirement_category": "metrics", "context_requirement_question": "Confirm filesystem inode usage",
+            "prometheus_expression": "disk_utilization > 90", "connector_resolution": {"status": "completed"},
+            "resolved_context_connectors": [{"provider": "prometheus", "endpoint_identity": "http://prometheus:9090", "config": {}}]})
+    incident = Incident(tenant_id="tenant-a", service=alert.service, severity=alert.severity, title=alert.name)
+    await PrometheusConnector().fetch(alert, incident)
+    query = captured["request"].url.params["query"]
+    assert "node_filesystem_" in query and "files_free" in query
+    assert 'mountpoint="/mnt/host/d"' in query
+    assert "disk_utilization > 90" not in query
+
+
+@pytest.mark.asyncio
 async def test_connector_resolution_is_exact_and_tenant_scoped(sqlite_session_factory) -> None:
     integration_id = uuid4()
     async with sqlite_session_factory() as session:

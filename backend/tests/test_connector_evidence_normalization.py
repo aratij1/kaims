@@ -227,14 +227,14 @@ def test_rca_domain_gap_aliases_create_executable_canonical_requirements() -> No
         now=datetime(2024, 8, 26, 13, 32, tzinfo=UTC),
     )
     assert [(item.category, item.candidate_connectors) for item in requirements] == [
-        ("topology", ["discovery-mcp", "vector-db", "cmdb", "kubernetes", "local-evidence"]),
+        ("topology", ["discovery-mcp"]),
         ("runbook", ["vector-db", "discovery-mcp", "local-evidence"]),
     ]
 
 
 def test_computed_prometheus_result_retains_query_without_inventing_metric_name():
     incident = Incident(tenant_id="tenant-a", service="api-gateway", title="latency")
-    payload = {"endpoint": "prometheus:9090", "query": "sum(rate(requests_total[5m]))", "series": [{"metric": {}, "value": [1724679030, "3.2"]}]}
+    payload = {"endpoint": "prometheus:9090", "query": 'sum(rate(requests_total{service="api-gateway"}[5m]))' , "series": [{"metric": {}, "value": [1724679030, "3.2"]}]}
     result = normalize_connector_response(raw_response=payload, requirement=_requirement(incident), incident=incident, connector="prometheus", collected_at=datetime.now(UTC))
     assert not result.rejected
     assert result.records[0].content["metric_name"] is None

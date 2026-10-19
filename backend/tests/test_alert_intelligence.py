@@ -17,6 +17,48 @@ def make_alert(description: str = "payment latency above threshold") -> Alert:
 
 
 @pytest.mark.asyncio
+async def test_durable_candidate_key_does_not_depend_on_alert_uuid_or_history():
+    agent = AlertIntelligenceAgent()
+    first = make_alert()
+    first.labels["operation"] = "/checkout"
+    second = make_alert("payment latency now 4.2 seconds")
+    second.labels["operation"] = "/checkout"
+    # Independent worker histories still converge on a single database key.
+    _, one = await agent.process(first)
+    _, two = await AlertIntelligenceAgent().process(second)
+    assert first.correlation_id != second.correlation_id
+    assert one.metadata["incident_candidate"]["correlation_key"] == two.metadata["incident_candidate"]["correlation_key"]
+
+
+@pytest.mark.asyncio
+async def test_different_endpoint_alerts_do_not_deduplicate_or_correlate():
+    agent = AlertIntelligenceAgent()
+    first = make_alert()
+    first.labels["operation"] = "/checkout"
+    first, _ = await agent.process(first)
+    second = make_alert()
+    second.labels["operation"] = "/onboarding/templates"
+    second, _ = await agent.process(second)
+    assert first.fingerprint != second.fingerprint
+    assert second.deduplicated_count == 1
+    assert first.correlation_id != second.correlation_id
+
+
+@pytest.mark.asyncio
+async def test_explicit_candidates_cannot_correlate_across_tenants():
+    agent = AlertIntelligenceAgent()
+    first = make_alert()
+    first.tenant_id = "tenant-a"
+    first, _ = await agent.process(first)
+    second = make_alert()
+    second.tenant_id = "tenant-b"
+    second = await agent.deduplicate_alerts(second, candidates=[first])
+    second = await agent.correlate_alerts(second, candidates=[first])
+    assert second.deduplicated_count == 1
+    assert first.correlation_id != second.correlation_id
+
+
+@pytest.mark.asyncio
 async def test_alert_intelligence_deduplicates_and_classifies() -> None:
     agent = AlertIntelligenceAgent()
     first, first_incident = await agent.process(make_alert())

@@ -27,7 +27,7 @@ test("completed live analysis renders its persisted RCA", async ({ page }) => {
   const review = page.getByRole("button", { name: "Review missing evidence" }).first();
   if (await review.count()) {
     await review.click();
-    const response = page.locator("[data-requirement-response]").first();
+    const response = page.locator("[data-requirement-response]:focus");
     await expect(response).toBeVisible();
     await expect(response).toBeFocused();
     await expect(response).toHaveValue(/Evidence requirement:/);

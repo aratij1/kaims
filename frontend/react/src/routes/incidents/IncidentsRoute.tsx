@@ -151,7 +151,7 @@ function normalizedStatus(row: IncidentRow) {
 }
 
 export function analysisBlocker(row: IncidentRow): string {
-  if (!["open", "investigating", "rca_ready", "context_ready"].includes(normalizedStatus(row))) return "";
+  if (!["open", "investigating", "collecting", "waiting_for_human", "collection_blocked", "rca_ready", "context_ready"].includes(normalizedStatus(row))) return "";
   const analysis = row.analysis_summary;
   if (!analysis?.completed_at) return "";
   const reasons = (analysis.blockers || []).filter(Boolean);
@@ -232,7 +232,7 @@ export function lifecycleFor(row: IncidentRow): LifecycleStage[] {
     });
   }
   if (row.recommendation_id || event.recommendation_id || latestEvent.includes("recommendation") || understood) {
-    stages.push({ ...stage("understand"), state: observedRecovery || blocker ? "stopped" : route.analysisReused ? "reused" : understood ? "complete" : "current", caption: observedRecovery ? "Cause remains inconclusive" : blocker ? "Analysis completed; resolution blocked" : route.analysisReused ? "Qualified RCA reused" : understood ? "RCA generated" : "Generating RCA" });
+    stages.push({ ...stage("understand"), state: observedRecovery || blocker ? "stopped" : route.analysisReused ? "reused" : understood ? "complete" : "current", caption: observedRecovery ? "Cause remains inconclusive" : status === "waiting_for_human" ? "Waiting for human evidence" : blocker ? "Analysis completed; more evidence needed" : route.analysisReused ? "Qualified RCA reused" : understood ? "RCA generated" : "Generating RCA" });
   }
   if (observedRecovery) {
     stages.push({ ...stage("approval"), state: "complete", caption: "Operator authorized recovery assessment" });
@@ -546,12 +546,14 @@ export default function IncidentsRoute() {
               <div className="unified-card-kicker"><span>Incident</span><code>{incidentId}</code>{Number(row.total_occurrence_count || 0) > 1 ? <em>{row.total_occurrence_count} occurrences</em> : null}</div>
               <button type="button" className="unified-card-title" onClick={() => openIncident(row, "overview")}>{incidentTitle(row)}</button>
               <div className="unified-card-context"><span><Server size={13} /> {row.service || "Unknown service"}</span><span>{row.environment || "Environment not set"}</span><span>{formatIstTimestamp(row.updated_at || row.created_at)}</span></div>
-              <p className="unified-card-summary">{value(event.customer_impact, event.business_impact, event.impact, row.summary, "Kai is coordinating diagnosis and resolution.")}</p>
+              {value(row.operation, row.source_alert?.labels?.operation, projectionLabels(row).operation) !== "Not recorded" ? <p className="unified-card-operation"><strong>Affected operation</strong> <code>{value(row.operation, row.source_alert?.labels?.operation, projectionLabels(row).operation)}</code></p> : null}
+              <p className="unified-card-summary">{analysisBlocker(row) || value(event.customer_impact, event.business_impact, event.impact, row.summary, "No current processing detail has been published.")}</p>
+              <div className="unified-card-context"><span>Source: {value(row.source, row.origin_system, row.source_alert?.source)}</span><span>Alert: {row.alert_id || "Not linked"}</span>{row.source_alert?.labels?.event_authenticity ? <span>{String(row.source_alert.labels.event_authenticity).replaceAll("_", " ")}</span> : null}</div>
               <div className="unified-card-progress"><span className="unified-progress-node"><Workflow size={14} /></span><div><small>Current stage</small><strong>{currentStage?.label || "Awaiting intake"}</strong><span>{currentStage?.caption || "No executed stage recorded"}</span></div></div>
             </div>
             <aside className="unified-card-aside">
               <span className={`pill ${normalizedStatus(row) === "failed" ? "status-warning" : `status-${normalizedStatus(row)}`}`}>{incidentStatusLabel(row)}</span>
-              <span className={`unified-attention-label ${needsHuman ? "is-urgent" : ""}`}>{needsHuman ? <><FileCheck2 size={13} /> Human decision</> : <><BrainCircuit size={13} /> Kai handling</>}</span>
+              <span className={`unified-attention-label ${needsHuman ? "is-urgent" : ""}`}>{normalizedStatus(row) === "waiting_for_human" ? <><FileCheck2 size={13} /> Human evidence needed</> : analysisBlocker(row) ? <><ScanSearch size={13} /> Evidence incomplete</> : needsHuman ? <><FileCheck2 size={13} /> Human decision</> : <><BrainCircuit size={13} /> Kai handling</>}</span>
               <button type="button" className="button-primary" onClick={() => openIncident(row, "overview")}>Open incident</button>
             </aside>
           </article>;

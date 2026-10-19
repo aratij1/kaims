@@ -40,8 +40,6 @@
 .ic-context-findings { margin-block: 1rem; }
 .ic-context-findings li { margin-block: .65rem; }
 
-.ic-detail-navigation { display:flex; gap:12px; flex-wrap:wrap; }
-.ic-detail-navigation a { padding:10px 14px; border:1px solid var(--k-color-border); border-radius:8px; background:var(--k-color-surface); font-weight:700; }
 .ic-detailed-context, #incident-impact, #incident-rca { scroll-margin-top:100px; }
 .ic-detailed-context label { display:grid; gap:8px; font-weight:700; }
 .ic-detailed-context select { width:100%; padding:10px; background:var(--k-color-surface); color:inherit; border:1px solid var(--k-color-border); border-radius:6px; }
@@ -51,3 +49,50 @@
 .ic-context-content dd { margin:4px 0; }
 .ic-context-content p, .ic-context-content pre { white-space:pre-wrap; margin:4px 0; font-size:13px; }
 .ic-context-content summary { cursor:pointer; padding:6px 0; }
+
+/* Keep wide evidence tables from enlarging the incident grid track on mobile. */
+.incident-command { grid-template-columns: minmax(0, 1fr); }
+
+/* A focused workspace: tasks first, supporting records on demand. */
+.incident-command { gap: 16px; max-width: 1240px; margin-inline: auto; font-size: 14px; line-height: 1.6; }
+.ic-command-header { padding: 24px 24px 0; box-shadow: none; border-radius: 14px; }
+.ic-title-row h2 { font-size: clamp(24px, 3vw, 32px); line-height: 1.2; letter-spacing: -.025em; }
+.ic-title-row p { font-size: 14px; max-width: 70ch; line-height: 1.6; }
+.ic-id { font-size: 11px; color: var(--k-color-text-muted); letter-spacing: .02em; }
+.ic-back { font-size: 13px; margin-bottom: 16px; }
+.ic-header-state > span { font-size: 12px; }
+.ic-critical-context { margin: 20px -24px 0; }
+.ic-critical-context dt { font-size: 11px; letter-spacing: .02em; }
+.ic-critical-context dd { font-size: 13px; white-space: normal; overflow: visible; }
+.ic-command-grid { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.ic-primary { gap: 16px; }
+.ic-disclosure { min-width: 0; border: 1px solid var(--k-color-border); border-radius: 12px; background: var(--k-color-surface); }
+.ic-disclosure > summary { padding: 16px 20px; cursor: pointer; font-size: 14px; font-weight: 650; }
+.ic-disclosure > summary > span { display: block; margin: 3px 0 0 18px; color: var(--k-color-text-muted); font-size: 12px; font-weight: 400; }
+.ic-disclosure[open] > summary { border-bottom: 1px solid var(--k-color-border); margin-bottom: 12px; }
+.ic-disclosure > .ic-section, .ic-disclosure > .ic-journey { border: 0; box-shadow: none; }
+.ic-lifecycle-details .ic-journey { margin: 0; }
+.ic-section { padding: 22px; box-shadow: none; border-radius: 12px; }
+.ic-section header h3 { font-size: 18px; line-height: 1.45; }
+.ic-section > p, .ic-decision-summary, .ic-resolution-why { font-size: 14px; line-height: 1.7; }
+.ic-section header span { font-size: 11px; }
+.ic-reasoning article h4, .ic-section h4 { font-size: 14px; }
+.ic-reasoning article p, .ic-reasoning article li { font-size: 13px; line-height: 1.65; }
+.ic-intelligence { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); padding: 16px; gap: 16px; }
+.ic-kai-panel { display: none; }
+.ic-narrative h3, .ic-evidence h3, .ic-control h3 { font-size: 16px; }
+.ic-narrative li strong, .ic-evidence article strong { font-size: 13px; }
+.ic-narrative li p, .ic-evidence article p, .ic-control p { font-size: 13px; }
+.ic-narrative time, .ic-narrative > small, .ic-evidence article small { font-size: 11px; }
+.ic-truth-note { font-size: 12px; padding: 14px 18px; }
+.ic-truth-note button { font-size: 12px; }
+.ic-disclosure summary:focus-visible { outline: 3px solid #175cc4; outline-offset: 3px; }
+@media(max-width:700px) { .ic-command-header { padding: 18px 18px 0; }.ic-critical-context { margin-inline: -18px; }.ic-intelligence { grid-template-columns: 1fr; }.ic-section { padding: 16px; }.ic-disclosure > summary { padding: 14px 16px; } }
+
+.ic-source-relationship { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; font-size: 12px; color: var(--k-color-text-muted); }
+.ic-source-relationship a { overflow-wrap: anywhere; color: var(--k-color-info); }
+
+.ic-loading-workspace { display: grid; justify-items: start; gap: 14px; padding: 24px; border: 1px solid var(--k-color-border); border-radius: 12px; background: var(--k-color-surface); }
+.ic-loading-workspace > small { color: var(--k-color-text-muted); overflow-wrap: anywhere; }
+.ic-loading-workspace > h2, .ic-loading-workspace > p { margin: 0; }
+.ic-loading-workspace > p { max-width: 65ch; font-size: 14px; color: var(--k-color-text-muted); }

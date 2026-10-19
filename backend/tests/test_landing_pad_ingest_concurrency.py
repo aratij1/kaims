@@ -191,7 +191,9 @@ async def test_alertmanager_webhook_parallel_path_matches_sequential_semantics(m
         "alerts": [
             {
                 "status": "firing",
-                "labels": {"alertname": f"Alert{i}", "service": f"svc-{i}", "severity": "warning"},
+                # Exercise admitted investigation work; warnings intentionally
+                # remain live-alert observations without entering this path.
+                "labels": {"alertname": f"Alert{i}", "service": f"svc-{i}", "severity": "high"},
                 "annotations": {"summary": f"summary {i}"},
                 "fingerprint": f"fp-{i}",
             }
@@ -219,3 +221,14 @@ async def test_alertmanager_webhook_parallel_path_matches_sequential_semantics(m
     reasons = [str(row.get("reason")) for row in response["skipped_rows"]]
     assert any("landing pad ingestion failed" in reason for reason in reasons)
     assert any(reason == "non-object alert item" for reason in reasons)
+
+
+@pytest.mark.parametrize("marker", [{"synthetic": "true"}, {"synthetic": "1"}, {"event_authenticity": "synthetic"}, {"event_mode": "simulation"}])
+async def test_alertmanager_quarantines_synthetic_signals_before_investigation(monitoring_app, monkeypatch, marker):
+    monkeypatch.setattr(monitoring_app, "_claim_alertmanager_delivery", lambda key: True)
+    result = await monitoring_app.ingest_alertmanager_webhook(payload={"alerts": [{
+        "status": "firing", "labels": {"alertname": "ServiceDown", "service": "fault-lab", "severity": "critical", **marker},
+    }]})
+    assert result["ingested"] == 0
+    assert result["skipped_rows"][0]["authenticity"] == "synthetic"
+    assert not list(monitoring_app.LANDING_PAD_INPUT_DIR.glob("*.json"))

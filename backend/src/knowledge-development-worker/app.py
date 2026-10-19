@@ -18,6 +18,7 @@ from common.tenant_identity import require_tenant_id
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy.orm import load_only
 
 settings = get_settings()
 settings.service_name = "knowledge-development-worker"
@@ -405,6 +406,15 @@ async def _analyze_locked(app: FastAPI, trigger: str, *, tenant_id: str = "defau
         max_checkpoint = checkpoint
         max_checkpoint_id = checkpoint_id or None
         for report in reports:
+            # Advance the scan cursor even for orphaned or out-of-scope reports.
+            report_time = _utc(report.created_at)
+            if report_time and (
+                max_checkpoint is None
+                or report_time > max_checkpoint
+                or (report_time == max_checkpoint and str(report.id) > str(max_checkpoint_id or ""))
+            ):
+                max_checkpoint = report_time
+                max_checkpoint_id = str(report.id)
             incident = incidents.get(str(report.incident_id))
             if not incident:
                 continue
@@ -417,14 +427,6 @@ async def _analyze_locked(app: FastAPI, trigger: str, *, tenant_id: str = "defau
             evidence_id = uuid5(NAMESPACE_URL, f"kaims:incident-evidence:{tenant_id}:{evidence.incident_id}")
             await session.merge(IncidentEvidenceRecord(id=evidence_id, tenant_id=tenant_id, incident_id=evidence.incident_id, issue_signature=issue_signature(evidence), service=evidence.service, environment=evidence.environment, alert_type=evidence.alert_type, evidence=evidence.model_dump(mode="json"), reviewed=evidence.reviewed, collected_at=max(evidence.timestamps) if evidence.timestamps else started))
             collected += 1
-            report_time = _utc(report.created_at)
-            if report_time and (
-                max_checkpoint is None
-                or report_time > max_checkpoint
-                or (report_time == max_checkpoint and str(report.id) > str(max_checkpoint_id or ""))
-            ):
-                max_checkpoint = report_time
-                max_checkpoint_id = str(report.id)
         await session.flush()
         stored = (await session.execute(select(IncidentEvidenceRecord).where(IncidentEvidenceRecord.tenant_id == tenant_id, IncidentEvidenceRecord.collected_at >= cutoff).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(5000))).scalars().all()
         evidence_rows = []
@@ -747,18 +749,34 @@ async def update_configuration(configuration: ScheduleConfig) -> dict[str, Any]:
     return await get_configuration()
 
 
+def _recent_report_records(model, tenant: str, timestamp, limit: int):
+    # Sort only identifiers before fetching the selected document bodies.
+    # Sorting whole ORM rows makes MySQL read large JSON/TEXT for every
+    # historical candidate, even though the report returns a small page.
+    keys = list(model.__mapper__.primary_key)
+    recent = select(*keys).where(model.tenant_id == tenant).order_by(timestamp.desc(), *keys).limit(limit).subquery()
+    return select(model).join(recent, and_(*(key == recent.c[key.key] for key in keys))).order_by(timestamp.desc(), *keys)
+
+
 @app.get("/report")
 async def report(tenant_id: str = "default") -> dict[str, Any]:
     if not settings.database_enabled:
         return {"status": "disabled", "summary": last_result, "patterns": [], "drafts": []}
     async with app.state.session_factory() as session:
         tenant = str(tenant_id or "default").strip() or "default"
-        patterns = (await session.execute(select(FailurePatternRecord).where(FailurePatternRecord.tenant_id == tenant).order_by(FailurePatternRecord.analyzed_at.desc()).limit(50))).scalars().all()
-        drafts = (await session.execute(select(RunbookVersionRecord).where(RunbookVersionRecord.tenant_id == tenant).order_by(RunbookVersionRecord.created_at.desc()).limit(50))).scalars().all()
-        evidence = (await session.execute(select(IncidentEvidenceRecord).where(IncidentEvidenceRecord.tenant_id == tenant).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(100))).scalars().all()
-        outcomes = (await session.execute(select(RunbookOutcomeRecord).where(RunbookOutcomeRecord.tenant_id == tenant).order_by(RunbookOutcomeRecord.created_at.desc()).limit(100))).scalars().all()
-        audit_rows = (await session.execute(select(LearningAuditRecord).where(LearningAuditRecord.tenant_id == tenant).order_by(LearningAuditRecord.occurred_at.desc()).limit(100))).scalars().all()
-        documents = (await session.execute(select(KnowledgeRagDraftRecord).where(KnowledgeRagDraftRecord.tenant_id == tenant).order_by(KnowledgeRagDraftRecord.updated_at.desc()).limit(100))).scalars().all()
+        patterns = (await session.execute(_recent_report_records(FailurePatternRecord, tenant, FailurePatternRecord.analyzed_at, 50))).scalars().all()
+        drafts = (await session.execute(_recent_report_records(RunbookVersionRecord, tenant, RunbookVersionRecord.created_at, 50))).scalars().all()
+        # The report displays metadata only. Avoid loading large raw evidence
+        # documents just to show a count and twenty recent evidence rows.
+        evidence = (await session.execute(select(IncidentEvidenceRecord).options(load_only(
+            IncidentEvidenceRecord.incident_id, IncidentEvidenceRecord.service,
+            IncidentEvidenceRecord.environment, IncidentEvidenceRecord.alert_type,
+            IncidentEvidenceRecord.reviewed, IncidentEvidenceRecord.collected_at,
+            raiseload=True,
+        )).where(IncidentEvidenceRecord.tenant_id == tenant).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(100))).scalars().all()
+        outcomes = (await session.execute(_recent_report_records(RunbookOutcomeRecord, tenant, RunbookOutcomeRecord.created_at, 100))).scalars().all()
+        audit_rows = (await session.execute(_recent_report_records(LearningAuditRecord, tenant, LearningAuditRecord.occurred_at, 100))).scalars().all()
+        documents = (await session.execute(_recent_report_records(KnowledgeRagDraftRecord, tenant, KnowledgeRagDraftRecord.updated_at, 100))).scalars().all()
     audits = []
     for row in audit_rows:
         canonical = json.dumps(row.payload or {}, sort_keys=True, separators=(",", ":"), default=str)

@@ -3,6 +3,9 @@ import { describe, expect, it } from "vitest";
 import { durableIncidentId, durableIncidentPath } from "./incidentNavigation";
 
 describe("durable incident navigation", () => {
+  it("opens the canonical incident when an occurrence has a different id", () => {
+    expect(durableIncidentPath({ canonical_incident_id: "canonical-id", incident_id: "occurrence-id" })).toBe("/incidents/canonical-id");
+  });
   it("uses and URL-encodes the durable incident identifier", () => {
     expect(durableIncidentPath({ incident_id: "tenant/a incident" })).toBe("/incidents/tenant%2Fa%20incident");
   });

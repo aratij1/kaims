@@ -134,3 +134,7 @@
   .incident-summary-table td[data-label]::before { content: attr(data-label); display: block; margin-bottom: 4px; font-size: 10px; font-weight: 700; color: var(--text-muted, #52677d); }
   .incident-summary-table td[data-label="Action"] { align-self: end; }
 }
+
+.unified-card-operation { margin: 8px 0; font-size: 13px; overflow-wrap: anywhere; }
+.unified-card-operation strong { color: var(--k-color-text-muted); margin-right: 8px; font-size: 11px; }
+.unified-card-summary { overflow-wrap: anywhere; }

@@ -28,6 +28,7 @@ import {
 
 import { searchNavigation, type NavigationIcon, type NavigationItem } from "../../app/navigation";
 import "./KaiOperationsShell.css";
+import "./OperationsDesign.css";
 
 type NavigationGroupView = { id: string; label: string; items: readonly NavigationItem[] };
 type OperationalItem = { kind?: string; label?: string | number; meta?: string; row?: unknown };
@@ -222,7 +223,7 @@ export function KaiOperationsShell({
           <button className="kai-mobile-menu" type="button" aria-label="Open navigation" onClick={() => setMobileNavigationOpen(true)}><Menu /></button>
           <div className="kai-context-selectors">
             <span className="kai-environment"><small>Project</small><strong>{project || "No project selected"}</strong></span>
-            <span className={`kai-environment ${["prod", "production"].includes(environment.toLowerCase()) ? "is-production" : ""}`}><small>Environment</small><strong>{humanize(environment, "Unknown")}</strong></span>
+            <span className={`kai-environment ${["prod", "production"].includes(environment.toLowerCase()) ? "is-production" : ""}`}><small>Connection env.</small><strong>{humanize(environment, "Unknown")}</strong></span>
           </div>
 
           <button className="kai-search-trigger" type="button" onClick={() => { setPaletteView("search"); setPaletteOpen(true); }}>
@@ -255,7 +256,6 @@ export function KaiOperationsShell({
             <div><span>{currentGroup?.label || "KaiMS"} / {currentItem.label}</span><h1>{currentItem.pageTitle}</h1><p>{currentItem.description}</p></div>
             <details className="kai-page-guide"><summary>How to use this page</summary><div><ol>{pageSteps.map((step) => <li key={step}>{step}</li>)}</ol>{relatedItems.length ? <nav aria-label="Related pages"><span>Related</span>{relatedItems.map((item) => <button type="button" key={item.id} onClick={() => selectNavigation(item)}>{item.label}</button>)}</nav> : null}</div></details>
           </header>
-          {currentItem.id === "dashboard" ? <section className="kai-next-action" aria-label="Recommended next action"><div><span>Recommended next action</span><strong>{approvalCount > 0 ? `${approvalCount} decision${approvalCount === 1 ? "" : "s"} waiting for review` : health.ok ? "Review active incidents" : "Check platform health"}</strong><p>{approvalCount > 0 ? "Start with the oldest assigned decision and verify its evidence and rollback plan." : health.ok ? "Open the incident list and continue the highest-severity investigation." : "Resolve degraded platform dependencies before relying on automated investigation."}</p></div><button type="button" onClick={() => { const targetId = approvalCount > 0 ? "approvals" : health.ok ? "incidents" : "platformOverview"; const item = navigationGroups.flatMap((group) => group.items).find((candidate) => candidate.id === targetId); if (item) selectNavigation(item); }}>{approvalCount > 0 ? "Review approvals" : health.ok ? "Open incidents" : "View platform health"}</button></section> : null}
           {restrictedDestination ? <div className="kai-permission-notice" role="status"><CircleAlert aria-hidden="true" /><span><strong>Access is restricted.</strong> {restrictedDestination} is not available to your role.</span></div> : null}
           {children}
         </main>

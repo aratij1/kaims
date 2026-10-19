@@ -28,7 +28,8 @@ def load_context_app_module():
 
 
 @pytest.mark.asyncio
-async def test_context_snapshot_and_outbox_are_committed_once(sqlite_session_factory) -> None:
+@pytest.mark.parametrize("lane", ["background", "initial"])
+async def test_context_snapshot_and_outbox_are_committed_once(sqlite_session_factory, lane) -> None:
     module = load_context_app_module()
     module.settings.database_enabled = True
     module.app.state.session_factory = sqlite_session_factory
@@ -55,6 +56,7 @@ async def test_context_snapshot_and_outbox_are_committed_once(sqlite_session_fac
         tenant_id="tenant-a",
         subject_fingerprint=context_subject_fingerprint(alert, "tenant-a"),
     )
+    context.metadata["context_delivery_lane"] = lane
     outgoing = module._build_context_event_payload(
         alert=alert,
         incident=incident,
@@ -86,10 +88,13 @@ async def test_context_snapshot_and_outbox_are_committed_once(sqlite_session_fac
         snapshots = await session.scalar(select(func.count()).select_from(ContextSnapshotRecord))
         outbox_rows = await session.scalar(select(func.count()).select_from(ResolutionOutboxRecord))
         snapshot = (await session.execute(select(ContextSnapshotRecord))).scalar_one()
+        outbox = (await session.execute(select(ResolutionOutboxRecord))).scalar_one()
     assert first is True
     assert second is False
     assert snapshots == 1
     assert outbox_rows == 1
+    assert outbox.topic == ("context-initial-events" if lane == "initial" else "context-events")
+    assert outgoing["event_contract"]["payload"]["topic"] == outbox.topic
     assert snapshot.context_fingerprint == context.metadata["context_fingerprint"]
     assert snapshot.contract_version == "kaiops.context.v2"
     assert snapshot.expires_at >= snapshot.collected_at + timedelta(

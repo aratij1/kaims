@@ -1,0 +1,73 @@
+rule_files:
+  - /etc/prometheus/alert.rules.yml
+evaluation_interval: 1m
+tests:
+  - name: real writable disks only
+    interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{instance="host",device="d",mountpoint="/mnt/host/d",fstype="9p"}'
+        values: '5+0x10'
+      - series: 'node_filesystem_size_bytes{instance="host",device="d",mountpoint="/mnt/host/d",fstype="9p"}'
+        values: '100+0x10'
+      - series: 'node_filesystem_readonly{instance="host",device="d",mountpoint="/mnt/host/d",fstype="9p"}'
+        values: '0+0x10'
+      - series: 'node_filesystem_avail_bytes{instance="host",device="sdb",mountpoint="/parent-distro/usr/lib/linux-tools",fstype="ext4"}'
+        values: '0+0x10'
+      - series: 'node_filesystem_size_bytes{instance="host",device="sdb",mountpoint="/parent-distro/usr/lib/linux-tools",fstype="ext4"}'
+        values: '100+0x10'
+      - series: 'node_filesystem_readonly{instance="host",device="sdb",mountpoint="/parent-distro/usr/lib/linux-tools",fstype="ext4"}'
+        values: '0+0x10'
+      - series: 'node_filesystem_avail_bytes{instance="host",device="image",mountpoint="/image",fstype="ext4"}'
+        values: '0+0x10'
+      - series: 'node_filesystem_size_bytes{instance="host",device="image",mountpoint="/image",fstype="ext4"}'
+        values: '100+0x10'
+      - series: 'node_filesystem_readonly{instance="host",device="image",mountpoint="/image",fstype="ext4"}'
+        values: '1+0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: DiskSpaceLow
+        exp_alerts:
+          - exp_labels: {instance: host, device: d, mountpoint: /mnt/host/d, fstype: 9p, severity: critical}
+            exp_annotations:
+              summary: Disk space low
+              description: Disk utilization is above 90% on host mount /mnt/host/d.
+  - name: failed probes are not latency observations
+    interval: 1m
+    input_series:
+      - series: 'probe_duration_seconds{job="blackbox",instance="unavailable"}'
+        values: '5+0x10'
+      - series: 'probe_success{job="blackbox",instance="unavailable"}'
+        values: '0+0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: HighNetworkLatency
+        exp_alerts: []
+  - name: idle application and zero browsers are not outages without configured expectations
+    interval: 1m
+    input_series:
+      - series: 'kaiops_gateway_requests_total{status="ok"}'
+        values: '0+0x25'
+      - series: 'kaiops_sse_connections{role="admin"}'
+        values: '0+0x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: LowRequestThroughput
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: KaiOpsSSEDisconnected
+        exp_alerts: []
+  - name: a configured request baseline still detects real sustained low traffic
+    interval: 1m
+    input_series:
+      - series: 'kaiops_gateway_requests_total{status="ok"}'
+        values: '0+0x25'
+      - series: 'kaiops_expected_min_request_rate'
+        values: '0.2+0x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: LowRequestThroughput
+        exp_alerts:
+          - exp_labels: {severity: warning, project_name: KaiOps, application: KaiOps}
+            exp_annotations:
+              summary: Low request throughput
+              description: Request throughput is below the explicitly configured kaiops_expected_min_request_rate baseline.

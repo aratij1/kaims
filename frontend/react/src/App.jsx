@@ -37,69 +37,42 @@ import { KAI_BRAND } from "./config/brand";
 import KaiCommandPalette from "./app/KaiCommandPalette";
 import { KaiOperationsShell } from "./components/shell/KaiOperationsShell";
 const LOCAL_JENKINS_ENDPOINT = "http://jenkins:8080", LOCAL_JENKINS_JOB = "kaiops-auto-remediation", LOCAL_JENKINS_CREDENTIAL_REF = "vault://kaiops/local/jenkins#api-token";
+import { ALERT_DOC_KIND_OPTIONS, DOCUMENT_PROVIDER_ROLES, ONBOARDING_SOURCE_DOC_EXTENSIONS, ONBOARDING_SOURCE_DOC_SAMPLE_FILES } from "./onboardingConfig";
+import { classifyOnboardingDocumentType, deriveMonitoringRequirementsFromDocument, extractMonitoringToolAndUrl, extractOnboardingProjectName, looksLikeUuid, normalizeRoleName, severityOverrideKey, simplifyMonitoringUrl, summarizeUploadedDocument } from "./onboardingUtils";
 import {
-  ALERT_DOC_KIND_OPTIONS,
-  DOCUMENT_PROVIDER_ROLES,
-  MONITORING_TOOL_OPTIONS,
-  ONBOARDING_SOURCE_DOC_BUCKETS,
-  ONBOARDING_SOURCE_DOC_EXTENSIONS,
-  ONBOARDING_SOURCE_DOC_SAMPLE_FILES,
-} from "./onboardingConfig";
-import {
-  classifyOnboardingDocumentType,
-  deriveMonitoringRequirementsFromDocument,
-  extractMonitoringToolAndUrl,
-  extractOnboardingProjectName,
-  looksLikeUuid,
-  normalizeMatchToken,
-  normalizeRoleName,
-  severityOverrideKey,
-  simplifyMonitoringUrl,
-  summarizeUploadedDocument,
-} from "./onboardingUtils";
-import {
-  DEFAULT_ALERT, REAL_USE_CASE_SCOPE, TEST_USE_CASE_SCOPE, CORE_MONITOR_PROJECTS,
-  SERVICE_TOPIC_FLOW, RECOMMENDED_WORKER_PROFILE, SCALE_CAPACITY_GUIDE, AGENT_DISPLAY_ALIASES, AGENT_ROUTE_ALIASES,
-  PREFERENCE_STORAGE_KEY, UI_THEME_VALUES, extractObservedRoutingMetrics, normalizeMatchTokens, hasTokenOverlap,
-  KAIOPS_CORE_SERVICE_SET, normalizeMonitorToken, isKaiopsCoreSelection, isKaiopsCoreAlert, PROMPT_FRAGMENT_PATTERNS,
-  isPromptFragment, isPlaceholderRecommendationText, cleanRecommendationText,
+  DEFAULT_ALERT,
+  REAL_USE_CASE_SCOPE,
+  TEST_USE_CASE_SCOPE,
+  CORE_MONITOR_PROJECTS,
+  SERVICE_TOPIC_FLOW,
+  SCALE_CAPACITY_GUIDE,
+  PREFERENCE_STORAGE_KEY,
+  UI_THEME_VALUES,
+  extractObservedRoutingMetrics,
+  cleanRecommendationText,
   filterAlertsForMonitor,
   filterRowsForMonitor,
-  inferMonitorScope,
   isGeneratedOrTestAlert,
-  isEphemeralProjectName,
   normalizeAlertChannel,
   sourceChannelLabel,
   ALERT_SOURCE_CHANNELS,
   MAX_LATEST_ALERTS_PER_SOURCE,
-  MIN_VISIBLE_ALERTS_BY_SOURCE,
   capLatestAlertsPerSource,
   ensureMinimumAlertsBySource,
   monitorScopeLabel,
   alertTimeMs,
-  stableCrossSourceAlertSignature,
-  alertIdentityKeys,
-  alertApplicationCandidate,
-  alertRowScore,
-  resolveCanonicalAlertRow,
   resolveCanonicalAlertForRow,
   dedupeAndConsolidateAlertRows,
   shouldRetainAlertSelection,
-  mapClosedIncidentToAlertStreamRow,
-  projectHintFromAlertRow,
   ALERT_UUID_PATTERN,
   mapLandingPadRowToAlertStreamRow,
   mergeAlertStreamRows,
   onboardingSourceDocCategoryLabel,
-  fallbackFetchTargets,
   fetchJson,
-  HealthBadge,
-  htmlEscape,
   asDisplayValue,
   parseUtcTimestamp,
   formatIstTimestamp,
   formatUtcTimestamp,
-  clampQualityScore,
   formatQualityPercent,
   normalizeEvaluationEnvelope,
   elapsedSeconds,
@@ -109,7 +82,6 @@ import {
   compactText,
   hasMeaningfulValue,
   stringifyTimelineValue,
-  isFailureStatus,
   normalizeApprovalStatus,
   canonicalIncidentStatus,
   isApprovalResolvedStatus,
@@ -118,13 +90,9 @@ import {
   extractEventError,
   extractEventInput,
   extractEventOutput,
-  buildPreviewExecutionPlan,
   deriveExecutionCommands,
   remediationOutcomeFromAction,
-  shellArg,
   buildKaiOpsRemediationScript,
-  firstTraceTimestamp,
-  firstEventTimestamp,
   buildSyntheticFlowRows,
   summarizeEventType,
   timelinePhaseOrder,
@@ -132,47 +100,22 @@ import {
   toFiniteNumber,
   percentile,
   normalizeUsageRow,
-  isPlaceholderUsageValue,
   isMeaningfulUsageRow,
-  usageRowIdentity,
   dedupeUsageRows,
-  HorizontalBarChart,
-  SuccessFailureDonut,
-  ONBOARDING_STEP_BACKGROUND,
   explainOnboardingStepBackground,
   findHistoricalTicketDiscoveryDocument,
   HistoricalTicketDiscoveryPanel,
   FlowTimelineGraph,
   UnifiedIncidentTimeline,
-  intelligenceListText,
-  groundedIntelligenceDisplay,
   canonicalIncidentAnalysis,
-  downloadInvestigationArtifact,
   ContextRetrievalGraph,
   AgentEventsGraph,
-  TopicFlowGraph,
-  classifySelectedAlertPath,
-  parseTimelineJson,
-  classifyFlowStageFromRow,
-  timelineRowText,
-  timelineRowIndicatesFallback,
-  timelineRowIndicatesSuccess,
-  timelineRowHasError,
-  timelineRowStatus,
-  inferTimelineNextStep,
-  buildDynamicFlowSections,
   ApplicationSankeyFlow,
   ProcessingFlowMap,
   MessageBusTopology,
   ExecutionPlanGraph,
-  renderHtmlTable,
   normalizeGeneratedRuleRows,
   cleanRuleIntentLine,
-  slugForPrometheus,
-  yamlQuote,
-  inferPrometheusExpression,
-  inferRuleDuration,
-  inferRuleSeverity,
   buildPrometheusRulePreview,
   summarizeAlertRuleContext,
 } from "./appHelpers.jsx";
@@ -778,11 +721,13 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     queueHealthRequestRef.current = { ...requestState, inFlight: true };
     if (!background) setQueueHealth((current) => ({ ...current, loading: true }));
     try {
-      const data = await fetchJson("/api-gateway/operations/queue-health", { timeoutMs: 4000 });
+      const data = await fetchJson("/api-gateway/operations/queue-health", authenticatedOptions({ timeoutMs: 6500 }));
       queueHealthRequestRef.current.lastFetchedAt = Date.now();
       setQueueHealth({ loading: false, ...data });
     } catch (error) {
-      setQueueHealth((current) => ({ ...current, loading: false, status: "unreachable", healthy: false, error: error.message }));
+      setQueueHealth((current) => ({ ...current, loading: false, status: "unreachable", healthy: false,
+        alert_processing: { status: "unavailable", limit: 50, active: null },
+        analysis_backlog_ready: null, evidence_collection: { status: "unavailable" }, error: error.message }));
     } finally {
       queueHealthRequestRef.current.inFlight = false;
     }
@@ -932,77 +877,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  async function applyAlertSeverityOverrideRule(row) {
-    const alertName = String(row?.name || row?.alert_name || "").trim();
-    const service = String(row?.service || "").trim();
-    const environment = String(row?.environment || "").trim();
-    const key = severityOverrideKey(alertName, service, environment);
-    const draftSeverity = String(alertSeverityDrafts[key] || row?.severity || "warning").trim().toLowerCase();
-    const reason = String(alertSeverityReasons[key] || "").trim();
-    if (!alertName) {
-      setAlertSeverityOverrides((prev) => ({ ...prev, error: "Alert name is required for severity override." }));
-      return;
-    }
-    if (reason.length < 10) {
-      setAlertSeverityOverrides((prev) => ({ ...prev, error: "Explain why this severity correction is needed (at least 10 characters)." }));
-      return;
-    }
-    setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: key, error: "" }));
-    try {
-      await fetchJson("/api-gateway/alerts/severity-overrides", authenticatedOptions({
-        method: "PUT",
-        body: JSON.stringify({
-          name: alertName,
-          service,
-          environment,
-          severity: draftSeverity,
-          requested_by: String(adminSession?.user?.username || "ui-user").trim(),
-          requested_role: String(currentRole || "").trim(),
-          updated_at: new Date().toISOString(),
-        }),
-      }));
-      await fetchJson("/api-gateway/triage/corrections", authenticatedOptions({
-        method: "POST",
-        body: JSON.stringify({
-          entity_type: "alert",
-          entity_id: String(row?.alert_id || row?.id || alertName).trim(),
-          correction_type: "severity",
-          original_payload: {
-            severity: String(row?.severity || "unknown").toLowerCase(),
-            name: alertName,
-            service,
-            environment,
-          },
-          corrected_payload: { severity: draftSeverity },
-          reason,
-        }),
-      }));
-      await loadAlertSeverityOverrides();
-      setAlertSeverityReasons((current) => ({ ...current, [key]: "" }));
-      setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: "" }));
-    } catch (error) {
-      setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: error.message }));
-    }
-  }
 
-  async function clearAlertSeverityOverrideRule(row) {
-    const alertName = String(row?.name || row?.alert_name || "").trim();
-    const service = String(row?.service || "").trim();
-    const environment = String(row?.environment || "").trim();
-    const key = severityOverrideKey(alertName, service, environment);
-    if (!alertName) {
-      return;
-    }
-    setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: key, error: "" }));
-    try {
-      const params = new URLSearchParams({ name: alertName, service, environment });
-      await fetchJson(`/api-gateway/alerts/severity-overrides?${params.toString()}`, authenticatedOptions({ method: "DELETE" }));
-      await loadAlertSeverityOverrides();
-      setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: "" }));
-    } catch (error) {
-      setAlertSeverityOverrides((prev) => ({ ...prev, savingKey: "", error: error.message }));
-    }
-  }
+
+
 
   async function loadMonitoringApplications() {
     setMonitoringApps((prev) => ({ ...prev, loading: true, error: "" }));
@@ -1317,7 +1194,6 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     // This action owns the complete cockpit URL below. Prevent the legacy tab
     // synchronization effect from racing it with a navigation to plain `/`,
     // which would remove workspace=alert and leave the details view hidden.
-    const incidentDestination = /^\/incidents\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(currentPath) ? currentPath : "/";
     skipNextActiveTabNavigationRef.current = true;
     setActiveTab("home");
     setHomeDetailTab(initialTab === "rca" ? "evidence" : initialTab);
@@ -1328,7 +1204,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
   function openAlertDetailsFromIncident(row, initialTab = "evidence") {
-    const incidentId = String(row?.incident_id || row?.id || "").trim();
+    const incidentId = String(row?.incident_id || row?.incident_projection?.incident_id || row?.incident_projection?.id || row?.id || "").trim();
     if (!incidentId) {
       return;
     }
@@ -1710,7 +1586,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       setIncidentMetadata((prev) => ({
         loading: false,
         rows: Array.isArray(prev.rows) ? prev.rows : [],
-        error: Array.isArray(prev.rows) && prev.rows.length ? "" : error.message,
+        error: error.message,
         page: prev.page || {},
       }));
     } finally {
@@ -1820,28 +1696,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }));
   }
 
-  function refreshApprovalDrivenViewsSoon(incidentId = "") {
-    window.setTimeout(() => {
-      refreshApprovalDrivenViews(incidentId);
-    }, 1200);
-  }
 
-  async function loadFlows() {
-    setFlows((prev) => ({ ...prev, loading: true, error: "" }));
-    try {
-      const payload = await fetchJson("/api-gateway/sample/flows");
-      const data = unwrap(payload);
-      const rows = data?.flows || [];
-      const normalizedRows = Array.isArray(rows) ? rows : [];
-      const firstFlowId = normalizedRows[0]?.id || normalizedRows[0]?.flow_id;
-      if (firstFlowId && !selectedFlow) {
-        setSelectedFlow(firstFlowId);
-      }
-      setFlows({ loading: false, rows: normalizedRows, error: "" });
-    } catch (error) {
-      setFlows({ loading: false, rows: [], error: error.message });
-    }
-  }
+
+
 
   async function loadGatewaySummary() {
     setGatewaySummary((prev) => ({ ...prev, loading: true, error: "" }));
@@ -1953,29 +1810,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  async function reloadRagDocs() {
-    try {
-      await fetchJson("/api-gateway/rag/reload", authenticatedOptions({ method: "POST", body: JSON.stringify({}) }));
-      await loadRagDocs();
-    } catch (error) {
-      setRagDocs((prev) => ({ ...prev, error: error.message }));
-    }
-  }
 
-  async function submitAlert(event) {
-    event.preventDefault();
-    setSubmitState({ loading: true, result: null, error: "" });
-    try {
-      const payload = await fetchJson("/api-gateway/alerts", {
-        method: "POST",
-        body: JSON.stringify(form),
-      });
-      setSubmitState({ loading: false, result: payload, error: "" });
-      await loadRecentAlerts();
-    } catch (error) {
-      setSubmitState({ loading: false, result: null, error: error.message });
-    }
-  }
+
+
 
   async function runWorkflow(flowId) {
     const normalized = String(flowId || "").trim();
@@ -1995,16 +1832,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  function normalizeMetadataMap(value) {
-    if (!value || typeof value !== "object") {
-      return {};
-    }
-    return Object.fromEntries(
-      Object.entries(value)
-        .map(([key, raw]) => [String(key || "").trim(), String(raw ?? "").trim()])
-        .filter(([key, item]) => key && item)
-    );
-  }
+
 
   function coerceText(value, fallback = "") {
     const text = String(value ?? "").trim();
@@ -2331,6 +2159,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const evidenceDraftApi = useEvidenceDraftBundle({ fetchJson, authenticatedOptions, unwrap });
 
   function resetNavigationAfterLogin() {
+    const incidentDestination = /^\/incidents\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(currentPath) ? currentPath : "/";
     // App is intentionally kept mounted while the login screen is visible, so
     // selections from the previous session would otherwise survive a new
     // authentication. Reset every persistent workspace to its first tab and
@@ -3670,26 +3499,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  function onboardingProjectSeed() {
-    const projectName = String(selectedOnboardingProject || onboardingForm.name || "").trim();
-    const selectedMonitoringTool = String(onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
-    return {
-      project_name: projectName,
-      description: "",
-      business_unit: "",
-      environment: String(onboardingForm.environment || "prod").trim().toLowerCase(),
-      criticality: "high",
-      sla: "",
-      support_team: String(onboardingForm.owner_team || "").trim(),
-      business_owner: "",
-      technical_owner: "",
-      technology_stack: [],
-      cloud_provider: ({ azure_cloud: "azure", aws_cloud: "aws", gcp_cloud: "gcp", private_cloud: "private-cloud", on_prem: "on-prem" }[onboardingForm.deployment_mode] || "cloud-neutral"),
-      region: String(onboardingForm.region || "").trim(),
-      monitoring_platforms: MONITORING_TOOL_OPTIONS.includes(selectedMonitoringTool) ? [selectedMonitoringTool] : ["prometheus"],
-      notification_platforms: ["slack", "teams", "pagerduty"],
-    };
-  }
+
 
   async function loadOnboardingRuleCapabilities() {
     setOnboardingRuleCapabilities((current) => ({ ...current, loading: true, error: "" }));
@@ -3703,89 +3513,9 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  async function runExistingRulePipeline(event) {
-    event.preventDefault();
-    setOnboardingRuleRunState({ loading: true, result: null, error: "" });
-    try {
-      let rulesToPush = [];
-      const rawRules = String(existingRulePipelineForm.rules_json || "").trim();
-      if (rawRules) {
-        const parsed = JSON.parse(rawRules);
-        if (!Array.isArray(parsed)) {
-          throw new Error("Rules JSON must be an array of rule objects.");
-        }
-        rulesToPush = parsed;
-      }
 
-      const payload = {
-        project: onboardingProjectSeed(),
-        platform: String(existingRulePipelineForm.platform || "prometheus").trim(),
-        mode: String(existingRulePipelineForm.mode || "bidirectional").trim(),
-        rules_to_push: rulesToPush,
-        connection_profile: {
-          endpoint_url: String(existingRulePipelineForm.connection_url || "").trim(),
-        },
-      };
 
-      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/existing", authenticatedOptions({
-        method: "POST",
-        body: JSON.stringify(payload),
-      }));
-      const result = unwrap(response);
-      setOnboardingRuleRunState({ loading: false, result, error: "" });
-      setOnboardingRuleLookup((current) => ({
-        ...current,
-        workflow_id: String(result?.workflow_id || current.workflow_id || "").trim(),
-      }));
-      await loadOnboardingAdminData();
-    } catch (error) {
-      setOnboardingRuleRunState({ loading: false, result: null, error: error.message });
-    }
-  }
 
-  async function runNewRulePipeline(event) {
-    event.preventDefault();
-    setOnboardingRuleRunState({ loading: true, result: null, error: "" });
-    try {
-      const requirements = String(newRulePipelineForm.requirements_text || "")
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean);
-      if (!requirements.length) {
-        throw new Error("Provide at least one monitoring requirement.");
-      }
-
-      const selectedTool = String(newRulePipelineForm.selected_tool || onboardingForm.monitoring_tool || "prometheus").trim().toLowerCase();
-      const targetPlatforms = MONITORING_TOOL_OPTIONS.includes(selectedTool) ? [selectedTool] : ["prometheus"];
-      const discoveryInputs = {
-        endpoint_url: simplifyMonitoringUrl(onboardingForm.monitoring_url),
-        deployment_mode: String(onboardingForm.deployment_mode || "cloud_neutral").trim(),
-        environment: String(onboardingForm.environment || "prod").trim(),
-        generated_from_plain_language: true,
-      };
-
-      const payload = {
-        project: onboardingProjectSeed(),
-        monitoring_requirements: requirements,
-        target_platforms: targetPlatforms,
-        discovery_inputs: discoveryInputs,
-      };
-
-      const response = await fetchJson("/api-gateway/onboarding/rules/pipeline/new", authenticatedOptions({
-        method: "POST",
-        body: JSON.stringify(payload),
-      }));
-      const result = unwrap(response);
-      setOnboardingRuleRunState({ loading: false, result, error: "" });
-      setOnboardingRuleLookup((current) => ({
-        ...current,
-        workflow_id: String(result?.workflow_id || current.workflow_id || "").trim(),
-      }));
-      await loadOnboardingAdminData();
-    } catch (error) {
-      setOnboardingRuleRunState({ loading: false, result: null, error: error.message });
-    }
-  }
 
   async function lookupOnboardingRuleWorkflow(event) {
     event.preventDefault();
@@ -5009,8 +4739,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
     };
     void refreshAlertStream();
-    const timer = window.setInterval(refreshAlertStream, 60000);
-    return () => window.clearInterval(timer);
+    const timer = window.setInterval(refreshAlertStream, 20000);
+    window.addEventListener("focus", refreshAlertStream);
+    document.addEventListener("visibilitychange", refreshAlertStream);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshAlertStream);
+      document.removeEventListener("visibilitychange", refreshAlertStream);
+    };
   }, [adminSession.accessToken, activeTab, alertsLimit, applicationToMonitor]);
 
   useEffect(() => {
@@ -5739,10 +5475,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       (projectionEventPayload?.evaluation && typeof projectionEventPayload.evaluation === "object" && projectionEventPayload.evaluation)
       || (projectionPayload?.evaluation && typeof projectionPayload.evaluation === "object" && projectionPayload.evaluation)
       || {};
-    const evaluation =
-      (metadata?.evaluation && typeof metadata.evaluation === "object" && metadata.evaluation)
-      || projectedEvaluation
-      || {};
+    const evaluation = {
+      ...projectedEvaluation,
+      ...(metadata?.evaluation && typeof metadata.evaluation === "object" ? metadata.evaluation : {}),
+    };
     const ragMatches = Array.isArray(metadata.rag_matches) ? metadata.rag_matches : [];
     const bestRagMatch = ragMatches.reduce((best, row) => {
       const value = Number(row?.match_confidence ?? row?._similarity ?? row?.similarity ?? row?.score ?? 0);
@@ -8218,32 +7954,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     }
   }
 
-  async function runExecutionPreflight() {
-    const passed = blockingPreflightFailures.length === 0;
-    if (!passed) {
-      if (executionRequiresCredential && !remediationPlanEditor.credential_ref) setShowExecutionCredential(true);
-      setExecutionPreflightState({ signature: executionPlanSignature, checkedAt: new Date().toISOString(), passed: false });
-      setRemediationExecutionState((current) => ({ ...current, error: `Dry run blocked: ${blockingPreflightFailures.map((check) => check.label).join(", ")}.` }));
-      return;
-    }
-    setRemediationExecutionState((current) => ({ ...current, loading: true, error: "" }));
-    try {
-      const incidentId = String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "").trim();
-      const recommendationId = await resolveRecommendationIdForIncident(incidentId, String(approvalForm.recommendation_id || selectedApprovalRecommendationId || "").trim());
-      const payload = buildRemediationExecutionPayload({ incidentId, recommendationId, action: "approve", approver: String(adminSession?.user?.username || ""), comment: approvalForm.comment || "operator dry run", editedPlan: buildEditedRemediationPlan() });
-      const response = await fetchJson("/api-gateway/remediation/dry-run", authenticatedOptions({ method: "POST", body: JSON.stringify(payload) }));
-      const result = unwrap(response);
-      if (String(result?.status || "").toLowerCase() !== "passed") throw new Error(result?.message || "Dry run was blocked by remediation policy.");
-      setExecutionPreflightState({ signature: executionPlanSignature, checkedAt: new Date().toISOString(), passed: true });
-      setRemediationExecutionState({ loading: false, result: response, error: "" });
-    } catch (error) {
-      setExecutionPreflightState({ signature: executionPlanSignature, checkedAt: new Date().toISOString(), passed: false });
-      const message = String(error?.message || error);
-      const credentialError = message.includes("valid enterprise secret-manager reference");
-      if (credentialError) setShowExecutionCredential(true);
-      setRemediationExecutionState({ loading: false, result: null, error: credentialError ? "Dry run blocked: enter a valid enterprise secret-manager URI in Execution identity, then retry." : `Dry run failed: ${message}` });
-    }
-  }
+
 
   async function approveCockpitRemediationPlan(actionOverride = "") {
     const incidentId = String(approvalForm.incident_id || selectedIncidentId || selectedApprovalIncidentId || "").trim();
@@ -8697,10 +8408,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const executionOutcomeReviewed = String(executionOutcomeReview.reviewedAlertId || "") === String(selectedAlertId || "")
     || selectedAlertRagDocuments.some((document) => String(document?.source_system || document?.metadata?.source_system || "").toLowerCase() === "kaims-execution-review");
   const incidentCockpitStages = [
-    { id: "evidence", short: "01", label: "Evidence & Understanding", accessibleLabel: "Evidence, RCA, and impact", description: `${selectedAiTrust.evidence.length} linked record(s) · RCA and impact`, complete: selectedAiTrust.evidence.length > 0 && Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
-    { id: "execution", short: "02", label: "Resolve", accessibleLabel: "Resolve incident", description: resolveStageDescription, complete: persistedDiagnosticCompletion || (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) && executionAutoCloses) || (!executionPolicyBlocked && !executionAutoCloses && ["succeeded", "skipped", "failed", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(cockpitExecutionStatus)) },
-    { id: "audit", short: "03", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : executionOutcomeReviewed ? "outcome reviewed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" || executionOutcomeReviewed },
-    { id: "overview", short: "04", label: "Orient", accessibleLabel: "Overview", description: "Identity and lifecycle", complete: Boolean(selectedAlertId) },
+    { id: "overview", short: "01", label: "Orient", accessibleLabel: "Overview", description: "Identity and lifecycle", complete: Boolean(selectedAlertId) },
+    { id: "evidence", short: "02", label: "Evidence & Understanding", accessibleLabel: "Evidence, RCA, and impact", description: `${selectedAiTrust.evidence.length} linked record(s) · RCA and impact`, complete: selectedAiTrust.evidence.length > 0 && Boolean(cockpitAnalysis.rootCause && cockpitAnalysis.rootCause !== "-") },
+    { id: "execution", short: "03", label: "Resolve", accessibleLabel: "Resolve incident", description: resolveStageDescription, complete: persistedDiagnosticCompletion || (["closed", "resolved"].includes(selectedCanonicalIncidentStatus) && executionAutoCloses) || (!executionPolicyBlocked && !executionAutoCloses && ["succeeded", "skipped", "failed", "dispatch_failed", "execution_failed", "validation_failed", "rolled_back", "rollback_failed", "timed_out", "cancelled", "manual_intervention_required"].includes(cockpitExecutionStatus)) },
+    { id: "audit", short: "04", label: "Validate", accessibleLabel: "Audit Trail", description: selectedCanonicalIncidentStatus === "closed" ? "closed" : executionOutcomeReviewed ? "outcome reviewed" : "audit and recovery", complete: selectedCanonicalIncidentStatus === "closed" || executionOutcomeReviewed },
   ];
   const cockpitRecommendedStage = (() => {
     if (!incidentCockpitStages.find((stage) => stage.id === "evidence")?.complete || selectedAlertEvaluation.requiresReview) return "evidence";
@@ -9637,201 +9348,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     ] };
   }, [alerts.error, alerts.loading, approvalState.error, approvalState.loading, applicationToMonitor, currentRole, executiveInsights, gatewayRecent.rows.length, health.ok, incidentMetadata.error, incidentMetadata.loading, monitorScopedAlerts, monitorScopedIncidentMetadata, monitoringApps.error, monitoringApps.loading, monitoringApps.rows, pendingApprovals.length, queueHealth, selectedAlertEventsDisplay, selectedAlertRow, selectedExecutionBreakdown.commands.length, selectedExecutionBreakdown.scripts.length, selectedMonitorScopeLabel]);
 
-  function downloadFullHtmlReportPack() {
-    const now = new Date();
-    const generatedAt = formatIstTimestamp(now.toISOString());
-    const homeMetrics = [
-      ["Recent Alerts", monitorScopedAlerts.length],
-      ["Flows", flows.rows.length],
-      ["Gateway Events", gatewayRecent.rows.length],
-      ["Health", health.ok ? "OK" : "CHECK"],
-    ];
-    const executiveMetrics = [
-      ["Open Alerts", monitorScopedAlerts.length],
-      ["Critical Open", monitorScopedAlerts.filter((row) => String(row?.severity || "").toLowerCase() === "critical").length],
-      ["Closed Incidents", closedIncidents.rows.length],
-      ["Health Restored", closedIncidents.rows.filter((row) => row?.health_restored === true).length],
-      ["SLA At Risk", executiveInsights.slaAtRisk],
-      ["Avg Approval Wait (min)", executiveInsights.avgApprovalWaitMinutes.toFixed(1)],
-      ["Auto Remediation Rate", `${executiveInsights.automationRate.toFixed(1)}%`],
-    ];
-    const safetyMetrics = [
-      ["Total", gatewaySummary.data.total_events || 0],
-      ["Allowed", gatewaySummary.data.allowed || 0],
-      ["Review", gatewaySummary.data.review || 0],
-      ["Blocked", gatewaySummary.data.blocked || 0],
-    ];
 
-    const monitorAlertsRows = monitorScopedAlerts.slice(0, 200).map((row, index) => [
-      row.alert_id || row.id || row.incident_id || index,
-      formatUtcTimestamp(row.created_at || row.starts_at),
-      row.name || row.alert_name || "-",
-      row.application || row.project_name || row.project || row.service || "-",
-      row.service || "-",
-      String(row.severity || "-").toUpperCase(),
-      row.status || row.state || "open",
-    ]);
-    const metadataRows = monitorScopedIncidentMetadata.slice(0, 250).map((row, index) => [
-      row.incident_id || row.id || index,
-      row.service || "-",
-      row.risk_tier || "-",
-      row.execution_mode || "-",
-      row.transport_provider || "-",
-      row.status || "-",
-    ]);
-    const pendingApprovalRows = pendingApprovals.slice(0, 200).map((row, index) => [
-      row.incident_id || index,
-      row.service || "-",
-      row.severity || row.risk_tier || "-",
-      row.execution_mode || "-",
-      row.status || "pending",
-    ]);
-    const guidanceRows = guidanceState.rows.slice(0, 200).map((row, index) => [
-      row.kind || row.document_kind || "-",
-      row.score ?? "-",
-      row.title || row.id || `match-${index}`,
-      row.path || "-",
-    ]);
-    const traceRows = workflowEventRows.slice(0, 250).map((row) => [
-      row.sequence,
-      row.agent,
-      row.action,
-      row.decision,
-      row.output,
-      row.communicates_to,
-    ]);
-    const finopsProviderRows = finopsByProvider.map((row) => [
-      row.provider,
-      row.calls,
-      row.total_tokens,
-      Number(row.total_cost_usd || 0).toFixed(6),
-    ]);
-    const finopsUsageRows = panelWorkflowUsage.slice(0, 250).map((row) => [
-      row.task || "-",
-      row.provider || "-",
-      row.model || "-",
-      row.input_tokens || "-",
-      row.output_tokens || "-",
-      row.total_cost_usd || "-",
-    ]);
-    const gatewayRows = gatewayRecent.rows.slice(0, 250).map((row, index) => [
-      formatIstTimestamp(row.created_at || row.timestamp) || index,
-      row.path || "-",
-      row.status_code || "-",
-      row?.safety?.decision || "-",
-      row.trace_id || "-",
-    ]);
-    const busActualRows = messageBusActual.rows.map((row) => [
-      row.service,
-      row.consumed,
-      row.published,
-      row.provider,
-      row.status,
-    ]);
-    const busConfigRows = messageBusTopicRows.map((row) => [row.service, row.consumes, row.publishes]);
-    const closedRows = filteredClosedRows.slice(0, 300).map((row, index) => [
-      row.incident_id || index,
-      row.service || "-",
-      row.severity || "-",
-      row.status || "closed",
-      formatIstTimestamp(row.closed_at || row.updated_at),
-    ]);
-
-    const selectedCanonicalAnalysis = canonicalIncidentAnalysis(selectedAlertWorkflow, selectedAlertRow);
-    const selectedSummaryRows = selectedAlertRow
-      ? [
-          ["Alert ID", selectedAlertId],
-          ["Name", selectedAlertRow?.name || selectedAlertWorkflow?.alert?.name || "-"],
-          ["Service", selectedAlertRow?.service || selectedAlertWorkflow?.alert?.service || "-"],
-          ["Incident", selectedAlertWorkflow?.incident?.id || selectedAlertWorkflow?.incident_id || "-"],
-          ["Analysis Status", selectedCanonicalAnalysis.status],
-          ["Root Cause", selectedCanonicalAnalysis.rootCause],
-          ["Recommended Action", selectedCanonicalAnalysis.action],
-          ["Impact", selectedCanonicalAnalysis.impact],
-          ["External Knowledge", selectedCanonicalAnalysis.externalKnowledgeStatus],
-        ]
-      : [];
-    const selectedEventsRows = selectedAlertEvents.slice(0, 250).map((event) => [
-      event.sequence || "-",
-      event.agent || "-",
-      event.action || "-",
-      typeof event.decision === "object" ? JSON.stringify(event.decision) : String(event.decision || "-"),
-      typeof event.output === "object" ? JSON.stringify(event.output) : String(event.output || "-"),
-      event.communicates_to || "-",
-    ]);
-    const selectedUsageRows = selectedAlertUsage.slice(0, 250).map((row) => [
-      row.task || "-",
-      row.provider || "-",
-      row.model || "-",
-      row.input_tokens || "-",
-      row.output_tokens || "-",
-      row.total_cost_usd || "-",
-    ]);
-    const selectedRoutingRows = selectedAlertRow
-      ? [
-          ["Observed Provider", (hasSelectedWorkflowData ? selectedAlertRouting?.message_bus_provider : observedRouting?.message_bus_provider) || "-"],
-          ["Workflow", (hasSelectedWorkflowData ? selectedAlertRouting?.workflow : observedRouting?.workflow) || "-"],
-          ["Next Action", (hasSelectedWorkflowData ? selectedAlertRouting?.next_action : observedRouting?.next_action) || "-"],
-          ["Execution Mode", (hasSelectedWorkflowData ? selectedAlertRouting?.execution_mode : observedRouting?.execution_mode) || "-"],
-          ["Risk Tier", (hasSelectedWorkflowData ? selectedAlertRouting?.risk_tier : observedRouting?.risk_tier) || "-"],
-        ]
-      : [];
-
-    const sections = [
-      `<section><h2>Report Context</h2>${renderHtmlTable(["Field", "Value"], [["Generated At", generatedAt], ["Application Scope", selectedMonitorScopeLabel], ["Active Tab", activeTab], ["Health", health.message]])}</section>`,
-      `<section><h2>Dashboard Metrics</h2>${renderHtmlTable(["Metric", "Value"], homeMetrics)}</section>`,
-      `<section><h2>Alert Stream</h2>${renderHtmlTable(["Alert ID", "Time (UTC)", "Name", "Application", "Service", "Severity", "Status"], monitorAlertsRows)}</section>`,
-      `<section><h2>Alert Details Cockpit</h2>${renderHtmlTable(["Field", "Value"], selectedSummaryRows)}${renderHtmlTable(["Step", "Agent", "Action", "Decision", "Output", "Communicates To"], selectedEventsRows)}${renderHtmlTable(["Task", "Provider", "Model", "Input", "Output", "Cost USD"], selectedUsageRows)}${renderHtmlTable(["Field", "Value"], selectedRoutingRows)}<h3>Raw Payload</h3><pre>${htmlEscape(JSON.stringify(selectedAlertData.payload || {}, null, 2))}</pre></section>`,
-      `<section><h2>Executive Dashboard</h2>${renderHtmlTable(["Metric", "Value"], executiveMetrics)}${renderHtmlTable(["Incident", "Service", "Risk", "Execution Mode", "Provider", "Status"], metadataRows)}</section>`,
-      `<section><h2>Incident Metadata Explorer</h2>${renderHtmlTable(["Incident", "Service", "Risk", "Execution Mode", "Provider", "Status"], metadataRows)}</section>`,
-      `<section><h2>Alerts and Quick Docs</h2>${renderHtmlTable(["Incident", "Service", "Severity", "Execution Mode", "Status"], pendingApprovalRows)}${renderHtmlTable(["Kind", "Score", "Title", "Path"], guidanceRows)}</section>`,
-      `<section><h2>Agent Flow</h2>${renderHtmlTable(["Step", "Agent", "Action", "Decision", "Output", "Handoff"], traceRows)}${renderHtmlTable(["Time", "Path", "Status", "Decision", "Trace"], gatewayRows)}</section>`,
-      `<section><h2>FinOps</h2>${renderHtmlTable(["Provider", "Calls", "Tokens", "Cost USD"], finopsProviderRows)}${renderHtmlTable(["Task", "Provider", "Model", "Input Tokens", "Output Tokens", "Total Cost USD"], finopsUsageRows)}</section>`,
-      `<section><h2>Message Bus</h2>${renderHtmlTable(["Service", "Consumed", "Published", "Provider", "Status"], busActualRows)}${renderHtmlTable(["Service", "Consumes", "Publishes"], busConfigRows)}<h3>Observed Topics</h3><p>Published: ${htmlEscape(messageBusActual.published.join(", ") || "none")}</p><p>Consumed: ${htmlEscape(messageBusActual.consumed.join(", ") || "none")}</p></section>`,
-      `<section><h2>Gateway Safety</h2>${renderHtmlTable(["Metric", "Value"], safetyMetrics)}${renderHtmlTable(["Time", "Path", "Status", "Decision", "Trace"], gatewayRows)}</section>`,
-      `<section><h2>Closed Incidents</h2>${renderHtmlTable(["Incident", "Service", "Severity", "Status", "Closed At"], closedRows)}</section>`,
-      `<section><h2>Admin Snapshot</h2>${renderHtmlTable(["Field", "Value"], [["Signed In User", adminSession?.user?.username || "-"], ["Users Loaded", adminUsers.rows.length], ["Onboarding Rows", onboardingState.rows.length]])}</section>`,
-      `<section><h2>Workflow Raw Result</h2><pre>${htmlEscape(JSON.stringify(workflowState.result || {}, null, 2))}</pre></section>`,
-    ];
-
-    const documentHtml = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>KaiMS Report Pack - ${htmlEscape(selectedMonitorScopeLabel)}</title>
-  <style>
-    :root { color-scheme: light; }
-    body { margin: 0; padding: 24px; font-family: "Segoe UI", Tahoma, sans-serif; background: #f5f8fb; color: #10233b; }
-    h1, h2, h3 { margin: 0 0 10px; }
-    h1 { font-size: 26px; }
-    h2 { font-size: 19px; margin-top: 18px; }
-    h3 { font-size: 15px; margin-top: 12px; }
-    .meta { margin: 8px 0 18px; color: #42566e; }
-    section { background: #fff; border: 1px solid #dbe7f3; border-radius: 14px; padding: 14px; margin-bottom: 12px; box-shadow: 0 8px 20px rgba(16, 35, 59, 0.06); }
-    table { width: 100%; border-collapse: collapse; margin: 8px 0 14px; }
-    th, td { border: 1px solid #dbe7f3; text-align: left; padding: 7px 8px; font-size: 12px; vertical-align: top; }
-    th { background: #eef4fb; }
-    pre { margin: 8px 0 0; padding: 10px; background: #0f172a; color: #e2e8f0; border-radius: 10px; overflow: auto; font-size: 11px; }
-  </style>
-</head>
-<body>
-  <h1>KaiMS Full HTML Report Pack</h1>
-  <p class="meta">Application: ${htmlEscape(selectedMonitorScopeLabel)} | Generated: ${htmlEscape(generatedAt)}</p>
-  ${sections.join("\n")}
-</body>
-</html>`;
-
-    const blob = new Blob([documentHtml], { type: "text/html;charset=utf-8" });
-    const objectUrl = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = objectUrl;
-    anchor.download = `kaiops-report-pack-${String(selectedMonitorScopeLabel || "all").replace(/[^a-zA-Z0-9_-]+/g, "-")}-${generatedAt.replace(/[:.]/g, "-")}.html`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(objectUrl);
-  }
 
   if (adminSession.loading || authConfig.loading) return <main className="app-route-loading" aria-busy="true">Restoring authenticated session…</main>;
   if (!isAuthenticated) {
@@ -9887,11 +9404,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                 <p>Sign in to your operational command center.</p>
               </div>
             </div>
-            <label className="auth-application-select"><span>Application workspace</span><select aria-label="Application workspace" value={applicationToMonitor} onChange={(event) => setApplicationToMonitor(event.target.value)} disabled={!monitorApplications.length}>{!monitorApplications.length ? <option value="">No onboarded projects available</option> : null}{monitorApplications.map((name) => <option key={name} value={name}>{name}</option>)}</select><small>{monitorApplications.length ? "Your session opens scoped to this onboarded application." : "Ask an administrator to onboard a project before signing in."}</small></label>
+            <label className="auth-application-select"><span>Application workspace</span><select aria-label="Application workspace" value={applicationToMonitor} onChange={(event) => setApplicationToMonitor(event.target.value)} disabled={!monitorApplications.length}>{!monitorApplications.length ? <option value="">No onboarded projects available</option> : null}{monitorApplications.map((name) => <option key={name} value={name}>{name}</option>)}</select><small>{monitorApplications.length ? "Your session opens scoped to this onboarded application." : "Sign in to configure an application workspace. Your account permissions still apply."}</small></label>
             {authConfig.mode === "oidc" ? (
               <div className="form auth-login-form">
                 <p className="auth-sso-note">Enterprise single sign-on is required. Your identity-provider role controls KaiMS access.</p>
-                <button className="button-primary auth-submit" type="button" onClick={oidcLogin} disabled={adminSession.loading || authConfig.loading || !applicationToMonitor}>{adminSession.loading ? "Redirecting..." : <><span>Continue with SSO</span><b aria-hidden="true">→</b></>}</button>
+                <button className="button-primary auth-submit" type="button" onClick={oidcLogin} disabled={adminSession.loading || authConfig.loading}>{adminSession.loading ? "Redirecting..." : <><span>Continue with SSO</span><b aria-hidden="true">→</b></>}</button>
               </div>
             ) : (
               <form className="form auth-login-form" onSubmit={adminLogin}>
@@ -9899,7 +9416,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                 <label className="auth-field"><span>Username</span><div className="auth-input-frame"><b aria-hidden="true">@</b><input autoComplete="username" value={adminAuthForm.username} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, username: e.target.value }))} /></div></label>
                 <label className="auth-field"><span>Password</span><div className="auth-input-frame"><b className="auth-lock-mark" aria-hidden="true" /><input type={loginPasswordVisible ? "text" : "password"} autoComplete="current-password" value={adminAuthForm.password} onChange={(e) => setAdminAuthForm((curr) => ({ ...curr, password: e.target.value }))} /><button type="button" className="auth-password-toggle" aria-label={loginPasswordVisible ? "Conceal entered value" : "Reveal entered value"} aria-pressed={loginPasswordVisible} onClick={() => setLoginPasswordVisible((visible) => !visible)}>{loginPasswordVisible ? "Hide" : "Show"}</button></div></label>
                 <div className="auth-session-meta"><span><i aria-hidden="true" /> Encrypted session</span><span>Role-scoped access</span></div>
-                <button className="button-primary auth-submit" type="submit" disabled={adminSession.loading || !applicationToMonitor}>{adminSession.loading ? <><i className="auth-submit-spinner" aria-hidden="true" /> Signing in...</> : <><span>Sign in securely</span><b aria-hidden="true">→</b></>}</button>
+                <button className="button-primary auth-submit" type="submit" aria-label="Sign In" disabled={adminSession.loading}>{adminSession.loading ? <><i className="auth-submit-spinner" aria-hidden="true" /> Signing in...</> : <><span>Sign in securely</span><b aria-hidden="true">→</b></>}</button>
               </form>
             )}
             {adminSession.error ? <p className="error auth-login-error" role="alert">{adminSession.error}</p> : null}
@@ -9993,6 +9510,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
           <RouteRuntimeProvider value={{
             session: { accessToken: String(adminSession.accessToken || ""), username: String(adminSession?.user?.username || "operator") },
             dashboard: {
+              processing: queueHealth,
               role: roleDashboard,
               allowedTabs,
               projects: monitoringApps.rows || [],
@@ -10000,7 +9518,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               selectedProject: String(applicationToMonitor || ""),
               workflow: workflowGuide,
               openSection,
-              refreshProjects: () => Promise.allSettled([loadMonitorApplications(), loadMonitoringApplications(), checkQueueHealth(), loadIncidentMetadata({ limit: 100 })]),
+              refreshProjects: async () => {
+                await Promise.all([
+                  queryClient.invalidateQueries({ queryKey: ["route-api"], refetchType: "none" }),
+                  queryClient.invalidateQueries({ queryKey: ["alerts"], refetchType: "none" }),
+                ]);
+                await Promise.allSettled([
+                  loadMonitorApplications(), loadMonitoringApplications(), checkQueueHealth(),
+                  loadIncidentMetadata({ ignoreFilters: true, limit: 100 }), loadRecentAlerts(),
+                  loadClosedIncidents(), loadGatewaySummary(), loadGatewayRecent(),
+                ]);
+              },
               selectProject: setApplicationToMonitor,
             },
             copilot: {
@@ -10755,7 +10283,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         <article className="alert-rule-summary-card">
                           <span>Overall Quality</span>
                           <strong>{selectedAiTrust.evidence.length ? formatQualityPercent(selectedAlertEvaluation.overallScore) : "Unavailable"}</strong>
-                          <small>{selectedAiTrust.evidence.length ? `${selectedAlertEvaluation.qualityLabel} | ${selectedAlertEvaluation.provider}` : "No linked evidence"}</small>
+                          <small>{selectedAiTrust.evidence.length ? selectedAlertEvaluation.available ? `${selectedAlertEvaluation.qualityLabel} | ${selectedAlertEvaluation.provider}` : "No recorded evaluation" : "No linked evidence"}</small>
                         </article>
                         <article className="alert-rule-summary-card">
                           <span>{selectedAiTrust.confidenceLabel}</span>

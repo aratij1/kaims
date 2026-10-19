@@ -73,7 +73,7 @@ describe("Completed analysis blockers", () => {
     expect(analysisBlocker(row)).toBe("Retention policy is required");
     const stage = lifecycleFor(row).find(item => item.id === "understand");
     expect(stage?.state).toBe("stopped");
-    expect(stage?.caption).toBe("Analysis completed; resolution blocked");
+    expect(stage?.caption).toBe("Analysis completed; more evidence needed");
   });
   it("does not let an old analysis override execution or closure", () => {
     for (const status of ["awaiting_approval", "remediating", "validating", "closed"]) {
@@ -112,4 +112,12 @@ describe("Inbox human evidence ownership", () => {
     expect(belongsToInboxView(row, "needs_me")).toBe(false);
     expect(belongsToInboxView(row, "kai_handling")).toBe(true);
   });
+});
+
+it.each(["collecting", "waiting_for_human", "collection_blocked"])("does not label completed RCA as generating while %s", status => {
+ const row = { status, recommendation_id: "recorded-rca", analysis_summary: { completed_at: "2026-10-17T14:00:00Z", rca_status: "insufficient_evidence", blockers: ["Independent causal evidence is missing"] } };
+ expect(analysisBlocker(row)).toBe("Independent causal evidence is missing");
+ const stage = lifecycleFor(row).find(item => item.id === "understand");
+ expect(stage?.caption).not.toBe("Generating RCA");
+ expect(stage?.caption).toBe(status === "waiting_for_human" ? "Waiting for human evidence" : "Analysis completed; more evidence needed");
 });

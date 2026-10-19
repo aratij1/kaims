@@ -39,13 +39,21 @@ def validate_policy(policy):
         raise ValueError("Referenced evidence and archived copies must be retained")
     if not 1<=policy.get("batch_size",0)<=500:raise ValueError("Invalid batch size")
 
+def eligibility_sql(cursor):
+    cursor.execute("SELECT COUNT(*) AS present FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name='context_snapshots' AND index_name='idx_context_snapshots_retention_alert'")
+    if not cursor.fetchone()["present"]:
+        raise RuntimeError("Apply 20261015_snapshot_alert_retention_index.sql before alert retention; JSON scans are unsafe on large snapshot tables")
+    start = ELIGIBLE.index(" AND NOT EXISTS (SELECT 1 FROM context_snapshots")
+    return ELIGIBLE[:start] + " AND a.inbox_canonical_incident_id IS NULL AND NOT EXISTS (SELECT 1 FROM context_snapshots c WHERE c.tenant_id=a.tenant_id AND c.retention_alert_id=a.id)"
+
 def run(connection,policy,*,execute=False,restore_batch=None):
     validate_policy(policy)
     tenant=policy["tenant_id"];cutoff=datetime.now(timezone.utc).replace(tzinfo=None)-timedelta(days=policy["unlinked_live_days"])
     batch=str(UUID(restore_batch)) if restore_batch else str(uuid4())
     with connection.cursor() as cursor:
+        eligible = eligibility_sql(cursor) if not restore_batch else None
         if not execute:
-            cursor.execute("SELECT COUNT(*) AS eligible FROM alerts a WHERE "+ELIGIBLE,(tenant,cutoff))
+            cursor.execute("SELECT /*+ MAX_EXECUTION_TIME(30000) */ COUNT(*) AS eligible FROM alerts a WHERE "+eligible,(tenant,cutoff))
             return {"dry_run":True,"eligible":cursor.fetchone()["eligible"],"cutoff":str(cutoff),"policy":policy}
         cursor.execute(DDL)
     connection.commit()
@@ -70,7 +78,7 @@ def run(connection,policy,*,execute=False,restore_batch=None):
                     cursor.execute("INSERT INTO alerts ("+",".join(COLUMNS)+") VALUES ("+",".join(["%s"]*len(COLUMNS))+")",tuple(row[k] for k in COLUMNS));restored+=1
                 result={"restored":restored,"batch_id":batch}
             else:
-                cursor.execute("SELECT a.* FROM alerts a WHERE "+ELIGIBLE+" ORDER BY a.created_at,a.id LIMIT %s FOR UPDATE",(tenant,cutoff,policy["batch_size"]))
+                cursor.execute("SELECT /*+ MAX_EXECUTION_TIME(30000) */ a.* FROM alerts a WHERE "+eligible+" ORDER BY a.created_at,a.id LIMIT %s FOR UPDATE",(tenant,cutoff,policy["batch_size"]))
                 rows=cursor.fetchall()
                 for row in rows:
                     raw=encode_record(row);checksum=hashlib.sha256(raw.encode()).hexdigest()

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 from collections.abc import Awaitable, Callable, Coroutine
+from datetime import UTC
 from typing import Any
 
 from alert_intelligence import AlertIntelligenceAgent
@@ -305,6 +307,16 @@ def _incident_from_persisted_payload(payload: dict[str, Any], incident_type: typ
     })
 
 
+def _occurrence_idempotency_key(source_event_id: str, alert: Alert) -> str:
+    onset = alert.starts_at
+    if onset is not None:
+        onset = onset.replace(tzinfo=UTC) if onset.tzinfo is None else onset.astimezone(UTC)
+    # Prometheus fingerprints identify a rule/label set, not an outage episode.
+    # Bound delivery retries to the same onset without collapsing later outages.
+    material = json.dumps([alert.tenant_id, source_event_id, onset.isoformat() if onset else None])
+    return "alert-occurrence:" + hashlib.sha256(material.encode()).hexdigest()
+
+
 async def _merge_duplicate_into_canonical(alert: Alert, incident: Any) -> Any | None:
     deduplication = alert.metadata.get("deduplication") if isinstance(alert.metadata, dict) else {}
     if not settings.database_enabled or getattr(app.state, "session_factory", None) is None:
@@ -329,7 +341,7 @@ async def _merge_duplicate_into_canonical(alert: Alert, incident: Any) -> Any | 
     )
     # Candidate idempotency identifies a correlation family; occurrence
     # idempotency must identify the immutable source event within that family.
-    idempotency_key = f"alert-occurrence:{source_event_id}"
+    idempotency_key = _occurrence_idempotency_key(source_event_id, alert)
     window_minutes = int(
         (deduplication.get("window_minutes") if isinstance(deduplication, dict) else None)
         or agent.deduplication_window_minutes
@@ -400,6 +412,8 @@ async def _merge_duplicate_into_canonical(alert: Alert, incident: Any) -> Any | 
         await repo.save_alert(alert)
         await repo.save_incident(canonical)
         await repo.save_incident_event(_build_alert_enriched_envelope(alert, canonical))
+        from common.stalled_investigation import recover_stalled_investigation
+        await recover_stalled_investigation(repo, alert, canonical)
         await session.commit()
     logger.info(
         "incident_pipeline stage=deduplicate outcome=linked_duplicate alert=%s canonical_incident=%s issue=%s",

@@ -31,6 +31,24 @@ from remediation_engine.capability_executors import (
 )
 
 
+def jenkins_result_proves_outcome(candidate: dict[str, Any], *, dry_run: bool, script_count: int) -> bool:
+    if candidate.get("dry_run") is not dry_run or candidate.get("result") != "SUCCESS":
+        return False
+    if dry_run:
+        return (
+            candidate.get("dry_run_validated") is True
+            and candidate.get("executed") is False
+            and candidate.get("recovery_validated") is False
+            and candidate.get("executed_script_count") == 0
+        )
+    return (
+        candidate.get("preflight_passed") is True
+        and candidate.get("executed") is True
+        and candidate.get("recovery_validated") is True
+        and candidate.get("executed_script_count") == script_count
+    )
+
+
 class RemediationPlugin(Protocol):
     action_type: str
 
@@ -237,7 +255,7 @@ class JenkinsRollbackPlugin(BasePlugin):
             if crumb_response.status_code == 200:
                 crumb = crumb_response.json()
                 headers[str(crumb.get("crumbRequestField") or "Jenkins-Crumb")] = str(crumb.get("crumb") or "")
-            response = await client.post(f"{endpoint}{job_path}/buildWithParameters", params=parameters, headers=headers)
+            response = await client.post(f"{endpoint}{job_path}/buildWithParameters", data=parameters, headers=headers)
             response.raise_for_status()
         queue_url = urljoin(f"{endpoint}/", str(response.headers.get("location") or "").strip())
         if not queue_url:
@@ -336,7 +354,7 @@ class JenkinsRollbackPlugin(BasePlugin):
             "executed_script_count": int(evidence.get("executed_script_count") or 0),
         })
         action.parameters["execution_result"] = result
-        action.completed_at = utc_now()
+        action.completed_at = action.completed_at or utc_now()
         if truthful:
             action.status = RemediationStatus.SUCCEEDED
             action.output = f"Jenkins execution and recovery validation completed for {result.get('job_name')}"
@@ -395,7 +413,7 @@ class JenkinsRollbackPlugin(BasePlugin):
             if crumb_response.status_code == 200:
                 crumb = crumb_response.json()
                 headers[str(crumb.get("crumbRequestField") or "Jenkins-Crumb")] = str(crumb.get("crumb") or "")
-            response = await client.post(build_url, params=parameters, headers=headers)
+            response = await client.post(build_url, data=parameters, headers=headers)
             response.raise_for_status()
             queue_url = urljoin(f"{endpoint}/", str(response.headers.get("location") or "").strip())
             if not queue_url:
@@ -459,12 +477,8 @@ class JenkinsRollbackPlugin(BasePlugin):
                     if mismatched:
                         raise ValueError(f"result artifact identity mismatch: {', '.join(mismatched)}")
                     dry_run = bool(action.parameters.get("dry_run", False))
-                    truthful_success = (
-                        bool(candidate.get("preflight_passed"))
-                        and bool(candidate.get("recovery_validated"))
-                        and (dry_run or bool(candidate.get("executed")))
-                        and str(candidate.get("result") or "").upper() == "SUCCESS"
-                        and int(candidate.get("executed_script_count") or 0) == expected_script_count
+                    truthful_success = jenkins_result_proves_outcome(
+                        candidate, dry_run=dry_run, script_count=expected_script_count,
                     )
                     if not truthful_success:
                         raise ValueError("result artifact does not prove execution and recovery validation")
@@ -1195,6 +1209,8 @@ class RemediationEngine(BaseAgent):
                 "service": service,
                 "environment": environment,
                 "recommended_action": recommended_action,
+                "root_cause": str(approved_execution_plan.get("root_cause") or ""),
+                "impact": str(approval.metadata.get("impact") or ""),
                 "commands": command_list,
                 "execution_plan": execution_plan,
                 "connection_profile": connection_profile,

@@ -1,0 +1,6 @@
+Disposable automatic recovery qualification: validation-service
+The maintenance_enabled diagnostic means this fixture intentionally returns HTTP 503.
+The reviewed repair is disable_test_maintenance with a matching diagnostic revision.
+The target atomically records an idempotent receipt and disables its maintenance flag.
+Recovery requires two distinct fresh healthy diagnostics with the same action identity.
+This document authorizes no operation on a KaiMS, customer, or production service.

@@ -13,6 +13,50 @@ module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
 
 
+def test_trace_route_binding_rejects_health_checks_and_accepts_templates():
+    trace = {"processes": {"p": {"serviceName": "api-gateway"}}, "spans": [
+        {"processID": "p", "operationName": "GET /healthz", "tags": []},
+    ]}
+    assert not module._trace_matches_operation(trace, "api-gateway", "/onboarding/templates")
+    trace["spans"][0]["operationName"] = "GET /alerts/{alert_id}/processed-result"
+    assert module._trace_matches_operation(trace, "api-gateway", "/alerts/abc/processed-result?tenant=default")
+    assert not module._trace_matches_operation(trace, "api-gateway", "/applications")
+
+
+@pytest.mark.asyncio
+async def test_target_scope_does_not_overwrite_filesystem_metric_selection(monkeypatch):
+    captured = {}
+    def handler(request):
+        captured["query"] = request.url.params["query"]
+        return module.httpx.Response(200, json={"status": "success", "data": {"result": []}})
+    client = module.httpx.AsyncClient
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: client(transport=module.httpx.MockTransport(handler), **kwargs))
+    await module._search_telemetry({"service": "node-exporter", "evidence_category": "metrics", "question": "filesystem inode usage",
+        "target_labels": {"job": "node-exporter", "instance": "node-exporter:9100", "mountpoint": "/mnt/host/d"}})
+    assert "node_filesystem_" in captured["query"]
+    assert 'mountpoint="/mnt/host/d"' in captured["query"]
+
+
+@pytest.mark.asyncio
+async def test_telemetry_filters_other_operations_before_limiting_results(monkeypatch):
+    def handler(request):
+        if "/api/v1/" in request.url.path:
+            return module.httpx.Response(200, json={"status": "success", "data": {"result": [
+                {"metric": {"__name__": "latency", "service": "api-gateway", "operation": "/applications"}, "value": [1792081780, "3"]},
+                {"metric": {"__name__": "latency", "service": "api-gateway", "operation": "/onboarding/templates"}, "value": [1792081780, "1"]},
+            ]}})
+        return module.httpx.Response(200, json={"data": []})
+
+    async_client = module.httpx.AsyncClient
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: async_client(
+        transport=module.httpx.MockTransport(handler), **kwargs))
+    result = await module._search_telemetry({"service": "api-gateway", "operation": "/onboarding/templates",
+                                             "evidence_category": "metrics", "limit": 1})
+    rows = [row for row in result["evidence"] if "metric" in row]
+    assert len(rows) == 1
+    assert rows[0]["metric"]["operation"] == "/onboarding/templates"
+
+
 def test_mcp_lists_read_only_discovery_tools() -> None:
     names = {row["name"] for row in module.TOOLS}
     assert names == {
@@ -104,17 +148,11 @@ def test_code_search_for_an_onboarded_app_without_source_finds_nothing(monkeypat
     assert roots == []
 
 
-def test_code_search_with_no_project_at_all_uses_the_platform_default(monkeypatch) -> None:
-    """No project resolves at all (project_id == "") legitimately means
-    "investigate KaiMS itself" -- the only case the platform-wide default
-    code roots are actually correct for.
-    """
+def test_code_search_with_unknown_service_does_not_use_platform_default(monkeypatch) -> None:
     monkeypatch.setenv("DISCOVERY_MCP_CODE_ROOTS", "/workspace/backend/src")
     monkeypatch.setattr(module, "_project_catalog", lambda: {})
-
-    roots = module._code_roots({"service": "unregistered-service"})
-
-    assert roots == [Path("/workspace/backend/src")]
+    assert module._code_roots({"service": "unregistered-service"}) == []
+    assert module._code_roots({}) == [Path("/workspace/backend/src")]
 
 
 def test_code_search_discards_volatile_alert_tokens() -> None:
@@ -521,3 +559,44 @@ async def test_changes_search_never_lets_file_matches_crowd_out_deployment_event
     assert result["result_count"] == 8
     assert result["evidence"][0]["evidence_id"] == "CHANGE-deploy-1"
     assert any(row["change_evidence_kind"] == "container_deployment" for row in result["evidence"])
+
+
+def test_prefixed_service_code_search_uses_question_and_searches_late_handlers(tmp_path, monkeypatch):
+    service = tmp_path / 'monitoring-adapter'
+    service.mkdir()
+    source = service / 'app.py'
+    source.write_text('# padding\n'*5100 + 'raise HTTPException(status_code=503, detail="upstream unavailable")\n')
+    monkeypatch.setattr(module, '_project_catalog', lambda: {'kaiops': {'platform':True, 'aliases':['kaims'], 'code_roots':[str(tmp_path)]}})
+    result = module._call_tool('code.search', {'project':'kaims', 'service':'kaiops-monitoring-adapter',
+        'terms':['kaiops-monitoring-adapter','kaiopsservicedown','prod','kan-2432'],
+        'question':'Are there recent code changes or bugs that could explain HTTP 5xx errors?', 'limit':8})
+    assert result['result_count'] == 1
+    row = result['evidence'][0]
+    assert row['path'] == str(source)
+    assert row['line'] == 5101
+    assert 'status_code=503' in row['snippet']
+    assert 'monitoring-adapter' in result['query_terms']
+
+
+def test_question_terms_do_not_expand_unknown_service_scope(tmp_path, monkeypatch):
+    (tmp_path/'app.py').write_text('raise HTTPException(status_code=500)')
+    monkeypatch.setenv('DISCOVERY_MCP_CODE_ROOTS',str(tmp_path))
+    monkeypatch.setattr(module, '_project_catalog', lambda: {})
+    result = module._call_tool('code.search', {'service':'external-unknown','question':'HTTP 5xx errors'})
+    assert result['evidence'] == []
+
+
+def test_text_search_retains_bounded_candidates_without_changing_ranking(tmp_path,monkeypatch):
+    import tracemalloc
+    root=tmp_path/'service';root.mkdir()
+    source=root/'app.py'
+    source.write_text('needle\n'*12000+'needle strongest\n',encoding='utf-8')
+    monkeypatch.setenv('DISCOVERY_MCP_MAX_FILES','10')
+    tracemalloc.start()
+    result=module._search_text_files([root],{'.py'},['needle','strongest'],'code',8)
+    _,peak=tracemalloc.get_traced_memory();tracemalloc.stop()
+    assert len(result)==8
+    assert result[0]['line']==12001
+    # Input buffering is bounded by the file cap; candidate retention must not
+    # grow one snippet dictionary per matching source line.
+    assert peak < 5_000_000

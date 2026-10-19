@@ -84,3 +84,58 @@ def test_fresh_database_baseline_is_packaged() -> None:
 
     assert module.BASE_SCHEMA_PATH.is_file()
     assert "CREATE TABLE IF NOT EXISTS incidents" in module.BASE_SCHEMA_PATH.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("tracking,checksum_column", [(False, False), (True, False), (True, True)])
+def test_dry_run_never_changes_schema_or_tracking_rows(monkeypatch, tmp_path, tracking, checksum_column):
+    from unittest.mock import MagicMock
+
+    module = load_migrations_module()
+    path = tmp_path / "20260101_example.sql"
+    path.write_text("SELECT 1;")
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [(1,) if tracking else None] + (
+        [(1,) if checksum_column else None] if tracking else []
+    )
+    cursor.fetchall.return_value = []
+    cursor.__enter__.return_value = cursor
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(module.pymysql, "connect", lambda **kwargs: connection)
+    monkeypatch.setattr(module, "list_migration_files", lambda: [path])
+    monkeypatch.setattr(sys, "argv", ["apply-migrations.py", "--dry-run"])
+    module.main()
+    assert all(call.args[0].startswith(("SELECT", "SHOW")) for call in cursor.execute.call_args_list)
+    connection.close.assert_called_once()
+
+
+def test_real_checksum_drift_cannot_be_silently_adopted(tmp_path):
+    module = load_migrations_module()
+    path = tmp_path / "example.sql"
+    path.write_text("SELECT 1;")
+    with pytest.raises(RuntimeError, match="Restore the applied file"):
+        module.validate_applied_checksums([path], {path.name: "f" * 64})
+    import hashlib
+
+    for legacy in [None, hashlib.sha256(path.name.encode()).hexdigest(), module.migration_checksum(path)]:
+        module.validate_applied_checksums([path], {path.name: legacy})
+
+
+def test_concurrent_migration_runner_fails_before_schema_mutation(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    module = load_migrations_module()
+    path = tmp_path / "example.sql"
+    path.write_text("SELECT 1;")
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (0,)
+    cursor.__enter__.return_value = cursor
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+    monkeypatch.setattr(module.pymysql, "connect", lambda **kwargs: connection)
+    monkeypatch.setattr(module, "list_migration_files", lambda: [path])
+    monkeypatch.setattr(sys, "argv", ["apply-migrations.py"])
+    with pytest.raises(RuntimeError, match="migration lock"):
+        module.main()
+    assert len(cursor.execute.call_args_list) == 1
+    connection.close.assert_called_once()

@@ -5,9 +5,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'assert-docker-storage.ps1')
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Push-Location $RepoRoot
 try {
+    Assert-DockerStorageCapacity
     $env:DOCKER_BUILDKIT = "1"
     $env:COMPOSE_BAKE = "false"
     $env:COMPOSE_PARALLEL_LIMIT = "1"
@@ -33,10 +35,7 @@ try {
 
     docker compose build ui
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "BuildKit failed. Retrying the UI once with the classic builder."
-        $env:DOCKER_BUILDKIT = "0"
-        docker compose build ui
-        if ($LASTEXITCODE -ne 0) { throw "UI image build failed with both builders." }
+        throw "UI image build failed. The Dockerfile requires BuildKit; the existing UI image is preserved."
     }
     docker compose up -d --force-recreate --no-deps ui
     if ($LASTEXITCODE -ne 0) { throw "UI container start failed." }

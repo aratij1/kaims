@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from common.evidence_subject import service_matches, metric_matches_subject
 from common.config import get_settings
 from common.service import create_app
 from fastapi import FastAPI
@@ -149,7 +150,10 @@ def _project_catalog() -> dict[str, dict[str, Any]]:
         payload = {}
     curated = payload.get("projects") if isinstance(payload, dict) else {}
     curated = curated if isinstance(curated, dict) else {}
-    return {**_ONBOARDED_PROJECTS_CACHE, **curated}
+    # Operator-owned aliases and bindings must win over a dynamically
+    # onboarded alias of the same application. Dict override precedence alone
+    # is insufficient: _project_for searches entries in insertion order.
+    return {**curated, **{key: value for key, value in _ONBOARDED_PROJECTS_CACHE.items() if key not in curated}}
 
 
 def _project_for(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -182,7 +186,7 @@ def _project_for(arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return "", {}
 
 
-def _code_roots(arguments: dict[str, Any]) -> list[Path]:
+def _code_roots_legacy(arguments: dict[str, Any]) -> list[Path]:
     project_id, project = _project_for(arguments)
     configured = project.get("code_roots") if isinstance(project.get("code_roots"), list) else []
     if not configured and project_id:
@@ -224,6 +228,38 @@ def _code_roots(arguments: dict[str, Any]) -> list[Path]:
     )
 
 
+def _code_roots(arguments: dict[str, Any]) -> list[Path]:
+    roots = _code_roots_legacy(arguments)
+    service = str(arguments.get("service") or "").strip()
+    if not service:
+        return roots
+    from common.evidence_subject import service_identity
+    aliases = {service, service_identity(service)}
+    project_id, project = _project_for(arguments)
+    if service.lower().startswith(("robot-shop-", "rs-")) and (not project_id or project_id in {"kaiops", "kaims"} or project.get("platform") is True):
+        return []
+    candidates = []
+    catalog_root = str(project.get("service_catalog_root") or "").strip()
+    if catalog_root:
+        candidates.extend(Path(catalog_root) / alias for alias in aliases)
+    for root in roots:
+        if root.name in aliases:
+            candidates.append(root)
+        candidates.extend(root / alias for alias in aliases)
+    # Fault lab is a platform workload whose source is outside backend/src.
+    if service_identity(service) == "fault-lab":
+        candidates.extend(Path(root).parent.parent / "fault-lab" for root in roots
+                          if root.as_posix().endswith("backend/src"))
+    scoped = list(dict.fromkeys(path for path in candidates if path.is_dir()))
+    if scoped:
+        return scoped
+    # Explicit external project roots remain valid project context. An unknown
+    # service must never silently search the platform repository or its tests.
+    if project_id and project.get("platform") is not True and project_id not in {"kaiops", "kaims"}:
+        return roots
+    return []
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "service": "discovery-mcp"}
@@ -255,7 +291,17 @@ def _code_search_terms(arguments: dict[str, Any]) -> list[str]:
         "into", "unable", "resource", "service", "message",
     }
     service = str(arguments.get("service") or "").strip().lower()
-    candidates = [service, *_terms(arguments)]
+    from common.evidence_subject import service_identity
+    # The alert identity commonly has a deployment prefix which source files
+    # do not contain. Keep the original identity, but search its code alias too.
+    question = str(arguments.get("question") or "")
+    diagnostic_terms: list[str] = []
+    if re.search(r"\b(?:5xx|50[0-9]|http|server error)\b", question, re.I):
+        diagnostic_terms.extend(["httpexception", "status_code", "exception"])
+    if re.search(r"\b(?:timeout|timed out|connection|connectivity)\b", question, re.I):
+        diagnostic_terms.extend(["timeout", "connect"])
+    diagnostic_terms.extend(re.findall(r"[\w/-]+\.(?:py|go|js|ts|java)\b", question.lower()))
+    candidates = [service, service_identity(service), *diagnostic_terms, *_terms(arguments)]
     selected: list[str] = []
     for term in candidates:
         token = str(term or "").strip().lower()
@@ -325,6 +371,8 @@ def _log_diagnosis(evidence: list[dict[str, Any]], service: str = "") -> dict[st
     item.update(
         {
             "signal_type": "log_diagnosis",
+            "derived_observation": True,
+            "current_observation": False,
             "diagnostic_signals": [name for name, _ in ranked],
             "signal_counts": dict(ranked),
             "supporting_evidence": supporting_ids[:12],
@@ -404,10 +452,10 @@ async def _search_docker_logs(arguments: dict[str, Any], terms: list[str], limit
                     or (project.startswith("kaiops") and "kaiops" in identity)
                     or project in identity
                 )
-                service_ok = has_service_filter and (
-                    service in identity or service.replace("_", "-") in identity
-                )
-                if (has_project_filter or has_service_filter) and not project_ok and not service_ok:
+                service_ok = has_service_filter and service_matches(compose_service, service)
+                if has_service_filter and not service_ok:
+                    continue
+                if not has_service_filter and has_project_filter and not project_ok:
                     continue
                 container_id = str(container.get("Id") or "")
                 if not container_id:
@@ -453,7 +501,7 @@ def _search_text_files(
     max_files = max(10, min(int(os.getenv("DISCOVERY_MCP_MAX_FILES", "60")), 400))
     excluded_dirs = {".git", ".claiming", "node_modules", "dist", "build", "__pycache__", "ingested_alerts", ".venv", "kaiops.egg-info"}
     if kind == "code":
-        excluded_dirs.update({".github", ".devcontainer"})
+        excluded_dirs.update({".github", ".devcontainer", "tests", "__tests__"})
     for root_index, root in enumerate(roots):
         if not root.is_dir():
             continue
@@ -467,15 +515,21 @@ def _search_text_files(
                 if scanned >= root_budget:
                     break
                 path = Path(current) / filename
+                if kind == "code" and (filename.startswith("test_") or re.search(r"\.(test|spec)\.", filename)):
+                    continue
                 if kind == "log" and is_alert_artifact_reference(path):
                     continue
+                if kind == "log" and "disk-attribution" in path.parts:
+                    continue  # Structured host records require exact target/time binding.
                 if path.suffix.lower() not in suffixes:
                     continue
                 scanned += 1
                 try:
                     if path.stat().st_size > 750_000:
                         continue
-                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[:5000]
+                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                    if kind != "code":
+                        lines = lines[:5000]
                 except OSError:
                     continue
                 try:
@@ -499,6 +553,11 @@ def _search_text_files(
                                 for context_line_no in range(start, end)
                             )
                         ranked.append((len(matched), -root_index, _evidence(kind, path, line_no, snippet, matched)))
+                        # Retain only the best candidates while scanning. Broad
+                        # terms can match thousands of lines in one source file.
+                        if len(ranked) >= 2 * limit:
+                            ranked.sort(key=lambda row: (-row[0], -row[1], row[2]["uri"]))
+                            del ranked[limit:]
             if scanned >= root_budget:
                 break
         if root_index == 0 and len(ranked) >= limit:
@@ -758,7 +817,17 @@ async def _search_mysql(terms: list[str], limit: int) -> list[dict[str, Any]]:
 async def _call_mysql_tool(arguments: dict[str, Any]) -> dict[str, Any]:
     terms = _terms(arguments)
     limit = max(1, min(int(arguments.get("limit", 8)), 20))
-    rows = await _search_mysql(terms, limit)
+    database = str(arguments.get("database") or arguments.get("database_name") or "").strip()
+    table = str(arguments.get("table") or "").strip()
+    configured_database = str(_mysql_connection_settings()["db"])
+    if not database or not table or database != configured_database:
+        return {"tool": "mysql.search", "query_terms": terms, "result_count": 0, "evidence": [],
+                "evidence_gap": "APPLICATION_DATABASE_SCOPE_NOT_CONFIGURED",
+                "source_scope": "kaiops_control_plane",
+                "reason": "The default connection reads KaiMS records, not the affected application's database. An explicit matching database and table are required."}
+    rows = [row for row in await _search_mysql(terms, limit) if row.get("table") == table]
+    for row in rows:
+        row.update({"source_scope": "kaiops_control_plane", "epistemic_role": "historical_record", "current_observation": False})
     return {"tool": "mysql.search", "query_terms": terms, "result_count": len(rows), "evidence": rows}
 
 
@@ -773,6 +842,33 @@ def _jaeger_operation(value: str) -> str:
         path,
     )
     return path if " " in path else f"GET {path}"
+
+
+def _trace_matches_operation(trace: dict[str, Any], service: str, requested_operation: str) -> bool:
+    """A broad Jaeger retry must still match the requested route locally."""
+    if not requested_operation:
+        return True
+
+    def path(value: object) -> str:
+        text = str(value or "").split("?", 1)[0].strip()
+        return next((part for part in text.split() if part.startswith("/")), "")
+
+    expected = path(requested_operation)
+    processes = trace.get("processes") or {}
+    for span in trace.get("spans", []):
+        process = processes.get(span.get("processID"), {})
+        if process.get("serviceName") and not service_matches(process["serviceName"], service):
+            continue
+        tags = {tag.get("key"): tag.get("value") for tag in span.get("tags", [])}
+        for value in (tags.get("http.route"), tags.get("http.target"), tags.get("url.path"), span.get("operationName")):
+            observed = path(value)
+            if not observed:
+                continue
+            pattern = re.escape(observed)
+            pattern = re.sub(r"\\\{[^{}]+\\\}", "[^/]+", pattern)
+            if expected and re.fullmatch(pattern, expected):
+                return True
+    return False
 
 
 def _trace_evidence_summary(trace: dict[str, Any], requested_operation: str = "") -> dict[str, Any]:
@@ -792,6 +888,7 @@ def _trace_evidence_summary(trace: dict[str, Any], requested_operation: str = ""
     safe_tag_names = {
         "db.system", "db.operation", "server.address", "net.peer.name",
         "http.route", "http.target", "http.status_code", "http.response.status_code", "span.kind",
+        "exception.type", "error.type",
     }
     for span in spans:
         tags = {
@@ -799,24 +896,46 @@ def _trace_evidence_summary(trace: dict[str, Any], requested_operation: str = ""
             for tag in span.get("tags", [])
             if isinstance(tag, dict) and tag.get("key")
         }
+        # Jaeger stores OTLP exception events in span logs. Preserve types,
+        # never messages/stack traces (which may contain request secrets).
+        exception_types = sorted({
+            str(field.get("value"))[:160]
+            for event in span.get("logs", []) if isinstance(event, dict)
+            for field in event.get("fields", []) if isinstance(field, dict)
+            and field.get("key") == "exception.type" and field.get("value")
+        })[:8]
         status = tags.get("http.status_code", tags.get("http.response.status_code"))
         try:
             if status is not None:
                 status_codes.append(int(status))
         except (TypeError, ValueError):
             pass
-        if tags.get("error") is True or any(code >= 500 for code in status_codes[-1:]) or span.get("logs"):
+        # A log event is not itself an error, and the previous span's status
+        # must never contaminate this span's outcome.
+        try:
+            http_error = status is not None and int(status) >= 500
+        except (TypeError, ValueError):
+            http_error = False
+        if tags.get("error") is True or http_error or exception_types:
             error_spans += 1
         process = processes.get(span.get("processID"), {})
         service_name = str(process.get("serviceName") or "unknown") if isinstance(process, dict) else "unknown"
         span_rows.append({
+            "span_id": str(span.get("spanID") or ""),
+            "parent_span_ids": [str(ref["spanID"]) for ref in span.get("references", [])
+                                if isinstance(ref, dict) and ref.get("refType") == "CHILD_OF"
+                                and ref.get("spanID") and ref.get("traceID", trace.get("traceID")) == trace.get("traceID")],
+            "start_time_us": int(span.get("startTime") or 0),
             "service": service_name,
             "operation": str(span.get("operationName") or "unknown"),
             "duration_ms": round(int(span.get("duration") or 0) / 1000, 3),
+            "exception_types": exception_types,
             "tags": {key: tags[key] for key in safe_tag_names if tags.get(key) not in (None, "")},
         })
         for reference in span.get("references", []):
             if not isinstance(reference, dict) or reference.get("refType") != "CHILD_OF":
+                continue
+            if reference.get("traceID", trace.get("traceID")) != trace.get("traceID"):
                 continue
             parent = span_index.get(str(reference.get("spanID") or ""))
             if not parent:
@@ -928,6 +1047,11 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
 
     async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
         prometheus_url = str(telemetry.get("prometheus_url") or "").rstrip("/")
+        probe_sources = telemetry.get("probe_job_sources") or {}
+        bound_job = (arguments.get("target_labels") or {}).get("job")
+        probe_source = probe_sources.get(bound_job) if isinstance(probe_sources, dict) else None
+        if probe_source:
+            prometheus_url = str(probe_source).rstrip("/")
         if prometheus_url and arguments.get("evidence_category") in (None, "", "metrics"):
             if metric_service:
                 # OTel-instrumented services label series "service_name";
@@ -939,6 +1063,37 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                 query = f'{{service="{literal}"}} or {{service_name="{literal}"}} or {{job="{literal}"}}'
             else:
                 query = "up"
+            target_labels = dict(arguments.get("target_labels") or {})
+            for key in ("operation", "environment"):
+                if arguments.get(key):
+                    target_labels.setdefault(key, arguments[key])
+            target_selectors = {key: str(target_labels[key]) for key in ("job", "instance", "namespace", "cluster", "operation", "http_route", "route", "device", "mountpoint")
+                                if target_labels.get(key)}
+            if target_selectors and (target_selectors.get("job") or target_selectors.get("instance")):
+                query = "{" + ",".join(key + "=" + json.dumps(value) for key, value in target_selectors.items()) + "}"
+                if probe_source:
+                    # Independent probes are owned by a different registered
+                    # monitoring source than the application's OTLP metrics.
+                    query = query.replace("{", '{__name__=~"probe_success|probe_http_status_code|probe_duration_seconds|up",', 1)
+            if arguments.get("evidence_category") == "metrics":
+                from common.metric_queries import filesystem_evidence_query
+                query = filesystem_evidence_query(
+                    target_labels, question=str(arguments.get("question") or ""),
+                ) or query
+            # Scrape targets and independently probed HTTP targets use different
+            # jobs/instances. Preserve both, scoped by the operator's registry.
+            runtime_probe_job = str(telemetry.get("runtime_probe_job") or "")
+            runtime_probe_labels = {
+                "__name__": "probe_success", "job": runtime_probe_job,
+                "service": metric_service, "tenant_id": str(arguments.get("tenant_id") or "default"),
+            }
+            if runtime_probe_job and metric_service:
+                selector = ",".join(k + "=" + json.dumps(v) for k, v in runtime_probe_labels.items())
+                query = f"({query}) or {{{selector}}}"
+            from common.metric_queries import registered_signal_metric
+            signal_binding = registered_signal_metric(telemetry, arguments)
+            if signal_binding:
+                query = signal_binding[0]
             try:
                 params = {"query": query}
                 query_path = "query"
@@ -947,6 +1102,12 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                     start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
                     end = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
                     if start.tzinfo is None or end.tzinfo is None or end <= start:
+                        raise ValueError("INVALID_OBSERVATION_WINDOW")
+                    # Prometheus can evaluate future range steps using its
+                    # lookback cache. Those timestamps are not observations
+                    # from the future and cannot support a current RCA.
+                    end = min(end, datetime.now(UTC))
+                    if end <= start:
                         raise ValueError("INVALID_OBSERVATION_WINDOW")
                     params.update({"start": start.timestamp(), "end": end.timestamp(),
                                    "step": max(15, int((end - start).total_seconds() / 240))})
@@ -958,7 +1119,28 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                     raise ValueError(str(payload.get("error") or "PROMETHEUS_QUERY_FAILED"))
                 results = payload.get("data", {}).get("result", [])
                 metric_results = [row for row in results if isinstance(row, dict)
-                                  and (row.get("metric") or {}).get("__name__") not in {"ALERTS", "ALERTS_FOR_STATE"}]
+                                  and (row.get("metric") or {}).get("__name__") not in {"ALERTS", "ALERTS_FOR_STATE"}
+                                  and (all((row.get("metric") or {}).get(k) == v
+                                           for k, v in signal_binding[1].items()) if signal_binding else
+                                       all((row.get("metric") or {}).get(k) == v
+                                           for k, v in runtime_probe_labels.items())
+                                       if runtime_probe_job and (row.get("metric") or {}).get("job") == runtime_probe_job
+                                       else not metric_service or metric_matches_subject(
+                                      row.get("metric") or {}, metric_service,
+                                      target_labels=target_labels, query=query))]
+                def metric_priority(row):
+                    samples = row.get("values") or ([row["value"]] if row.get("value") else [])
+                    activity = 0.0
+                    if signal_binding:
+                        try:
+                            values = [float(sample[1]) for sample in samples]
+                            activity = sum(max(0.0, right - left) for left, right in zip(values, values[1:]))
+                        except (TypeError, ValueError, IndexError):
+                            pass
+                    return (0 if (row.get("metric") or {}).get("__name__") == "probe_success" else 1, -activity)
+                # Zero-valued series must not crowd out the failing consumer
+                # when a registered counter has more series than the quota.
+                metric_results.sort(key=metric_priority)
                 for index, row in enumerate(metric_results[:limit], 1):
                     snippet = json.dumps(row, ensure_ascii=False, default=str)[:700]
                     item = _evidence("metric", Path(f"{project_id or 'telemetry'}/prometheus"), index, snippet, terms)
@@ -974,7 +1156,8 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                     except (TypeError, ValueError, IndexError, OverflowError, OSError):
                         pass  # Missing source timestamps remain unknown to the evidence compiler.
                     evidence.append(item)
-                sources.append({"source": "prometheus", "status": "completed", "result_count": len(results)})
+                sources.append({"source": "prometheus", "status": "completed", "result_count": len(metric_results),
+                                "returned_series_count": len(results), "rejected_series_count": len(results) - len(metric_results)})
             except Exception as exc:
                 sources.append({"source": "prometheus", "status": "unavailable", "error": str(exc)[:240]})
 
@@ -1059,6 +1242,9 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                         broad.raise_for_status()
                         traces = broad.json().get("data", [])
                         operation_filter_fallback = bool(traces)
+                returned_trace_count = len(traces)
+                traces = [trace for trace in traces if _trace_matches_operation(trace, service, requested_operation)]
+                trace_not_found = not bool(traces)
                 for index, trace in enumerate(traces[:limit], 1):
                     discovered_trace_id = str(trace.get("traceID") or trace_id or "")
                     summary = _trace_evidence_summary(trace, requested_operation)
@@ -1084,9 +1270,10 @@ async def _search_telemetry(arguments: dict[str, Any]) -> dict[str, Any]:
                     "source": "jaeger",
                     "status": "not_found" if trace_not_found else "completed",
                     "result_count": len(traces),
+                    "rejected_trace_count": returned_trace_count - len(traces),
                     "bound_trace_fallback": bound_trace_fallback,
                     "operation_filter_fallback": operation_filter_fallback,
-                    **({"reason": "TRACE_NOT_FOUND_OR_EXPIRED"} if trace_not_found else {}),
+                    **({"reason": "TRACE_OPERATION_MISMATCH" if returned_trace_count else "TRACE_NOT_FOUND_OR_EXPIRED"} if trace_not_found else {}),
                 })
             except Exception as exc:
                 sources.append({"source": "jaeger", "status": "unavailable", "error": str(exc)[:240]})
@@ -1218,7 +1405,8 @@ def _docker_container_list_params(service: str, *, platform_wide: bool = False, 
     if service and not platform_wide:
         # Apply service scope before Docker's limit. Older containers otherwise
         # disappear when more recently created unrelated containers fill the page.
-        params["filters"] = json.dumps({"name": [re.escape(service)]})
+        from common.evidence_subject import service_identity
+        params["filters"] = json.dumps({"name": list(dict.fromkeys([re.escape(service), re.escape(service_identity(service))]))})
     return params
 
 
@@ -1268,7 +1456,7 @@ async def _container_deployment_events(arguments: dict[str, Any]) -> list[dict[s
             )
             if project and not platform_wide and project not in identity:
                 continue
-            if service and not service_platform_wide and service not in identity:
+            if service and not service_platform_wide and not service_matches(compose_service, service):
                 continue
             created_epoch = container.get("Created")
             if not isinstance(created_epoch, (int, float)) or created_epoch <= 0:
@@ -1427,16 +1615,29 @@ async def _search_runtime_topology(arguments: dict[str, Any], *, health_only: bo
             # with the service argument silently dropped).
             if project and not platform_wide and project not in identity:
                 continue
-            if service and not service_platform_wide and service not in identity:
+            if service and not service_platform_wide and not service_matches(compose_service, service):
                 continue
             state = str(container.get("State") or "unknown").lower()
             status = str(container.get("Status") or "unknown")
+            lifecycle: dict[str, Any] = {}
+            if state in {"exited", "dead"} and container.get("Id"):
+                try:
+                    async with httpx.AsyncClient(base_url=f"http://{docker_host}", timeout=5, trust_env=False) as inspector:
+                        detail = await inspector.get(f"/containers/{container['Id']}/json")
+                        detail.raise_for_status()
+                        runtime = detail.json().get("State") or {}
+                        lifecycle = {key: runtime.get(key) for key in (
+                            "Running", "Restarting", "OOMKilled", "ExitCode", "StartedAt", "FinishedAt",
+                        )}
+                except Exception as error:
+                    lifecycle = {"collection_error": type(error).__name__}
             networks = sorted((container.get("NetworkSettings") or {}).get("Networks", {}).keys())
             kind = "dependency" if health_only else "topology"
+            subject_service = service if service and not service_platform_wide else compose_service
             snippet = json.dumps(
                 {
                     "project": compose_project,
-                    "service": compose_service,
+                    "service": subject_service, "runtime_service": compose_service,
                     "state": state,
                     "status": status,
                     "networks": networks,
@@ -1448,7 +1649,7 @@ async def _search_runtime_topology(arguments: dict[str, Any], *, health_only: bo
             row.update(
                 {
                     "uri": f"docker://{compose_project or 'runtime'}/{compose_service or index}",
-                    "service": compose_service or service,
+                    "service": subject_service, "runtime_service": compose_service,
                     # A top-level field, not just embedded in the snippet text --
                     # investigation.py's dependency-hypothesis scoring reads
                     # metadata.related_to directly (metadata is populated by
@@ -1456,6 +1657,7 @@ async def _search_runtime_topology(arguments: dict[str, Any], *, health_only: bo
                     "related_to": related_to,
                     "runtime_state": state,
                     "runtime_status": status,
+                    "runtime_lifecycle": lifecycle,
                     "healthy": state == "running" and "unhealthy" not in status.lower(),
                     "observed_at": observed_at,
                     "observation_scope": "current_snapshot",
@@ -1580,7 +1782,7 @@ async def _search_resource_saturation(arguments: dict[str, Any]) -> dict[str, An
                 )
                 if project and not platform_wide and project not in identity:
                     continue
-                if service and not service_platform_wide and service not in identity:
+                if service and not service_platform_wide and not service_matches(compose_service, service):
                     continue
                 if str(container.get("State") or "").lower() != "running":
                     # A stopped container has no live cgroup stats to read;
@@ -1750,7 +1952,8 @@ async def _call_ticket_tool(arguments: dict[str, Any]) -> dict[str, Any]:
 async def _call_logs_tool(arguments: dict[str, Any]) -> dict[str, Any]:
     terms = _terms(arguments)
     limit = max(1, min(int(arguments.get("limit", 8)), 20))
-    file_rows, docker_rows = await asyncio.gather(
+    from common.disk_attribution import search_disk_observations
+    file_rows, docker_rows, disk_result = await asyncio.gather(
         asyncio.to_thread(
             _search_text_files,
             _roots("DISCOVERY_MCP_LOG_ROOTS", "/data/fault-lab/runtime"),
@@ -1760,9 +1963,14 @@ async def _call_logs_tool(arguments: dict[str, Any]) -> dict[str, Any]:
             limit,
         ),
         _search_docker_logs(arguments, terms, limit),
+        asyncio.to_thread(search_disk_observations,
+            Path(os.getenv("DISCOVERY_MCP_DISK_OBSERVATIONS_ROOT", "/workspace/backend/host-evidence/disk-attribution")),
+            arguments, limit),
     )
     merged: dict[str, dict[str, Any]] = {}
-    for row in [*docker_rows, *file_rows]:
+    # Host filesystem questions must see actual writer/allocation observations
+    # before exporter startup logs consume the evidence quota.
+    for row in [*disk_result["evidence"], *docker_rows, *file_rows]:
         merged[str(row.get("evidence_id") or row.get("uri"))] = row
     rows = list(merged.values())
     diagnosis = _log_diagnosis(rows, str(arguments.get("service") or ""))
@@ -1776,7 +1984,10 @@ async def _call_logs_tool(arguments: dict[str, Any]) -> dict[str, Any]:
         "query_terms": terms,
         "result_count": len(rows),
         "evidence": rows,
-        "sources": {"docker": len(docker_rows), "files": len(file_rows)},
+        "sources": {"docker": len(docker_rows), "files": len(file_rows),
+                    "host_disk": len(disk_result["evidence"])},
+        "host_disk_status": disk_result["provider_status"],
+        "host_disk_coverage": disk_result.get("coverage", [])[:3],
     }
 
 

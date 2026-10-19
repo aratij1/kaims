@@ -678,6 +678,14 @@ class ResolutionIntelligenceAgent(BaseAgent):
         payload: dict[str, Any],
         fallback_content: str,
     ) -> dict[str, Any]:
+        from common.diagnostic_runbooks import diagnostic_tools
+        plan = context.metadata.get("diagnostic_runbook")
+        if diagnostic_tools(plan, tenant_id=context.tenant_id, service=context.alert.service,
+                            environment=context.alert.environment):
+            payload = {**payload, "diagnostic_guidance": {
+                key: plan.get(key) for key in ("runbook_id", "version", "diagnostic_steps", "impact_checks", "resolution_requirements")
+            }}
+            prompt += "\nDiagnostic guidance describes checks to perform, not observations, confirmed causes, or authority to execute commands. Support every conclusion with independently collected evidence."
         try:
             response = await asyncio.wait_for(
                 self.model_gateway.generate(
@@ -836,7 +844,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
             0,
             {
                 "evidence_id": f"alert:{source_event_id}",
-                "source": str(context.alert.source or "alert"),
+                "source": "alert",
+                "connector": str(context.alert.source or "alert"),
                 "uri": str(
                     context.alert.labels.get("log_source_path")
                     or context.alert.annotations.get("generatorURL")
@@ -891,6 +900,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
             ) + " " + content_text)
             if service_terms and not any(term in evidence_text for term in service_terms):
                 continue
+            metric_labels = item.get("metric") or content.get("metric") or {}
+            metric_facts = ({"labels": metric_labels, "metric_name": metric_labels.get("__name__")}
+                            if isinstance(metric_labels, dict) and metric_labels else {})
             relevant_evidence.append(
                 {
                     "evidence_id": item.get("evidence_id"),
@@ -901,7 +913,13 @@ class ResolutionIntelligenceAgent(BaseAgent):
                     "current_observation": item.get("current_observation"),
                     "current_operational_evidence": item.get("current_operational_evidence"),
                     "uri": item.get("source_uri") or item.get("uri") or item.get("path") or item.get("source_reference") or item.get("citation"),
-                    "snippet": str(item.get("snippet") or item.get("summary") or content_text)[:500],
+                    "snippet": str(item.get("relevant_content") or item.get("snippet") or item.get("summary") or content_text)[:1200],
+                    **({"reliability_score": item["reliability_score"]} if item.get("reliability_score") is not None else {}),
+                    "metadata": {
+                        key: value for layer in (metric_facts, content, item.get("metadata") if isinstance(item.get("metadata"), dict) else {}, item)
+                        for key, value in layer.items()
+                        if key in {"healthy", "saturated", "runtime_state", "runtime_service", "related_to", "exit_code", "oom_killed", "restart_count", "metric_name", "value", "labels", "samples", "incident_window_relation", "outside_incident_window"}
+                    },
                     "diagnostic_signals": item.get("diagnostic_signals", []),
                     "signal_counts": item.get("signal_counts", {}),
                     "supporting_evidence": item.get("supporting_evidence", []),
@@ -911,7 +929,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         relevant_evidence = balanced_evidence(relevant_evidence, limit=48)
 
         log_evidence = [
-            row for row in relevant_evidence if str(row.get("source") or "").lower() in {"log", "opensearch"}
+            row for row in relevant_evidence if str(row.get("source") or "").lower() in {"log", "logs", "opensearch"}
         ]
         code_evidence = [row for row in relevant_evidence if str(row.get("source") or "").lower() == "code"]
         discovery_analysis = (
@@ -937,6 +955,8 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "name": context.alert.name,
                 "service": context.alert.service,
                 "severity": context.alert.severity.value,
+                "starts_at": (context.alert.starts_at or context.alert.created_at).isoformat(),
+                "environment": context.alert.environment,
                 "description": context.alert.description,
                 "labels": context.alert.labels,
             },
@@ -1002,7 +1022,16 @@ class ResolutionIntelligenceAgent(BaseAgent):
             buckets["changes"].extend(item for item in gathered["recent_changes"] if isinstance(item, dict))
         if gathered.get("observability") and not buckets["telemetry"]:
             buckets["telemetry"].append({"evidence_id": "context:observability", "source": "telemetry"})
-        required = ["logs", "code", "telemetry", "history", "changes"]
+        # Use the investigator's claim-specific policy. A separate fixed
+        # checklist incorrectly made source code and prior incidents mandatory
+        # for every infrastructure incident, even when neither was relevant.
+        from resolution_agent.investigation import IterativeInvestigator
+        required = sorted({
+            {"traces": "telemetry", "resource": "telemetry", "dependency": "telemetry"}.get(source, source)
+            for source in IterativeInvestigator._required_sources(
+                state["context"], (gathered.get("iterative_investigation") or {}).get("hypotheses") or [],
+            )
+        })
         coverage = {name: len(rows) for name, rows in buckets.items()}
         gaps = [name for name in required if coverage.get(name, 0) == 0]
         crawl_steps = [
@@ -1228,6 +1257,12 @@ class ResolutionIntelligenceAgent(BaseAgent):
             "code_review_findings": code_findings,
             "code_review_finding_evidence_ids": code_finding_ids,
         }
+        from common.rca_timeline import build_rca_timeline, causal_steps
+        state["rca_analysis"]["causal_chain"] = causal_steps(state["rca_analysis"]["causal_chain"])
+        state["rca_analysis"]["timeline"] = build_rca_timeline(
+            parsed.get("event_sequence"), state["gathered_context"].get("discovery_evidence", []), cited,
+        )
+        state["rca_analysis"]["event_sequence"] = parsed.get("event_sequence") if isinstance(parsed.get("event_sequence"), list) else []
         state["rca_analysis"]["missing_evidence"] = blocking_investigation_gaps(
             state["rca_analysis"], iterative_investigation,
         )
@@ -1253,10 +1288,9 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 else context_quality.get("coverage_score") or 0.0
             ),
         }
-        discovery_degraded = bool(
-            context_quality.get("discovery_degraded")
-            or context_quality.get("execution_ready") is False
-        )
+        # Missing executable artifacts must not invalidate a supported causal
+        # diagnosis. Execution eligibility is checked independently downstream.
+        discovery_degraded = bool(context_quality.get("discovery_degraded"))
         if discovery_degraded:
             model_confidence = min(model_confidence, 0.49)
             missing_evidence = state["rca_analysis"].get("missing_evidence")

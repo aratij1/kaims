@@ -7,9 +7,9 @@ from uuid import uuid4
 
 import pytest
 from common.continuous_learning import FailurePattern, IncidentEvidence
-from common.database import KnowledgeRagDraftRecord, LearningAuditRecord, RunbookOutcomeRecord, RunbookVersionRecord
+from common.database import IncidentEvidenceRecord, KnowledgeRagDraftRecord, LearningAuditRecord, RunbookOutcomeRecord, RunbookVersionRecord
 from common.models import EvidenceReference
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 
 def load_module():
@@ -151,6 +151,53 @@ def test_platform_workspace_is_tenant_wide_scope() -> None:
     assert module._in_application_scope("Platform", service="api-gateway") is True
     assert module._in_application_scope("KaiMS", service="mysql") is True
     assert module._in_application_scope("api-gateway", service="mysql") is False
+
+
+@pytest.mark.asyncio
+async def test_report_preserves_evidence_metadata_without_loading_raw_documents(sqlite_session_factory) -> None:
+    module = load_module()
+    module.app.state.session_factory = sqlite_session_factory
+    async with sqlite_session_factory() as session:
+        session.add(IncidentEvidenceRecord(
+            tenant_id="tenant-metadata", incident_id="large-evidence", issue_signature="c" * 64,
+            service="checkout", environment="prod", alert_type="latency", reviewed=True,
+            evidence={"raw": "x" * 1000000},
+        ))
+        await session.commit()
+    statements = []
+    engine = sqlite_session_factory.kw["bind"].sync_engine
+    def capture(connection, cursor, statement, parameters, context, executemany):
+        if "FROM incident_evidence" in statement:
+            statements.append(statement)
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        result = await module.report(tenant_id="tenant-metadata")
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+    assert result["evidence_count"] == 1
+    assert result["recent_evidence"][0]["service"] == "checkout"
+    assert result["recent_evidence"][0]["reviewed"] is True
+    assert statements and all("incident_evidence.evidence," not in sql and "incident_evidence.evidence " not in sql for sql in statements)
+
+
+@pytest.mark.asyncio
+async def test_report_page_joins_complete_version_key_and_keeps_tenant_scope(sqlite_session_factory) -> None:
+    module = load_module()
+    runbook = uuid4()
+    async with sqlite_session_factory() as session:
+        for version, tenant in ((1, "tenant-a"), (2, "tenant-a"), (3, "tenant-b")):
+            session.add(RunbookVersionRecord(
+                runbook_id=runbook, version=version, tenant_id=tenant,
+                issue_signature="d" * 64, owner="reviewer", risk_level="low",
+                required_approval="human", content={"version": version},
+            ))
+        await session.commit()
+        rows = (await session.execute(module._recent_report_records(
+            RunbookVersionRecord, "tenant-a", RunbookVersionRecord.created_at, 1,
+        ))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].tenant_id == "tenant-a"
+    assert rows[0].version == 2
 
 
 def test_catalog_promotion_requires_success_and_complete_recovery_controls() -> None:

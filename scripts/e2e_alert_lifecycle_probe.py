@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from datetime import UTC, datetime, timedelta
 from urllib.error import HTTPError
@@ -96,8 +97,13 @@ def main() -> int:
     parser.add_argument("--alertmanager", default="http://alertmanager:9093")
     parser.add_argument("--resolution", default="http://resolution-agent:8000")
     parser.add_argument("--username", default="admin")
-    parser.add_argument("--password", default="Admin@123456")
+    parser.add_argument("--password", default=os.getenv("ADMIN_USER_PASSWORD", "Admin@123456"))
     parser.add_argument("--wait-seconds", type=int, default=240)
+    parser.add_argument(
+        "--recover-missing-analysis",
+        action="store_true",
+        help="Explicitly exercise direct resolution recovery; excludes natural-delivery verification.",
+    )
     parser.add_argument(
         "--include-live-remediation",
         action="store_true",
@@ -210,7 +216,7 @@ def main() -> int:
         "ok": bool(context) and bool(context_evidence["evidence_present"]),
         **context_evidence,
     }
-    if context and not recommendation.get("id"):
+    if args.recover_missing_analysis and context and not recommendation.get("id"):
         # The processed read model adds presentation-only fields such as
         # ``snapshot``. Resolution accepts the strict Context event contract,
         # so only forward schema fields when exercising the recovery path.
@@ -229,7 +235,19 @@ def main() -> int:
             recommendation = recommendation_payload
         else:
             stages["rca_regeneration"]["response"] = recommendation_payload
-    stages["rca"] = {"ok": bool(recommendation.get("id")), "recommendation_id": recommendation.get("id")}
+    stages["rca"] = {
+        "ok": bool(recommendation.get("id")),
+        "recommendation_id": recommendation.get("id"),
+        "natural_delivery": bool(recommendation.get("id")) and "rca_regeneration" not in stages,
+        "analysis_status": (recommendation.get("metadata") or {}).get("rca_status"),
+    }
+    impact = (recommendation.get("metadata") or {}).get("impact_analysis") or {}
+    stages["impact"] = {
+        "ok": bool(impact) and isinstance(impact.get("observed_impact"), str),
+        "assessment_present": bool(impact),
+        "observed_impact": impact.get("observed_impact"),
+        "confidence": impact.get("confidence_score"),
+    }
     report_row: dict = {}
     report_deadline = time.time() + min(args.wait_seconds, 120)
     while incident.get("id") and time.time() < report_deadline:
@@ -475,7 +493,7 @@ def main() -> int:
             "action_status": action_status,
         }
 
-    required = ("live_stream", "incident", "context", "report_ui_context", "rca", "execution_plan")
+    required = ("live_stream", "incident", "context", "report_ui_context", "rca", "impact", "execution_plan")
     if args.include_live_remediation:
         required += ("approval", "execution_submission", "remediation_and_closure")
     if args.complete_diagnostic:

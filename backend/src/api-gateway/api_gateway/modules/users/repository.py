@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from sqlalchemy import Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.exc import OperationalError, TimeoutError as DatabaseTimeoutError
 from fastapi import HTTPException
 
 from common.database import AuditLogRecord, RoleRecord, UserRecord, UserSessionRecord
@@ -154,14 +155,19 @@ class UserRepository:
         )
 
     async def list_audit_logs(self, *, page: int, page_size: int, action: str | None) -> tuple[list[AuditLogRecord], int]:
-        base: Select[tuple[AuditLogRecord]] = select(AuditLogRecord).order_by(AuditLogRecord.created_at.desc())
-        if action:
-            base = base.where(AuditLogRecord.action == action)
-
-        count_query = select(func.count()).select_from(base.subquery())
+        filters = [AuditLogRecord.action == action] if action else []
+        # Sort narrow keys first. Sorting entire JSON payloads exhausted MySQL's
+        # sort memory on real RCA audit records and made the audit workspace 500.
+        count_query = select(func.count()).select_from(AuditLogRecord).where(*filters)
         total = int((await self.session.execute(count_query)).scalar_one())
         offset = max(0, (page - 1) * page_size)
-        rows = (await self.session.execute(base.offset(offset).limit(page_size))).scalars().all()
+        page_keys = select(AuditLogRecord.id, AuditLogRecord.created_at).where(*filters).order_by(
+            AuditLogRecord.created_at.desc(), AuditLogRecord.id.desc(),
+        ).offset(offset).limit(page_size).subquery()
+        query = select(AuditLogRecord).join(page_keys, AuditLogRecord.id == page_keys.c.id).order_by(
+            page_keys.c.created_at.desc(), page_keys.c.id.desc(),
+        )
+        rows = (await self.session.execute(query)).scalars().all()
         return list(rows), total
 
 
@@ -174,6 +180,24 @@ async def run_in_session(factory: async_sessionmaker[AsyncSession] | None, fn):
             result = await fn(repo)
             await session.commit()
             return result
+        except (OperationalError, DatabaseTimeoutError) as exc:
+            # A failed connection is infrastructure unavailability, not invalid
+            # credentials. Never return driver messages or SQL to the client.
+            try:
+                await session.rollback()
+            except OperationalError:
+                pass  # Preserve the original connection failure.
+            driver_args = getattr(getattr(exc, "orig", None), "args", ())
+            code = driver_args[0] if driver_args else None
+            if isinstance(exc, DatabaseTimeoutError) or code in {2002, 2003, 2006, 2013, 2055}:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"code": "authentication_store_unavailable",
+                            "message": "Authentication is temporarily unavailable. Please try again shortly.",
+                            "retryable": True},
+                    headers={"Retry-After": "5"},
+                ) from exc
+            raise
         except Exception:
             await session.rollback()
             raise

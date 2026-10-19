@@ -84,6 +84,7 @@ class RecoveryProfile(BaseModel):
     additional_alert_names: list[str] = Field(default_factory=list, max_length=8)
     required_alert_labels: dict[str, str] = Field(default_factory=dict, max_length=16)
     allow_operator_verified_closure: bool = False
+    allow_automatic_observation: bool = False
     checks: list[RegisteredRecoveryCheck] = Field(min_length=6, max_length=32)
 
     @property

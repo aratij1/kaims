@@ -16,6 +16,13 @@
       "service_catalog_root": "/workspace/backend/src",
       "telemetry": {
         "prometheus_url": "http://prometheus:9090",
+        "runtime_probe_job": "kaims-recovery-http",
+        "signal_metric_bindings": {
+          "KaiOpsDeadLettersIncreasing": {
+            "service": "rabbitmq", "tenant_id": "default", "environment": "prod",
+            "metric_name": "kaiops_dead_letter_events_total", "labels": {"provider": "rabbitmq"}
+          }
+        },
         "jaeger_url": "http://jaeger:16686"
       },
       "ticket_sources": {
@@ -34,6 +41,11 @@
       "service_catalog_root": "/workspace/external/telemetry/opentelemetry-demo/src",
       "telemetry": {
         "prometheus_url": "http://telemetry-prometheus:9090",
+        "probe_job_sources": {
+          "telemetry-application": "http://prometheus:9090",
+          "telemetry-catalog-journey": "http://prometheus:9090",
+          "telemetry-jaeger": "http://prometheus:9090"
+        },
         "jaeger_url": "http://host.docker.internal:26686/jaeger/ui",
         "opensearch_url": "http://host.docker.internal:9200",
         "opensearch_index": "otel-*"

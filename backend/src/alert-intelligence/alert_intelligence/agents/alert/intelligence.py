@@ -43,6 +43,7 @@ _METRIC_KEYS = ("metric", "metric_name", "__name__", "prometheus_rule", "rule", 
 _STABLE_RESOURCE_KEYS = (
     "mountpoint", "filesystem", "volume", "persistentvolumeclaim", "disk",
     "resource_id", "resource", "database", "queue", "topic",
+    "operation", "http_route", "route", "method", "http_method",
 )
 
 
@@ -98,7 +99,8 @@ class AlertIntelligenceAgent(BaseAgent):
         match_details: list[dict[str, Any]] = []
         for item in candidates:
             if (
-                item.starts_at < cutoff
+                item.tenant_id != alert.tenant_id
+                or item.starts_at < cutoff
                 or (item.ends_at is not None and item.ends_at <= utc_now())
                 or not same_environment_family(alert.environment, item.environment)
             ):
@@ -140,7 +142,7 @@ class AlertIntelligenceAgent(BaseAgent):
         best_score = 0.0
         best_evidence: dict[str, Any] = {}
         for candidate in candidates:
-            if not same_environment_family(alert.environment, candidate.environment):
+            if candidate.tenant_id != alert.tenant_id or not same_environment_family(alert.environment, candidate.environment):
                 continue
             candidate_score, evidence = self._correlation_score(alert, candidate)
             if candidate_score > best_score:

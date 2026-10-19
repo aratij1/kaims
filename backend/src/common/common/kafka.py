@@ -10,6 +10,7 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from pydantic import BaseModel
 
 from common.config import Settings
+from common.alert_processing_budget import run_handler
 from common.logging import get_logger
 from common.message_processing import ProcessedMessageCache, extract_message_identity, processing_cancelled
 from common.resilience import CircuitBreaker, CircuitOpenError, retry_async
@@ -197,7 +198,7 @@ async def consume_forever(
             try:
                 while attempts <= max_retries:
                     try:
-                        await handler(payload)
+                        await run_handler(consumer._settings, consumer._topic, handler, payload)
                         processed_cache.mark(identity)
                         should_commit = True
                         break

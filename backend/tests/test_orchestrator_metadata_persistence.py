@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from common.models import Alert, AlertSeverity, Incident
@@ -77,3 +79,28 @@ async def test_orchestrator_persists_metadata_envelope_before_publish(monkeypatc
     assert len(fake_session.saved_envelopes) == 1
     assert fake_session.saved_envelopes[0]["event_type"] == "incident.workflow.selected"
     assert fake_session.saved_envelopes[0]["identity"]["incident_id"] == str(incident.id)
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_does_not_advance_delivery_without_persisted_decision(monkeypatch):
+    captured = {}
+    async def consume(_consumer, handler):
+        captured["handler"] = handler
+    monkeypatch.setattr(orchestrator_app, "_build_ingress_consumers", lambda: [("test", object(), consume)])
+    monkeypatch.setattr(orchestrator_app.settings, "temporal_pilot_enabled", False)
+    monkeypatch.setattr(orchestrator_app, "selected_event_bus_provider", lambda _settings: "rabbitmq")
+    monkeypatch.setattr(orchestrator_app.agent, "decide_workflow_async_with_runtime", AsyncMock(return_value=SimpleNamespace(workflow="investigate")))
+    publish = AsyncMock()
+    monkeypatch.setattr(orchestrator_app, "publish_orchestration_event", publish)
+    app = SimpleNamespace(state=SimpleNamespace(producer=object(), session_factory=None))
+    alert = Alert(tenant_id="tenant-a", source="prometheus", service="payments", name="Down", description="down")
+    incident = Incident(tenant_id="tenant-a", service="payments", title="Down")
+    await orchestrator_app.startup(app)
+    await asyncio.sleep(0)
+    # Invoke the captured handler directly; broker retry must see this error.
+    try:
+        with pytest.raises(RuntimeError, match="session factory unavailable"):
+            await captured["handler"]({"alert": alert.model_dump(), "incident": incident.model_dump()})
+        publish.assert_not_awaited()
+    finally:
+        await orchestrator_app.shutdown(app)

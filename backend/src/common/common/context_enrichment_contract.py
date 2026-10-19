@@ -9,7 +9,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from common.models import Alert, Incident
-from common.evidence_source_policy import is_alert_artifact
+from common.evidence_source_policy import is_alert_artifact, is_derived_observation
+from common.evidence_subject import metric_matches_subject, service_matches
 
 EvidenceCategory = Literal[
     "metrics",
@@ -241,7 +242,7 @@ def normalize_connector_response(
                         source_reference=source_reference, observation_identity=observed_at.isoformat(), content=content),
                     requirement_id=str(requirement.requirement_id), tenant_id=requirement.tenant_id,
                     incident_id=str(incident.id), category="metrics", source_id="docker", connector=connector,
-                    source_reference=source_reference, service=str(raw.get("service") or incident.service),
+                    source_reference=source_reference, service=incident.service if service_matches(raw.get("service") or incident.service, incident.service) else str(raw["service"]),
                     observed_at=observed_at, collected_at=now,
                     freshness="fresh" if abs((now - observed_at).total_seconds()) <= 900 else "stale",
                     content=content, provenance={"endpoint": source_reference, "observation_scope": "current_snapshot"},
@@ -269,6 +270,10 @@ def normalize_connector_response(
             if not (metric_name or record_query) or not samples:
                 rejected.append({"code": "PROMETHEUS_SERIES_INCOMPLETE", "record_index": index})
                 continue
+            if not metric_matches_subject(labels, incident.service,
+                    target_labels=wrapper.get("preserved_labels") or {}, query=record_query):
+                rejected.append({"code": "METRIC_SUBJECT_MISMATCH", "record_index": index})
+                continue
             content = {"metric_name": metric_name or None, "expression": record_query or None,
                        "series_kind": "named_metric" if metric_name else "query_result",
                        "labels": dict(labels), "samples": samples,
@@ -282,7 +287,7 @@ def normalize_connector_response(
                 evidence_id=evidence_id, requirement_id=str(requirement.requirement_id),
                 tenant_id=requirement.tenant_id, incident_id=str(incident.id), category="metrics",
                 source_id=record_endpoint, connector=connector, source_reference=source_reference,
-                service=str(labels.get("service") or incident.service or "") or None,
+                service=incident.service,
                 resource=str(labels.get("instance") or "") or None,
                 project_id=str(labels.get("project_id") or "") or None,
                 observed_at=observed_at, collected_at=now,
@@ -336,6 +341,9 @@ def normalize_connector_response(
             if category == "logs" and is_alert_artifact(raw):
                 rejected.append({"code": "ALERT_ARTIFACT_NOT_OPERATIONAL_LOG", "record_index": index})
                 continue
+            if category == "logs" and is_derived_observation(raw):
+                rejected.append({"code": "DERIVED_SUMMARY_NOT_SOURCE_LOG", "record_index": index})
+                continue
             timestamp_missing = not any(raw.get(key) for key in ("observed_at", "timestamp", "updated_at", "created_at"))
             observed_raw = (
                 raw.get("observed_at") or raw.get("timestamp") or raw.get("updated_at")
@@ -364,7 +372,7 @@ def normalize_connector_response(
                 evidence_id=evidence_id, requirement_id=str(requirement.requirement_id),
                 tenant_id=requirement.tenant_id, incident_id=str(incident.id), category=category,
                 source_id=endpoint, connector=connector, source_reference=source_reference,
-                service=str(raw.get("service") or incident.service or "") or None,
+                service=incident.service if service_matches(raw.get("service") or incident.service, incident.service) else str(raw["service"]),
                 resource=str(raw.get("resource") or "") or None,
                 project_id=str(raw.get("project_id") or "") or None,
                 observed_at=observed_at, collected_at=now,
@@ -684,13 +692,16 @@ class HumanEvidenceJiraRequest(BaseModel):
 
 
 _REQUIREMENT_CONNECTORS: dict[str, list[str]] = {
-    "metrics": ["prometheus", "discovery-mcp"],
-    "logs": ["opensearch", "discovery-mcp", "local-evidence"],
-    "traces": ["jaeger", "discovery-mcp"],
-    "topology": ["discovery-mcp", "vector-db", "cmdb", "kubernetes", "local-evidence"],
-    "deployment": ["discovery-mcp", "vector-db", "jenkins", "kubernetes", "local-evidence"],
-    "change": ["discovery-mcp", "vector-db", "jira", "github", "local-evidence"],
-    "source_code": ["discovery-mcp", "local-evidence", "github", "vector-db"],
+    # Prefer one registry-aware operational gateway. Preserve a dedicated
+    # source fallback for deployments authorized only for that source.
+    # Explicit bindings override defaults; knowledge is not live diagnostics.
+    "metrics": ["discovery-mcp", "prometheus"],
+    "logs": ["discovery-mcp", "opensearch"],
+    "traces": ["discovery-mcp", "jaeger"],
+    "topology": ["discovery-mcp"],
+    "deployment": ["discovery-mcp"],
+    "change": ["discovery-mcp"],
+    "source_code": ["discovery-mcp"],
     "database": [],
     "ticket": ["discovery-mcp", "jira", "vector-db"],
     "runbook": ["vector-db", "discovery-mcp", "local-evidence"],
@@ -728,6 +739,39 @@ def legacy_discovery_category(question: str) -> str | None:
     if text == "dependency health and saturation metrics":
         return "topology"
     return None
+
+
+def evidence_category_reviewed(category: str, coverage: dict[str, int]) -> bool:
+    sources = {"metrics": ("telemetry", "metrics"), "deployment": ("changes", "deployment"),
+               "change": ("changes", "change"), "source_code": ("code", "source_code")}
+    return any(coverage.get(source, 0) > 0 for source in sources.get(category, (category,)))
+
+
+def discovery_evidence_requirements(*, previous_requirements: list[dict[str, Any]] | None = None,
+                                  reviewed_sources: dict[str, int] | None = None,
+                                  **kwargs: Any) -> list[EvidenceRequirement]:
+    """Keep unresolved questions, and actively discover evidence to answer them."""
+    requirements = build_evidence_requirements(**kwargs)
+    if not any(row.category == "validation" and not row.candidate_connectors for row in requirements):
+        return requirements
+    # These are discovery questions, not inferred answers to the original gap.
+    # Every result still passes source, tenant and observation-window validation.
+    categories = {row.category for row in requirements}
+    previous_questions = {str(row.get("question") or "").strip().casefold()
+                          for row in previous_requirements or []
+                          if int(row.get("rca_version") or 0) < int(kwargs["rca_version"])}
+    probes = [
+        {"category": category, "question": question,
+         "reason": "Discover attributable evidence for unresolved RCA questions before requiring manual investigation."}
+        for category, question in (
+            ("metrics", "Discover service and dependency health measurements during the incident window."),
+            ("logs", "Discover service errors and configuration failures during the incident window."),
+            ("deployment", "Discover deployment and configuration changes around incident onset."),
+            ("topology", "Discover the affected service resources and dependencies for targeted investigation."),
+        ) if category not in categories and question.casefold() not in previous_questions
+        and not evidence_category_reviewed(category, reviewed_sources or {})
+    ]
+    return requirements + build_evidence_requirements(**{**kwargs, "missing_evidence": probes})
 
 
 def build_evidence_requirements(

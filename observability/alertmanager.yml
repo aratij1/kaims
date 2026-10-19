@@ -8,6 +8,19 @@ route:
   group_interval: 15s
   repeat_interval: 2m
   routes:
+    # Controlled real-fault recovery scope; other demo signals stay monitoring-only.
+    - receiver: kaiops-landing-pad
+      matchers:
+        - project="telemetry"
+        - environment="demo"
+        - service="frontend-proxy"
+        - alertname="TelemetryApplicationUnavailable"
+    - receiver: demo-monitoring-only
+      matchers:
+        - monitoring_scope="demo"
+    - receiver: demo-monitoring-only
+      matchers:
+        - environment="demo"
     - receiver: kaiops-landing-pad-realtime
       matchers:
         - category="latency"
@@ -17,6 +30,8 @@ route:
       repeat_interval: 1m
 
 receivers:
+  # Demo targets remain observable in Prometheus, without production tickets.
+  - name: demo-monitoring-only
   - name: kaiops-landing-pad
     webhook_configs:
       - url: http://monitoring-adapter:8000/alerts/alertmanager

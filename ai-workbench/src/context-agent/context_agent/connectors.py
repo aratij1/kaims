@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from common.evidence_source_policy import is_alert_artifact_reference, log_observed_at
+from common.evidence_subject import metric_matches_subject, service_identity
 
 import asyncio
 import hashlib
@@ -189,6 +190,11 @@ class PrometheusConnector(BaseConnector):
                 "",
             )
             expression = expression or generator_expression
+            if metadata.get("context_requirement_category") == "metrics":
+                from common.metric_queries import filesystem_evidence_query
+                expression = filesystem_evidence_query(
+                    labels, question=str(metadata.get("context_requirement_question") or ""), alert_name=alert.name,
+                ) or expression
             # Targeted external-probe evidence needs named, endpoint-bound
             # series. Aggregated alert expressions drop __name__ and can mix
             # multiple endpoints; they cannot satisfy this evidence request.
@@ -209,7 +215,7 @@ class PrometheusConnector(BaseConnector):
             ).strip()
             if not expression and metric_name:
                 matchers = []
-                for key in ("environment", "cluster", "namespace", "service", "instance"):
+                for key in ("environment", "cluster", "namespace", "service", "instance", "job"):
                     fallback = alert.environment if key == "environment" else alert.service if key == "service" else ""
                     value = str(labels.get(key) or fallback).strip()
                     if value and re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", key):
@@ -276,7 +282,12 @@ class PrometheusConnector(BaseConnector):
                 response.raise_for_status()
                 payload = response.json()
                 result = ((payload.get("data") or {}).get("result") or []) if isinstance(payload, dict) else []
+                all_series = result
+                result = [row for row in all_series if isinstance(row, dict)
+                          and metric_matches_subject(row.get("metric") or {}, alert.service,
+                                                     target_labels=labels, query=expression)]
                 return {
+                    "rejected_series_count": len(all_series) - len(result),
                     "_source_status": "completed" if result else "empty",
                     "query": expression,
                     "query_kind": "range",
@@ -433,6 +444,9 @@ class LocalEvidenceConnector(BaseConnector):
                     break
                 if any(part in excluded_dirs for part in path.parts):
                     continue
+                if kind == "code" and (any(part in {"tests", "__tests__"} for part in path.parts)
+                        or path.name.startswith("test_") or re.search(r"\.(test|spec)\.", path.name)):
+                    continue
                 if kind == "log" and is_alert_artifact_reference(path):
                     continue
                 if not path.is_file() or path.suffix.lower() not in suffixes:
@@ -486,11 +500,17 @@ class LocalEvidenceConnector(BaseConnector):
     async def fetch(self, alert: Alert, incident: Incident) -> dict[str, Any]:
         await asyncio.sleep(0)
         terms = self._terms(alert)
+        aliases = {alert.service, service_identity(alert.service)}
+        code_roots = list(dict.fromkeys(path for root in self.code_roots
+            for path in [*([root] if root.name in aliases else []), *(root / alias for alias in aliases)]
+            if path.is_dir()))
+        if alert.service.lower().startswith(("robot-shop-", "rs-")):
+            code_roots = [root for root in code_roots if "robot-shop" in root.parts]
         return {
             "query_terms": terms,
-            "code_matches": self._search(self.code_roots, self._code_suffixes, terms, "code"),
+            "code_matches": self._search(code_roots, self._code_suffixes, terms, "code"),
             "log_matches": self._search(self.log_roots, self._log_suffixes, terms, "log"),
-            "code_roots": [str(root) for root in self.code_roots],
+            "code_roots": [str(root) for root in code_roots],
             "log_roots": [str(root) for root in self.log_roots],
         }
 
@@ -705,6 +725,10 @@ class DiscoveryMCPConnector(BaseConnector):
             selected.add("code.search")
             reasons.append("source_or_configuration_diagnostics")
 
+        if re.search(r"\b(down|unavailable|unreachable|availability|refused|crash|crashloop)\b", haystack):
+            selected.update({"logs.search", "topology.search", "dependency-health.search", "resource-health.search"})
+            reasons.append("availability_runtime_diagnostics")
+
         database_identity = any(
             str(labels.get(key) or metadata.get(key) or "").strip()
             for key in ("database", "database_name", "schema", "table", "query_id")
@@ -747,6 +771,12 @@ class DiscoveryMCPConnector(BaseConnector):
                 selected.update(explicit)
                 reasons.append("explicit_source_request")
 
+        from common.diagnostic_runbooks import diagnostic_tools
+        guidance = diagnostic_tools(metadata.get("diagnostic_runbook"), tenant_id=alert.tenant_id,
+                                    service=alert.service, environment=alert.environment)
+        if guidance:
+            selected.update(guidance[:3])
+            reasons.append("scoped_diagnostic_runbook")
         if not selected:
             selected.update({"logs.search", "telemetry.search"})
             reasons.append("safe_observation_fallback")
@@ -845,14 +875,20 @@ class DiscoveryMCPConnector(BaseConnector):
     ) -> dict[str, Any]:
         arguments = {
             "terms": terms,
+            "tenant_id": alert.tenant_id,
             "limit": 8,
             "service": alert.service,
+            "alert_name": alert.name,
             "trace_id": str(alert.trace_id or ""),
             "evidence_category": str(alert.metadata.get("context_requirement_category") or ""),
+            "question": str(alert.metadata.get("context_requirement_question") or ""),
             "application": str(alert.metadata.get("application") or alert.labels.get("application") or ""),
             "project": str(alert.metadata.get("project_id") or alert.metadata.get("project") or alert.labels.get("project_id") or alert.labels.get("project") or ""),
             "environment": alert.environment,
             "operation": str(alert.labels.get("operation") or alert.metadata.get("operation") or ""),
+            "target_labels": {key: alert.labels[key] for key in ("job", "instance", "namespace", "cluster", "operation", "http_route", "route", "device", "mountpoint") if alert.labels.get(key)},
+            "database": str(alert.labels.get("database") or alert.labels.get("database_name") or alert.metadata.get("database") or ""),
+            "table": str(alert.labels.get("table") or alert.metadata.get("table") or ""),
             "start_time": str(alert.metadata.get("context_observation_start") or ""),
             "end_time": str(alert.metadata.get("context_observation_end") or ""),
         }

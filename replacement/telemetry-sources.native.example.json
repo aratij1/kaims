@@ -1,0 +1,42 @@
+{
+  "gateway-errors": {
+    "type": "prometheus",
+    "url": "http://prometheus:9090",
+    "service_label": "service_name",
+    "labels": {
+      "application": "payments",
+      "environment": "prod"
+    },
+    "metric_name": "service_error_rate_ratio",
+    "metric": "error_rate_ratio"
+  },
+  "gateway-p99": {
+    "type": "prometheus",
+    "url": "http://prometheus:9090",
+    "service_label": "service_name",
+    "labels": {
+      "application": "payments",
+      "environment": "prod"
+    },
+    "metric_name": "service_latency_p99_seconds",
+    "metric": "latency_p99_ms",
+    "multiplier": 1000
+  },
+  "gateway-logs": {
+    "type": "loki",
+    "url": "http://loki:3100",
+    "service_label": "service_name",
+    "labels": {
+      "application": "payments",
+      "environment": "prod"
+    }
+  },
+  "gateway-traces": {
+    "type": "jaeger",
+    "url": "http://jaeger:16686",
+    "tags": {
+      "application": "payments",
+      "environment": "prod"
+    }
+  }
+}

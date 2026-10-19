@@ -2,19 +2,24 @@ param(
     [ValidateSet("lean", "observability", "monitoring-authoring", "evaluation", "full")]
     [string]$Profile = "lean",
     [switch]$Build,
-    [int]$ReadyTimeoutSeconds = 180,
-    [int]$MaximumRunningContainers = 32,
-    [int]$DockerCommandTimeoutSeconds = 180
+    [int]$ReadyTimeoutSeconds = 600,
+    [int]$MinimumFreeDiskGB = 10,
+    [int]$MaximumRunningContainers = 48,
+    [int]$DockerCommandTimeoutSeconds = 900
 )
 
 $ErrorActionPreference = "Stop"
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+. (Join-Path $PSScriptRoot 'assert-docker-storage.ps1')
 function Invoke-DockerCommand {
     param([string[]]$Arguments, [string]$Description)
     $stdout = Join-Path $env:TEMP ("kaims-docker-{0}.out" -f [guid]::NewGuid())
     $stderr = Join-Path $env:TEMP ("kaims-docker-{0}.err" -f [guid]::NewGuid())
     try {
         $process = Start-Process docker -ArgumentList $Arguments -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        # Retain the process handle before termination so Windows PowerShell
+        # can reliably retrieve the native exit code after waiting.
+        $null = $process.Handle
         if (-not $process.WaitForExit($DockerCommandTimeoutSeconds * 1000)) {
             $process.Kill()
             throw "$Description timed out after $DockerCommandTimeoutSeconds seconds. Docker Desktop is saturated; restart Docker Desktop before retrying."
@@ -25,10 +30,10 @@ function Invoke-DockerCommand {
         $process.WaitForExit()
         Get-Content $stdout -ErrorAction SilentlyContinue | Write-Host
         Get-Content $stderr -ErrorAction SilentlyContinue | Write-Host
-        # Windows PowerShell can leave ExitCode unset for a completed
-        # Start-Process instance with redirected streams. Do not mistake that
-        # host-specific null for a non-zero Docker exit code.
-        if ($null -ne $process.ExitCode -and $process.ExitCode -ne 0) {
+        if ($null -eq $process.ExitCode) {
+            throw "$Description ended without a readable exit code."
+        }
+        if ($process.ExitCode -ne 0) {
             throw "$Description failed with exit code $($process.ExitCode)."
         }
     }
@@ -38,8 +43,14 @@ function Invoke-DockerCommand {
 }
 Push-Location $workspace
 try {
-    & (Join-Path $workspace "deploy/monitoring/start.ps1")
+    # Fail before starting any workload: a full host disk previously made the
+    # Docker data filesystem read-only and prevented subsequent startup.
+    $workspaceDrive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($workspace))
+    if ($workspaceDrive.AvailableFreeSpace -lt ($MinimumFreeDiskGB * 1GB)) {
+        throw "Insufficient free space on $($workspaceDrive.Name). Free at least $MinimumFreeDiskGB GB before starting KaiMS. Database volumes will not be deleted automatically."
+    }
     $env:DOCKER_BUILDKIT = "1"
+    Assert-DockerStorageCapacity -MinimumFreeDiskGB $MinimumFreeDiskGB
     $env:COMPOSE_BAKE = "false"
     $env:COMPOSE_PARALLEL_LIMIT = "1"
     docker version --format "Docker engine {{.Server.Version}}"
@@ -47,8 +58,9 @@ try {
 
     $optionalServices = @(
         "zookeeper", "kafka", "kafka-exporter", "fault-lab",
-        "grafana", "evaluation-service",
-        "temporal-pilot-worker", "temporal-ui", "jenkins", "ui-dev"
+        "grafana", "temporal-ui", "ui-dev",
+        "discovery-service", "metrics-validation-agent", "rule-generation-agent",
+        "prometheus-config-service", "validation-agent", "dashboard-generator"
     )
     if ($Profile -eq "lean") {
         # Stop only known optional services. Avoid a project-wide orphan
@@ -66,32 +78,30 @@ try {
     if ($runningContainers -gt $MaximumRunningContainers) {
         throw "Docker is still running $runningContainers containers (safe local limit: $MaximumRunningContainers). Stop overlapping Compose projects, then retry. Run 'docker compose ls' to identify them."
     }
+    & (Join-Path $workspace "deploy/monitoring/start.ps1")
     $leanServices = @(
         "mysql", "temporal", "redis", "rabbitmq",
         "mysql-exporter", "node-exporter",
-        "monitoring-adapter", "monitoring-ingestion-worker", "application-onboarding", "connector-hub",
-        "discovery-service", "metrics-validation-agent", "rule-generation-agent",
-        "prometheus-config-service", "validation-agent", "dashboard-generator",
+        "jaeger", "otel-collector",
+        "monitoring-adapter", "monitoring-ingestion-worker", "application-onboarding", "connector-hub", "cloud-operations",
         "api-gateway", "alert-intelligence", "orchestrator", "context-agent",
         "discovery-mcp", "docker-socket-proxy", "model-router", "resolution-agent",
         "approval-service", "notification-service", "remediation-engine",
+        "audit-service", "evaluation-service", "temporal-pilot-worker", "jenkins",
         "closure-service", "knowledge-development-worker", "ui"
     )
     $composeArguments = @("compose")
     if ($Profile -ne "lean") { $composeArguments += @("--profile", $Profile) }
     if ($Build) {
-        $buildArguments = @($composeArguments[0..($composeArguments.Count - 1)]) + @("build")
-        if ($Profile -eq "lean") { $buildArguments += $leanServices }
-        Write-Host "Building KaiMS sequentially (COMPOSE_PARALLEL_LIMIT=1)..."
-        try { Invoke-DockerCommand -Arguments $buildArguments -Description "KaiMS sequential build" }
-        catch {
-            Write-Warning "BuildKit failed. Retrying once with the classic builder."
-            $env:DOCKER_BUILDKIT = "0"
-            Invoke-DockerCommand -Arguments $buildArguments -Description "KaiMS classic-builder retry"
+        if ($Profile -eq "lean") {
+            & (Join-Path $PSScriptRoot 'build-kaims-images.ps1') -Services $leanServices
+        } else {
+            & (Join-Path $PSScriptRoot 'build-kaims-images.ps1')
         }
     }
     $composeArguments += @("up", "-d", "--no-build")
-    if (-not $Build) { $composeArguments += "--no-recreate" }
+    # Let Compose recreate services whose configuration changed, so worker
+    # and memory limits apply even when images do not need rebuilding.
     if ($Profile -eq "lean") { $composeArguments += $leanServices }
     Write-Host "Starting KaiMS profile '$Profile'..."
     Invoke-DockerCommand -Arguments $composeArguments -Description "KaiMS startup"
@@ -102,13 +112,29 @@ try {
         try {
             $response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8501/" -TimeoutSec 5
             $ready = $response.StatusCode -eq 200 -and $response.Content -match '<div id="root"></div>'
+            if ($ready) {
+                # auth/config is static and can succeed while login's database
+                # is offline. Readiness must exercise the database connection.
+                $databaseReady = Invoke-RestMethod "http://127.0.0.1:8501/api-gateway/readyz" -TimeoutSec 8
+                $ready = $databaseReady.status -eq "ready"
+            }
+            if ($ready) {
+                $auth = Invoke-RestMethod "http://127.0.0.1:8501/api-gateway/auth/config" -TimeoutSec 5
+                $ready = $auth.mode -in @("local", "oidc")
+                if ($ready) {
+                    # These back the visible inventory, connector, and evaluation
+                    # screens; UI HTML alone does not establish readiness.
+                    & docker compose exec -T api-gateway python -c "import urllib.request; [urllib.request.urlopen('http://' + service + ':8000/healthz', timeout=5).close() for service in ('cloud-operations', 'evaluation-service')]" 2>$null
+                    $ready = $LASTEXITCODE -eq 0
+                }
+            }
         }
         catch { $ready = $false }
     } while (-not $ready -and (Get-Date) -lt $deadline)
     if (-not $ready) {
         & docker compose ps
         & docker compose logs --tail 80 api-gateway ui
-        throw "KaiMS UI did not become ready within $ReadyTimeoutSeconds seconds."
+        throw "KaiMS UI and authentication API did not become ready within $ReadyTimeoutSeconds seconds."
     }
     & docker compose ps @leanServices
     Write-Host "KaiMS is ready: http://127.0.0.1:8501" -ForegroundColor Green

@@ -92,7 +92,7 @@ def test_build_info_exposes_safe_release_contract(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {
         "release_sha": "a" * 40,
-        "schema_version": "20260924_fix_investigation_binding_collation",
+        "schema_version": "20261015_snapshot_alert_retention_index",
         "contract_version": "kaiops.incident-operations.v1",
         "build_time": "2026-08-31T11:00:00Z",
     }

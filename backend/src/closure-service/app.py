@@ -187,6 +187,7 @@ async def _terminal_action_reconciliation_loop(app: FastAPI) -> None:
             await _reconcile_terminal_actions(app)
             if _reconciliation_mode() == "apply":
                 await app.state.reconcile_recovery_assessments()
+                await app.state.reconcile_current_recovery()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -990,6 +991,8 @@ async def manual_close_incident(
         tenant_id=str(incident_payload.get("tenant_id") or ""),
         incident_id=incident_id,
         root_cause="Operator-directed closure",
+        closure_kind="manual",
+        closure_status="closed",
         impact=str(incident_payload.get("summary") or "Impact reviewed by operator."),
         action_taken=f"Administrative closure by {request.actor_id}: {request.comment}",
         validation={"operator_attested": True, "technical_recovery_verified": False},
@@ -1031,10 +1034,19 @@ async def manual_close_incident(
     )
     if persistence.get("status") == "stale_suppressed":
         raise HTTPException(status_code=409, detail=persistence.get("reason"))
+    event_delivery = "queued"
     if persistence.get("outbox_enqueued"):
-        await _publish_closure_event(app, payload_out, key=incident_id)
+        try:
+            await _publish_closure_event(app, payload_out, key=incident_id)
+            event_delivery = "published"
+        except Exception:
+            # Closure and its outbox event are already committed. The durable
+            # dispatcher will retry; a delivery outage must not report that
+            # administrative closure itself failed after it succeeded.
+            logger.warning("Manual closure committed; event delivery awaits outbox retry", exc_info=True)
     return {
         "status": "closed",
+        "event_delivery": event_delivery,
         "closure_kind": "manual",
         "technical_recovery_verified": False,
         "incident_id": incident_id,
@@ -1044,3 +1056,5 @@ async def manual_close_incident(
 
 
 mount_recovery_assessment_routes(app, settings, _persist_closure_event, _build_closure_event_payload)
+from closure_service.current_recovery import mount_current_recovery
+mount_current_recovery(app, settings)

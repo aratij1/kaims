@@ -1,0 +1,21 @@
+import fs from 'node:fs';
+import {test,expect} from '@playwright/test';
+test.skip(!process.env.KAIOPS_LIVE_E2E,'Live stack only');
+test('production overview excludes configured demo histories',async({page})=>{
+ test.setTimeout(90000);
+ await page.goto('/');
+ await page.getByLabel('Username').fill('admin');
+ await page.getByLabel('Password').fill(process.env.KAIOPS_E2E_PASSWORD);
+ await page.getByRole('button',{name:/sign in/i}).click();
+ const home=page.locator('.operations-home');await expect(home).toBeVisible({timeout:45000});
+ await expect(home.getByRole('button',{name:'Refresh',exact:true})).toBeEnabled({timeout:30000});
+ const refreshed=page.waitForResponse(r=>r.url().includes('/incidents/groups?')&&r.request().method()==='GET');
+ await home.getByRole('button',{name:'Refresh',exact:true}).click();
+ expect((await refreshed).status()).toBe(200);
+ await expect(home.locator('.oh-scope')).toContainText(/Updated \d/);
+ const operational=home.locator('.needs-you,.kai-handling,.oh-resolved');
+ for(const section of await operational.all()) await expect(section).not.toContainText(/RobotShopServiceDown|OnlineBoutiqueFrontendDown|TelemetryJaegerUnavailable|TelemetryCollectorUnavailable/);
+ const text=await home.innerText();
+ fs.mkdirSync('../../artifacts/alert-authenticity',{recursive:true});
+ fs.writeFileSync('../../artifacts/alert-authenticity/browser-home.json',JSON.stringify({verified_at:new Date().toISOString(),displayed:text},null,2));
+});

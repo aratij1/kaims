@@ -2,6 +2,29 @@ from datetime import datetime, timedelta, timezone
 
 from monitoring_adapter.dedup import compute_fingerprint
 from monitoring_adapter.jira_admission import JiraAdmissionState
+from monitoring_adapter.alert_identity import alertmanager_delivery_key, alert_source_times
+
+
+def test_delivery_identity_includes_source_episode():
+    first = {"fingerprint": "same-labels", "startsAt": "2026-10-18T10:00:00Z"}
+    second = {**first, "startsAt": "2026-10-18T10:10:00Z"}
+    assert alertmanager_delivery_key(first, {}, "firing") == alertmanager_delivery_key(dict(first), {}, "firing")
+    assert alertmanager_delivery_key(first, {}, "firing") != alertmanager_delivery_key(second, {}, "firing")
+    assert alertmanager_delivery_key(first, {}, "firing") != alertmanager_delivery_key(first, {}, "resolved")
+    times = alert_source_times({}, {"startsAt": first["startsAt"], "endsAt": "0001-01-01T00:00:00Z"})
+    assert times == {"starts_at": datetime(2026, 10, 18, 10, tzinfo=timezone.utc)}
+
+
+def test_new_firing_episode_does_not_inherit_previous_discovery_cooldown(tmp_path):
+    state = _state(tmp_path)
+    now = datetime(2026, 10, 18, 10, tzinfo=timezone.utc)
+    def evaluate(onset, offset):
+        return state.evaluate_for_discovery(fingerprint="same", source="prometheus", severity="critical",
+            episode_start=onset.isoformat(), now=now + timedelta(seconds=offset))
+    assert evaluate(now, 0).allowed
+    assert not evaluate(now, 10).allowed
+    assert evaluate(now + timedelta(seconds=30), 30).allowed
+    assert not evaluate(now, 40).allowed
 
 
 def _state(tmp_path, **overrides):

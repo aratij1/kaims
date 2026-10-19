@@ -12,6 +12,7 @@ from common.context_enrichment_contract import (
     validate_enrichment_observation,
 )
 from common.database import (
+    ContextEnrichmentJobRecord,
     ActionRecord,
     ApprovalRecord,
     AuditLogRecord,
@@ -31,6 +32,45 @@ from common.repository import ContextEnrichmentRepository, IncidentRepository
 from context_agent.connectors import execute_enrichment_plan
 from context_agent.context_quality import plan_missing_evidence
 from sqlalchemy import select
+
+
+@pytest.mark.asyncio
+async def test_new_rca_retires_old_queued_jobs_but_preserves_live_collectors_and_other_tenants(sqlite_session_factory):
+    now = datetime.now(UTC)
+    incident_id = uuid4()
+    def requirement(version, tenant="tenant-a"):
+        return build_evidence_requirements(tenant_id=tenant, incident_id=incident_id,
+            rca_version=version, missing_evidence=[{"category": "logs", "question": "Which errors preceded the alert?"}], now=now)[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        old, other = requirement(1), requirement(1, "tenant-b")
+        await repo.upsert_context_evidence_requirements([old, other])
+        async def schedule(req, connector):
+            return await repo.schedule_context_enrichment_job(tenant_id=req.tenant_id,
+                incident_id=incident_id, requirement_id=req.requirement_id, connector_id=connector,
+                query_payload={}, observation_start=now-timedelta(minutes=15), observation_end=now)
+        queued = await schedule(old, "discovery-mcp")
+        live = await schedule(old, "opensearch")
+        live.status = "collecting"
+        live.lease_owner = "live-worker"
+        live.lease_expires_at = now + timedelta(minutes=2)
+        foreign = await schedule(other, "discovery-mcp")
+        session.add(IncidentInvestigationBindingRecord(tenant_id="tenant-a", project_id="project-a",
+            incident_id=incident_id, alert_id=uuid4(), analysis_request_id=uuid4(),
+            context_snapshot_id=uuid4(), context_fingerprint="c"*64, recommendation_id=uuid4(),
+            rca_version=2, status="insufficient_evidence", created_at=now, expires_at=now+timedelta(hours=1)))
+        await session.flush()
+        # Do not discard work while the new RCA's gap set is not persisted.
+        assert (await repo.retire_superseded_collection_jobs(tenant_id="tenant-a", incident_id=incident_id))["jobs_retired"] == 0
+        current = requirement(2)
+        await repo.upsert_context_evidence_requirements([current])
+        new_job = await schedule(current, "discovery-mcp")
+        await session.commit()
+        assert queued.status == "cancelled"
+        assert queued.last_error == "SUPERSEDED_EVIDENCE_REQUIREMENT"
+        assert live.status == "collecting" and live.lease_owner == "live-worker"
+        assert foreign.status == "scheduled"
+        assert new_job.status == "scheduled"
 
 
 def context_for(incident_id, *, tenant_id="tenant-a") -> Context:
@@ -1170,3 +1210,67 @@ async def test_external_probe_reconciliation_only_cancels_generic_trace_question
             tenant_id="tenant-a", incident_id=incident_id, categories={"traces"},
             questions={generic}, reason="Superseded generic request",
         ) == 0
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("category", ["database", "validation", "logs"])
+async def test_automatic_technical_failure_does_not_require_human_facts(sqlite_session_factory, category):
+    key = uuid4()
+    req = build_evidence_requirements(tenant_id="tenant-a", incident_id=key, rca_version=1,
+        missing_evidence=[category], now=datetime.now(UTC))[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([req])
+        previous = await repo.create_human_evidence_request(tenant_id="tenant-a", incident_id=key,
+            requirement_id=req.requirement_id, expected_responder="owner@example.com", due_at=datetime.now(UTC),
+            acceptable_format="Verified observation", evidence_already_checked=[], hypothesis_impact="Test")
+        result = await repo.create_human_evidence_request(tenant_id="tenant-a", incident_id=key,
+            requirement_id=req.requirement_id, expected_responder="owner@example.com", due_at=datetime.now(UTC),
+            acceptable_format="Verified observation", evidence_already_checked=[], hypothesis_impact="Test", automatic_fallback=True)
+        assert result is None
+        assert previous.status == "cancelled"
+        current = await repo.context_evidence_requirement(tenant_id="tenant-a", requirement_id=req.requirement_id)
+        assert current["status"] == "blocked"
+        assert not current["evidence_ids"]
+        from common.database import ContextEvidenceRequirementRecord
+        stored = await session.get(ContextEvidenceRequirementRecord, req.requirement_id)
+        version = stored.version
+        await repo.create_human_evidence_request(tenant_id="tenant-a", incident_id=key,
+            requirement_id=req.requirement_id, expected_responder=None, due_at=datetime.now(UTC),
+            acceptable_format="Verified observation", evidence_already_checked=[], hypothesis_impact="Test", automatic_fallback=True)
+        assert stored.version == version
+
+@pytest.mark.asyncio
+async def test_automatic_business_impact_can_still_request_a_person(sqlite_session_factory):
+    key = uuid4()
+    req = build_evidence_requirements(tenant_id="tenant-a", incident_id=key, rca_version=1,
+        missing_evidence=["business_impact"], now=datetime.now(UTC))[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([req])
+        result = await repo.create_human_evidence_request(tenant_id="tenant-a", incident_id=key,
+            requirement_id=req.requirement_id, expected_responder="owner@example.com", due_at=datetime.now(UTC),
+            acceptable_format="Verified observation", evidence_already_checked=[], hypothesis_impact="Test", automatic_fallback=True)
+        assert result.status == "pending"
+
+@pytest.mark.asyncio
+async def test_workspace_activity_can_read_current_requirements_without_replaying_history(sqlite_session_factory):
+    key = uuid4(); now = datetime.now(UTC)
+    old = build_evidence_requirements(tenant_id="tenant-a", incident_id=key, rca_version=1, missing_evidence=["logs"], now=now)[0]
+    current = build_evidence_requirements(tenant_id="tenant-a", incident_id=key, rca_version=2, missing_evidence=["logs"], now=now)[0]
+    async with sqlite_session_factory() as session:
+        repo = ContextEnrichmentRepository(session)
+        for req in [old, current]:
+            await repo.upsert_context_evidence_requirements([req])
+            await repo.schedule_context_enrichment_job(tenant_id="tenant-a", incident_id=key,
+                requirement_id=req.requirement_id, connector_id="discovery-mcp", query_payload={},
+                observation_start=now-timedelta(minutes=15), observation_end=now)
+            await repo.create_human_evidence_request(tenant_id="tenant-a", incident_id=key,
+                requirement_id=req.requirement_id, expected_responder="owner@example.com", due_at=now,
+                acceptable_format="Observation", evidence_already_checked=[], hypothesis_impact="Test")
+        all_activity = await repo.list_context_enrichment_activity(tenant_id="tenant-a", incident_id=key)
+        active = await repo.list_context_enrichment_activity(tenant_id="tenant-a", incident_id=key,
+            requirement_ids=[str(current.requirement_id)])
+        assert len(all_activity["jobs"]) == len(all_activity["human_requests"]) == 2
+        assert [item["requirement_id"] for item in active["jobs"]] == [str(current.requirement_id)]
+        assert [item["requirement_id"] for item in active["human_requests"]] == [str(current.requirement_id)]
+        assert await repo.list_context_enrichment_activity(tenant_id="tenant-a", incident_id=key, requirement_ids=[]) == {"jobs": [], "human_requests": []}

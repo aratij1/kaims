@@ -78,8 +78,28 @@ def ensure_checksum_column(cursor) -> None:  # noqa: ANN001
 
 
 def already_applied(cursor) -> dict[str, str | None]:  # noqa: ANN001
-    cursor.execute("SELECT filename, checksum_sha256 FROM schema_migrations")
+    """Read migration state without creating or upgrading tracking tables."""
+    cursor.execute("SHOW TABLES LIKE 'schema_migrations'")
+    if cursor.fetchone() is None:
+        return {}
+    cursor.execute("SHOW COLUMNS FROM schema_migrations LIKE 'checksum_sha256'")
+    checksum = "checksum_sha256" if cursor.fetchone() is not None else "NULL"
+    cursor.execute(f"SELECT filename, {checksum} FROM schema_migrations")
     return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+def validate_applied_checksums(files: list[Path], applied: dict[str, str | None]) -> None:
+    changed = [
+        path.name
+        for path in files
+        if path.name in applied and not is_acceptable_checksum(path.name, applied[path.name], migration_checksum(path))
+    ]
+    if changed:
+        raise RuntimeError(
+            "Applied migration checksum mismatch: "
+            + ", ".join(changed)
+            + ". Restore the applied file and add a forward migration."
+        )
 
 
 def migration_checksum(path: Path) -> str:
@@ -108,8 +128,7 @@ def apply_migration(cursor, path: Path) -> None:  # noqa: ANN001
         while cursor.nextset():
             pass
     cursor.execute(
-        "INSERT INTO schema_migrations (filename, checksum_sha256) VALUES (%s, %s) "
-        "ON DUPLICATE KEY UPDATE checksum_sha256=VALUES(checksum_sha256)",
+        "INSERT INTO schema_migrations (filename, checksum_sha256) VALUES (%s, %s)",
         (path.name, migration_checksum(path)),
     )
 
@@ -152,48 +171,48 @@ def main() -> None:
         client_flag=CLIENT.MULTI_STATEMENTS,
         autocommit=True,
     )
+    locked = False
+    lock_name = "kaims:migrations:" + hashlib.sha256(connection_kwargs["database"].encode()).hexdigest()[:40]
     try:
         with connection.cursor() as cursor:
+            if not args.dry_run:
+                cursor.execute("SELECT GET_LOCK(%s, 0)", (lock_name,))
+                locked = bool(cursor.fetchone()[0] == 1)
+                if not locked:
+                    raise RuntimeError("Another database migration runner holds the migration lock")
+            applied = already_applied(cursor)
+            validate_applied_checksums(files, applied)
+            pending = [path for path in files if path.name not in applied]
+            if args.dry_run:
+                for path in pending:
+                    print(f"  {path.name}")
+                print(f"Dry run: {len(pending)} pending migration(s); no schema or tracking rows changed.")
+                return
+            cursor.execute("SET SESSION lock_wait_timeout=10")
             cursor.execute(_CREATE_TRACKING_TABLE)
             ensure_checksum_column(cursor)
             if ensure_baseline_schema(cursor):
                 print(f"Applied fresh database baseline: {BASE_SCHEMA_PATH.name}")
-            applied = already_applied(cursor)
-
-            # Update existing rows to normalized checksums
+            # Only known legacy markers may be materialized. A real content
+            # checksum mismatch was rejected before any schema/data mutation.
             for path in files:
-                if path.name in applied:
-                    current_chk = migration_checksum(path)
-                    if applied[path.name] != current_chk:
-                        cursor.execute(
-                            "UPDATE schema_migrations SET checksum_sha256=%s WHERE filename=%s",
-                            (current_chk, path.name),
-                        )
-                        applied[path.name] = current_chk
-
-            pending = [path for path in files if path.name not in applied]
-            if not pending:
-                print(
-                    f"Up to date: {len(applied)} migration(s) already applied, nothing pending. "
-                    f"Schema version: {current_schema_version(files)}"
-                )
-                return
-
-            print(f"{len(pending)} pending migration(s) out of {len(files)} total:")
-            for path in pending:
-                print(f"  {path.name}")
-
-            if args.dry_run:
-                print("Dry run: no migrations applied.")
-                return
-
+                if path.name in applied and applied[path.name] != migration_checksum(path):
+                    cursor.execute(
+                        "UPDATE schema_migrations SET checksum_sha256=%s WHERE filename=%s",
+                        (migration_checksum(path), path.name),
+                    )
             for path in pending:
                 print(f"Applying {path.name} ...")
                 apply_migration(cursor, path)
                 print(f"Applied {path.name}")
             print(f"Schema version: {current_schema_version(files)}")
     finally:
-        connection.close()
+        try:
+            if locked:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT RELEASE_LOCK(%s)", (lock_name,))
+        finally:
+            connection.close()
 
 
 if __name__ == "__main__":

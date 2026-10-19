@@ -6,6 +6,17 @@ validation, and knowledge capture.
 
 ## Recommended local startup
 
+The production UI lives in `frontend/react`, backend services in `backend/src`,
+and investigation agents in `ai-workbench/src`. `replacement` is a separate
+prototype; `external` contains third-party demo applications. Neither is the
+production UI entry point.
+
+Keep generated test logs, screenshots and investigation reports under ignored
+`artifacts/`, rather than alongside architecture documents. To preview removal
+of reproducible Python caches, run `python scripts/clean_workspace.py`; add
+`--apply` to delete them. This command preserves application data, dependencies,
+operational evidence and temporary working scripts.
+
 KaiMS defaults to the `cloud-neutral` deployment profile. Provider services
 (Azure Service Bus/Monitor/OpenAI, AWS object storage, and GCP integrations)
 remain optional adapters and are activated only by an explicit profile or
@@ -16,18 +27,36 @@ python scripts/switch_service_profile.py --profile cloud-neutral --env-file .env
 ```
 
 Use the lean runtime for normal operation. It preserves the end-to-end incident
-and learning workflow while reducing the default Compose topology from 39 to 22
-services:
+and learning workflow using an explicit set of core services, metric exporters,
+and trace collection:
 
 ```powershell
 .\scripts\start-kaims.ps1
 ```
 
-The launcher starts an explicit 21-service runtime, builds one image at a time,
-checks Docker Desktop capacity, and waits for the UI health endpoint. Do not use
+The launcher starts the core runtime, builds one image at a time,
+checks Docker Desktop capacity, and waits for the UI and authentication API. Do not use
 an unscoped `docker compose up -d --build` on an 8 GB Docker Desktop instance;
 that can start optional observability, authoring, demo, and compatibility
 services together and exhaust the daemon.
+
+Impact assessment is enabled independently of remediation model generation through
+`RESOLUTION_IMPACT_ANALYSIS_ENABLED` (default `true`). An assessment still needs
+corroborated incident-window evidence before it can establish observed impact.
+
+Resolution events also request an assisted remedy through the internal
+`/resolution-catalog/assist` endpoint. When current persisted evidence is ready
+and exactly one certified, exact-service runbook matches, KaiMS compiles a bound
+execution plan even if automatic execution is disabled. The plan then awaits
+human approval through the existing approval workflow. Unattended execution still
+requires explicit tenant/environment/service authorization and all policy gates.
+Ambiguous remedies, missing evidence, or blocked compilation remain review work;
+human approval does not bypass those checks. Recovery still requires independent
+validation after execution. The `/resolution-catalog/auto-select` endpoint retains
+its stricter automatic-only behavior.
+The independent monitoring stack starts with the launcher; demo application
+stacks have separate lifecycles. Restarting collection cannot recover historical
+metrics or traces that have already expired from source retention.
 
 Rebuild only the UI with bounded Docker pressure:
 
@@ -40,6 +69,52 @@ available as opt-in profiles. See
 [`docs/operations/deployment-profiles.md`](docs/operations/deployment-profiles.md).
 
 ## Demo Guide
+
+Automatic execution requires both `RESOLUTION_AUTO_EXECUTION_ENABLED=true` and
+`RESOLUTION_AUTO_EXECUTION_TARGETS` containing exact `tenant/environment/service`
+strings (a JSON list). The default list is empty; wildcard grants are rejected.
+The approval service dispatches eligible persisted recommendations to the internal
+automatic selector. Only one certified, successful tenant runbook with low risk,
+rollback and validation steps can proceed, and current RCA, evidence, plan
+bindings and approval checks still apply. Missing evidence or an ambiguous
+runbook keeps the incident awaiting human action.
+
+Missing evidence starts collection work. Unclassified RCA questions retain their
+original review requirement and launch scoped metrics, logs, deployment and
+topology discovery jobs. Reconciliation refreshes onboarded sources for the
+incident's tenant and application, and resumes collection when a source becomes
+available even if a requirement was awaiting a person. Existing active jobs and
+exhausted sources are not duplicated. Collected records must still pass source,
+tenant and incident-window checks before supporting RCA or automatic execution.
+
+Collection uses independent workers for fair incident scheduling, retries,
+abandoned leases and operator priority. Slow source calls do not hold an entire
+batch. Fair scheduling uses each tenant/incident's last attempted collection;
+closed incidents do not consume collector capacity. Claims retain database row
+locks and leases, with retries for transient MySQL deadlocks.
+
+Administrators and HITL approvers can send
+`POST /incidents/{incident_id}/context-collection/prioritize` with a JSON
+`comment` explaining the request. The gateway supplies the authenticated tenant
+and actor. The request is audited; follow-up jobs inherit priority for 15 minutes.
+It does not approve remediation or relax evidence checks.
+
+Run a real, isolated automatic repair qualification with Docker running:
+
+```powershell
+.venv\Scripts\python.exe scripts/qualify_automatic_remediation.py --port 18504
+```
+
+This builds from the local `kaims-api-gateway:latest` image and starts a separate
+qualification project with its own broker, state and disposable HTTP target.
+The `replacement/kaims_next` workers observe a maintenance fault, authorize one
+repair under an exact, 15-minute policy, and require two fresh healthy checks.
+The script verifies HTTP 503 to 200, one repair, and durable policy authorization;
+it never submits a human approval or calls the repair endpoint itself. Reports
+are saved under `artifacts/automatic-remediation/`. This proves that isolated
+engine and connector path; qualification of a main-runtime production target
+still requires its own certified runbook and current evidence. Business and
+customer impact are not inferred from this fixture.
 
 - End user and executive demo script: [docs/DEMO_EXECUTIVE_AND_END_USER.md](docs/DEMO_EXECUTIVE_AND_END_USER.md)
 - Complete application flow (end-to-end + execution planning): [docs/COMPLETE_APPLICATION_FLOW.md](docs/COMPLETE_APPLICATION_FLOW.md)

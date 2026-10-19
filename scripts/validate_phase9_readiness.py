@@ -45,7 +45,7 @@ def validate(root: Path) -> list[str]:
         "backend/src/common/common/capability_registry.py",
         "backend/src/common/common/operational_models.py",
         "backend/src/connector-hub/app.py",
-        "frontend/react/src/routes/incidents/IncidentDecisionWorkspace.tsx",
+        "frontend/react/src/features/incidents/IncidentCommand.tsx",
     )
     for relative in required_files:
         if not (root / relative).is_file():

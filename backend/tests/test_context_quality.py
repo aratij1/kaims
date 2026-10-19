@@ -274,3 +274,12 @@ def test_connector_plan_requests_bounded_local_evidence_for_latency() -> None:
 
     assert "local-evidence" in selected
     assert "bounded_local_evidence_requested" in reasons
+
+def test_empty_topology_placeholders_are_not_evidence() -> None:
+    context = make_context()
+    context.deployment = None
+    context.dependency_services = []
+    context.cmdb = {'dependencies': []}
+    context.kubernetes = {}
+    governed = govern_context(context, tenant_id='tenant-a', subject_fingerprint=context_subject_fingerprint(context.alert, 'tenant-a'))
+    assert not governed.metadata['context_evidence'].get('topology')

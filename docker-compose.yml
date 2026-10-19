@@ -1,4 +1,6 @@
 x-service-env: &service-env
+  DEMO_ALERT_INGESTION_TARGETS: ${DEMO_ALERT_INGESTION_TARGETS:-[]}
+  REMEDIATION_COMPOSE_TARGETS: ${REMEDIATION_COMPOSE_TARGETS:-}
   KAIMS_RELEASE_SHA: ${KAIMS_RELEASE_SHA:-dev}
   KAIMS_BUILD_TIME: ${KAIMS_BUILD_TIME:-unknown}
   KAIMS_REQUIRE_RELEASE_PROVENANCE: ${KAIMS_REQUIRE_RELEASE_PROVENANCE:-false}
@@ -24,6 +26,7 @@ x-service-env: &service-env
   DB_MAX_OVERFLOW: ${SHARED_DB_MAX_OVERFLOW:-6}
   JWT_SECRET_KEY: ${JWT_SECRET_KEY:-kaiops-local-demo-secret-key-change-me}
   AUTH_MODE: ${AUTH_MODE:-local}
+  RESOLUTION_AUTO_EXECUTION_TARGETS: ${RESOLUTION_AUTO_EXECUTION_TARGETS:-[]}
   OIDC_ISSUER: ${OIDC_ISSUER:-}
   OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
   OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
@@ -170,11 +173,14 @@ x-service-env: &service-env
   MESSAGE_BUS_STREAM_THRESHOLD: ${MESSAGE_BUS_STREAM_THRESHOLD:-250}
   MESSAGE_BUS_DEFAULT_PROVIDER: ${MESSAGE_BUS_DEFAULT_PROVIDER:-rabbitmq}
   MESSAGE_BUS_WORKER_COUNT: ${MESSAGE_BUS_WORKER_COUNT:-1}
+  ALERT_PROCESSING_LIMIT_ENABLED: "true"
+  ALERT_PROCESSING_LIMIT: "50"
   # Startup repair is observable but non-mutating by default. Set to apply
   # only after reviewing candidates; even apply replays proof-qualified work.
   CLOSURE_RECONCILIATION_MODE: ${CLOSURE_RECONCILIATION_MODE:-apply}
   CLOSURE_RECONCILIATION_BATCH_SIZE: ${CLOSURE_RECONCILIATION_BATCH_SIZE:-100}
   CLOSURE_RECONCILIATION_INTERVAL_SECONDS: ${CLOSURE_RECONCILIATION_INTERVAL_SECONDS:-15}
+  OUTBOX_SNAPSHOT_REFERENCES_ENABLED: ${OUTBOX_SNAPSHOT_REFERENCES_ENABLED:-false}
   RESOLUTION_OUTBOX_BATCH_SIZE: ${RESOLUTION_OUTBOX_BATCH_SIZE:-100}
   RESOLUTION_OUTBOX_POLL_SECONDS: ${RESOLUTION_OUTBOX_POLL_SECONDS:-5}
   RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS: ${RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS:-60}
@@ -269,7 +275,7 @@ services:
     command:
       - "--max-connections=${MYSQL_MAX_CONNECTIONS:-450}"
       - "--sort-buffer-size=${MYSQL_SORT_BUFFER_SIZE:-2097152}"
-      - "--binlog-expire-logs-seconds=${MYSQL_BINLOG_RETENTION_SECONDS:-259200}"
+      - "--binlog-expire-logs-seconds=${MYSQL_BINLOG_RETENTION_SECONDS:-86400}"
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-kaiops}
@@ -292,7 +298,7 @@ services:
       <<: *service-env
       SERVICE_NAME: mysql-retention
     working_dir: /app
-    command: ["python", "/app/scripts/manage_mysql_retention.py", "--execute", "--daemon", "--archive-dir", "/archives"]
+    command: ["python", "/app/scripts/manage_mysql_retention.py", "--execute", "--daemon", "--interval-seconds", "3600", "--archive-dir", "/archives"]
     volumes:
       - ./scripts/manage_mysql_retention.py:/app/scripts/manage_mysql_retention.py:ro
       - ./backend/retention-archives:/archives
@@ -673,6 +679,10 @@ services:
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/connector-hub
     ports: ["8028:8000"]
+    depends_on:
+      migrations: { condition: service_completed_successfully }
+      rabbitmq: { condition: service_healthy }
+      redis: { condition: service_healthy }
 
   discovery-service:
     build: *service-build
@@ -958,6 +968,9 @@ services:
       - ${KAI_OPS_TICKET_SAMPLE_PATH:-./backend/ingested_alerts}:/data/tickets:ro
     depends_on:
       docker-socket-proxy: { condition: service_started }
+      migrations: { condition: service_completed_successfully }
+      rabbitmq: { condition: service_healthy }
+      redis: { condition: service_healthy }
 
   # Exposes a *read-only, containers-only* view of the Docker API over TCP so discovery-mcp
   # never touches /var/run/docker.sock directly. A raw socket mount (even with ":ro" on the
@@ -1024,11 +1037,13 @@ services:
       # worker must still have time to persist deterministic fallback output
       # and acknowledge the event after a provider timeout.
       LLM_REQUEST_TIMEOUT_SECONDS: ${RESOLUTION_LLM_REQUEST_TIMEOUT_SECONDS:-45}
-      RABBITMQ_HANDLER_TIMEOUT_SECONDS: ${RESOLUTION_HANDLER_TIMEOUT_SECONDS:-180}
+      # Allow the bounded investigation plus RCA and impact calls, with time
+      # remaining to persist the outcome and acknowledge the delivery.
+      RABBITMQ_HANDLER_TIMEOUT_SECONDS: ${RESOLUTION_HANDLER_TIMEOUT_SECONDS:-240}
       MESSAGE_BUS_WORKER_COUNT: ${RESOLUTION_AGENT_WORKER_COUNT:-2}
-      # RCA is the synchronous model call. Impact and remediation use the
-      # evidence-aware deterministic path by default, avoiding two serialized
-      # provider round trips; opt in only for investigations that need them.
+      # Assess impact independently from optional remediation generation.
+      # Disabling deep analysis must not silently disable impact assessment.
+      RESOLUTION_IMPACT_ANALYSIS_ENABLED: ${RESOLUTION_IMPACT_ANALYSIS_ENABLED:-true}
       RESOLUTION_DEEP_ANALYSIS_ENABLED: ${RESOLUTION_DEEP_ANALYSIS_ENABLED:-false}
       RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED: ${RESOLUTION_ITERATIVE_INVESTIGATION_ENABLED:-true}
       # The investigator can require all ten bounded evidence planes. Keep the

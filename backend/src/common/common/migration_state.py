@@ -61,12 +61,7 @@ async def inspect_schema_compatibility(connection: AsyncConnection) -> dict[str,
             applied_chk = applied[name]
             legacy_hash = hashlib.sha256(name.encode("utf-8")).hexdigest()
             if applied_chk and applied_chk != checksum and applied_chk != legacy_hash:
-                # If migration file was patched to fix a constraint/NULL bug on pre-existing DB,
-                # reconcile the checksum in schema_migrations.
-                await connection.execute(
-                    text("UPDATE schema_migrations SET checksum_sha256 = :chk WHERE filename = :fname"),
-                    {"chk": checksum, "fname": name},
-                )
+                changed.append(name)
     applied_known = [name for name in expected if name in applied and name not in changed]
     applied_version = Path(applied_known[-1]).stem if applied_known else "unversioned"
     return {

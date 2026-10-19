@@ -46,3 +46,11 @@ def test_clean_schema_reports_nothing() -> None:
     missing_tables, missing_columns, extra_columns = diff_schema(modeled, live)
 
     assert (missing_tables, missing_columns, extra_columns) == ([], {}, {})
+
+
+def test_detects_missing_composite_uniqueness_even_when_each_column_is_indexed():
+    from scripts.check_schema_drift import diff_unique_keys
+
+    modeled = {"incidents": {("tenant_id", "id")}}
+    assert diff_unique_keys(modeled, {"incidents": {("id",)}}) == modeled
+    assert diff_unique_keys(modeled, {"incidents": {("tenant_id", "id")}}) == {}

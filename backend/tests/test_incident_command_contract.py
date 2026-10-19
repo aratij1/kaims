@@ -3,6 +3,29 @@ from common.incident_command_contract import build_incident_command_workspace
 from pydantic import ValidationError
 
 
+def test_overview_defers_raw_reports_without_mutating_evidence_or_readiness():
+    import copy
+    incident = {"incident_id": "incident-1", "context": {"metadata": {
+        "context_evidence": {"logs": [{"message": "durable evidence"}]},
+        "investigation_report": {"raw": "large report"}, "context_collected_at": "2026-10-17",
+    }}, "recommendation": {"metadata": {
+        "iterative_investigation": {"raw": "large report"},
+        "rca_analysis": {"status": "insufficient_evidence"}, "execution_plan": {"status": "blocked"},
+    }}}
+    original = copy.deepcopy(incident)
+    full = build_incident_command_workspace(incident_id="incident-1", incident=incident, operations={"incident_id": "incident-1"})
+    brief = build_incident_command_workspace(
+        incident_id="incident-1", incident=incident, operations={"incident_id": "incident-1"}, include_source_records=False,
+    )
+    assert incident == original
+    assert full.incident["context"]["metadata"]["context_evidence"] == original["context"]["metadata"]["context_evidence"]
+    assert brief.incident["context"]["metadata"] == {"context_collected_at": "2026-10-17"}
+    assert brief.incident["recommendation"]["metadata"] == {
+        "rca_analysis": {"status": "insufficient_evidence"}, "execution_plan": {"status": "blocked"},
+    }
+    assert brief.evidence == full.evidence
+
+
 def test_command_workspace_composes_matching_read_models() -> None:
     workspace = build_incident_command_workspace(
         incident_id="incident-1",
@@ -178,3 +201,34 @@ def test_command_preserves_distinct_and_projection_only_evidence():
         incident_id="incident-1", incident=incident, operations={"incident_id": "incident-1"},
     )
     assert command.incident == incident
+
+
+@pytest.mark.parametrize('field', ['recommendation_id', 'context_snapshot_id'])
+def test_command_rejects_mixed_recommendation_generations(field):
+    incident = {'incident_id': 'i', 'recommendation_id': 'r', 'recommendation': {'id': 'r', 'metadata': {'context_snapshot_id': 's'}}}
+    binding = {'recommendation_id': 'r', 'context_snapshot_id': 's'}
+    binding[field] = 'another-generation'
+    with pytest.raises(ValidationError, match='does not match command operations'):
+        build_incident_command_workspace(incident_id='i', incident=incident,
+            operations={'incident_id': 'i', 'investigation_workspace': {'binding': binding}})
+
+
+def test_command_allows_new_context_without_relabelling_frozen_rca():
+    command = build_incident_command_workspace(incident_id='i',
+        incident={'incident_id':'i', 'recommendation_id':'r', 'recommendation':{'id':'r', 'metadata':{'context_snapshot_id':'frozen'}}},
+        operations={'incident_id':'i','context':{'snapshot_id':'new'}, 'investigation_workspace':{'binding':{'recommendation_id':'r','context_snapshot_id':'frozen'}}})
+    assert not command.evidence.binding_consistent
+    assert command.evidence.bound_snapshot_id == 'frozen'
+
+
+def test_compact_workspace_omits_debug_packages_but_preserves_execution_and_binding():
+    metadata={'context_package':{'raw':'x'*10000}, 'context_graph':{'edges':['x']},
+        'rag_index':{'debug':'x'}, 'model_calls':[{'payload':'x'*1000}],
+        'candidate_execution_plan':{'commands':['draft']},'model_proposed_execution_plan':{'commands':['draft']},
+        'execution_plan':{'execution_ready':False},'context_snapshot_id':'snapshot-1'}
+    incident={'incident_id':'i','recommendation':{'metadata':metadata},'context':{'metadata':metadata}}
+    compact=build_incident_command_workspace(incident_id='i',incident=incident,operations={'incident_id':'i'},include_source_records=False)
+    full=build_incident_command_workspace(incident_id='i',incident=incident,operations={'incident_id':'i'})
+    assert compact.incident['recommendation']['metadata']=={'execution_plan':{'execution_ready':False},'context_snapshot_id':'snapshot-1'}
+    assert full.incident['recommendation']['metadata']==metadata
+    assert 'model_calls' in metadata

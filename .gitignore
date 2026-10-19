@@ -56,3 +56,15 @@ docs/architecture/*.stderr.log
 
 # Local database retention archives contain operational evidence.
 backend/retention-archives/
+backend/host-evidence/
+config/disk-attribution.local.json
+# Local caches and downloaded third-party checkouts
+/pytest-cache-files-*/
+/external/
+*.pem
+*.pfx
+*.p12
+
+# Machine-specific integration settings and runtime state
+replacement/telemetry-sources.local.json
+backend/ingested_alerts/jira_admission_state.json

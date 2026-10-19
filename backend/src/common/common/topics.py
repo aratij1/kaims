@@ -3,6 +3,13 @@ JIRA_INVESTIGATIONS = "jira-investigations"
 ENRICHED_ALERTS = "enriched-alerts"
 ORCHESTRATION_EVENTS = "orchestration-events"
 CONTEXT_EVENTS = "context-events"
+INITIAL_CONTEXT_EVENTS = "context-initial-events"
+
+
+def context_delivery_topic(metadata: dict) -> str:
+    """Keep first investigations out of the background enrichment FIFO."""
+    return INITIAL_CONTEXT_EVENTS if metadata.get("context_delivery_lane") == "initial" else CONTEXT_EVENTS
+
 CODE_ANALYSIS_EVENTS = "code-analysis-events"
 RESOLUTION_EVENTS = "resolution-events"
 APPROVAL_EVENTS = "approval-events"

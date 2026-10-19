@@ -8,7 +8,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from ai_workbench_common.models import Context
-from common.context_enrichment_contract import EvidenceRequirement, build_evidence_requirements
+from common.context_enrichment_contract import EvidenceRequirement, discovery_evidence_requirements as build_evidence_requirements
 from common.incident_contracts import ContextPackage
 from common.models import EvidenceReference
 
@@ -367,6 +367,14 @@ def _context_material(context: Context, buckets: dict[str, list[dict[str, Any]]]
     }
 
 
+def _has_context_fact(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(_has_context_fact(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_context_fact(item) for item in value)
+    return value is not None and value != ""
+
+
 def assess_context(context: Context, *, now: datetime | None = None, threshold: float = 0.70) -> dict[str, Any]:
     now = now or utc_now()
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
@@ -380,7 +388,7 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
     present = {
         "identity": bool(str(context.alert.service or "").strip() and str(context.alert.service).lower() != "unknown"),
         "signal": bool(context.observability or buckets.get("logs") or buckets.get("telemetry") or buckets.get("database")),
-        "topology": bool(context.cmdb or context.kubernetes or context.dependency_services or context.deployment),
+        "topology": _has_context_fact([context.cmdb, context.kubernetes, context.dependency_services, context.deployment]),
         "causal": bool(context.recent_changes or buckets.get("changes") or buckets.get("deployments") or buckets.get("tickets") or buckets.get("code")),
         "action": bool(context.runbook or buckets.get("rag")),
     }
@@ -582,7 +590,7 @@ def govern_context(
         "dependencies": result.dependency_services,
         "deployment": result.deployment,
     }
-    if any(topology.values()):
+    if _has_context_fact(topology):
         combined.setdefault("topology", []).append(
             {
                 "source": "topology",
@@ -639,6 +647,9 @@ def govern_context(
                 continue
             seen.add(identity)
             ranked.append(item)
+        # Several raw source names share a canonical plane (e.g. dependency
+        # and CMDB are topology). Preserve them instead of overwriting facts.
+        ranked.extend(normalised.get(bucket, []))
         ranked.sort(
             key=lambda item: (
                 _clamp(item.get("freshness_score")),

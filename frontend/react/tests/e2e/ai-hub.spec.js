@@ -35,7 +35,7 @@ test("AI Hub presents health, capabilities, and accessible section navigation", 
   await expect(page.getByRole("tab", { name: "Agent activity" })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByRole("heading", { name: "Observed agent activity" })).toBeVisible();
   await page.getByRole("tab", { name: "Knowledge development" }).click();
-  await expect(page.getByRole("heading", { name: "Periodic knowledge development" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Resolution learning lifecycle" })).toBeVisible();
   await page.getByRole("tab", { name: "Pipeline queues" }).click();
   await expect(page.getByRole("heading", { name: "Pipeline Queue Manager" })).toBeVisible();
   await page.getByRole("tab", { name: "Topology", exact: true }).click();
@@ -49,9 +49,10 @@ test("AI Hub overview shows real AI provider health data", async ({ page }) => {
       contentType: "application/json",
       body: JSON.stringify({
         data: {
+          selected: {}, prompt_cache: {},
           providers: {
-            "azure-openai": { configured: true, healthy: true, circuit_open: false, model: "gpt-4o" },
-            "claude": { configured: false, healthy: true, circuit_open: false, model: "claude-sonnet-4-6", reason: "ANTHROPIC_API_KEY is not configured" },
+            "azure-openai": { configured: true, healthy: true, circuit_open: false, failure_count: 0, model: "gpt-4o" },
+            "claude": { configured: false, healthy: true, circuit_open: false, failure_count: 0, model: "claude-sonnet-4-6", reason: "ANTHROPIC_API_KEY is not configured" },
           },
         },
       }),

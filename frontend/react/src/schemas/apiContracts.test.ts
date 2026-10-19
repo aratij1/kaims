@@ -130,6 +130,13 @@ describe("internal API contract registry", () => {
       schema_version: "kaiops.operations-state.v1",
       incident_id: incidentId,
       lifecycle_state: "RCA_READY",
+      validation: {
+        report_id: null, status: "closed", closure_kind: "recovery", validation_checksum: "sha256:recorded",
+        action_id: null, health_restored: true, alerts_cleared: true, details: {}, updated_at: null,
+        pre_state_observations: [], post_state_observations: [{validator_id: "availability", passed: true}],
+        observation_window: {elapsed_seconds: 338.818, required_seconds: 300},
+        outcome_decision: {closure_authorized: true}, knowledge_draft: null,
+      },
       context: {}, investigation: {}, requirements: [], requirement_history: [],
       resolution: {}, approval: {}, updated_at: "2026-09-01T10:00:00Z",
     };

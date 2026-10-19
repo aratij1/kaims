@@ -1,0 +1,70 @@
+import { expect, test } from '@playwright/test';
+
+test.skip(!process.env.KAIOPS_LIVE_E2E, 'Requires generated documents on the live local stack');
+
+test('View opens the selected operational document above the table and supports keyboard dismissal', async ({ page }, testInfo) => {
+  test.setTimeout(90000);
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/knowledge');
+  await page.getByLabel('Username').fill(process.env.KAIOPS_E2E_USERNAME || 'admin');
+  await page.getByLabel('Password').fill(process.env.KAIOPS_E2E_PASSWORD || 'Admin@123456');
+  await page.getByRole('button', { name: /sign in/i }).click();
+  await page.getByRole('tab', { name: 'Knowledge development', exact: true }).click();
+  await page.getByRole('tab', { name: /^Documents/ }).click();
+  const panel = page.locator('.development-record-panel').filter({ has: page.getByRole('heading', { name: 'Generated operational documents', exact: true }) });
+  const row = panel.getByRole('row').nth(1);
+  const view = row.getByRole('button', { name: 'View', exact: true });
+  await expect(view).toBeVisible({ timeout: 30000 });
+  const title = await row.locator('.knowledge-document-link strong').innerText();
+  await view.click();
+  const reader = page.getByRole('dialog', { name: title, exact: true });
+  await expect(reader).toBeVisible();
+  await expect(reader.locator('.knowledge-document-body pre')).not.toBeEmpty();
+  await expect(reader.getByRole('button', { name: 'Close document' })).toBeFocused();
+  const bounds = await reader.boundingBox();
+  expect(bounds.y).toBeGreaterThanOrEqual(0);
+  expect(bounds.y + bounds.height).toBeLessThanOrEqual(page.viewportSize().height + 1);
+  await page.screenshot({ path: testInfo.outputPath('document-reader-desktop.png') });
+  await page.keyboard.press('Escape');
+  await expect(reader).toHaveCount(0);
+  await expect(view).toBeFocused();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await row.locator('.knowledge-document-link').click();
+  await expect(reader).toBeVisible();
+  await expect(reader.locator('.knowledge-document-body pre')).not.toBeEmpty();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath('document-reader-mobile.png') });
+  await reader.getByRole('button', { name: 'Close document' }).click();
+  await expect(reader).toHaveCount(0);
+  expect(errors).toEqual([]);
+});
+
+
+test('outcomes and learning audit provide working document access', async ({page}) => {
+  test.setTimeout(90000);
+  await page.goto('/knowledge');
+  await page.getByLabel('Username').fill(process.env.KAIOPS_E2E_USERNAME || 'admin');
+  await page.getByLabel('Password').fill(process.env.KAIOPS_E2E_PASSWORD);
+  await page.getByRole('button',{name:/sign in/i}).click();
+  await page.getByRole('tab',{name:'Knowledge development',exact:true}).click();
+  await page.getByRole('tab',{name:/^Outcomes/}).click();
+  await page.getByRole('button',{name:'Open generated documents',exact:true}).click();
+  await expect(page.getByRole('tab',{name:/^Documents/})).toHaveAttribute('aria-selected','true');
+  const documents=page.locator('.development-record-panel').filter({has:page.getByRole('heading',{name:'Generated operational documents',exact:true})});
+  await documents.getByRole('button',{name:'View',exact:true}).first().click();
+  await expect(page.getByRole('dialog').locator('.knowledge-document-body pre')).not.toBeEmpty();
+  await page.keyboard.press('Escape');
+  await page.getByRole('tab',{name:/^Outcomes/}).click();
+  const audit=page.locator('article.panel').filter({has:page.getByRole('heading',{name:'Learning audit integrity',exact:true})});
+  await audit.getByRole('button',{name:'View audit',exact:true}).first().click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByRole('dialog').locator('pre')).toContainText('event_id');
+  await page.keyboard.press('Escape');
+  await audit.getByRole('button',{name:'Open runbook',exact:true}).first().click();
+  await expect(page.getByRole('dialog').locator('pre')).not.toBeEmpty();
+  await page.keyboard.press('Escape');
+  await page.getByRole('tab',{name:/^Resolution catalog/}).click();
+  await page.getByRole('button',{name:'View runbook',exact:true}).first().click();
+  await expect(page.getByRole('dialog').locator('pre')).not.toBeEmpty();
+});

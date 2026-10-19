@@ -1,5 +1,5 @@
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from closure_service.validation import ClosureValidationAgent
@@ -244,7 +244,8 @@ async def test_duplicate_delivery_records_learning_once(sqlite_session_factory, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active", [True, False])
-async def test_manual_close_checks_lifecycle_before_jira(sqlite_session_factory, monkeypatch, active):
+@pytest.mark.parametrize("publish_failure", [True, False])
+async def test_manual_close_checks_lifecycle_before_jira(sqlite_session_factory, monkeypatch, active, publish_failure):
     from unittest.mock import AsyncMock
 
     from fastapi import HTTPException
@@ -272,7 +273,7 @@ async def test_manual_close_checks_lifecycle_before_jira(sqlite_session_factory,
         await session.commit()
     jira = AsyncMock(return_value={"commented": True})
     monkeypatch.setattr(module, "_sync_closure_to_jira", jira)
-    monkeypatch.setattr(module, "_publish_closure_event", AsyncMock())
+    monkeypatch.setattr(module, "_publish_closure_event", AsyncMock(side_effect=RuntimeError("broker unavailable") if publish_failure else None))
     request = module.ManualClosureRequest(
         comment="Reviewed incident and accepted administrative disposition",
         actor_id="operator-1",
@@ -288,8 +289,34 @@ async def test_manual_close_checks_lifecycle_before_jira(sqlite_session_factory,
     else:
         result = await module.manual_close_incident(str(action.incident_id), request, "test-token")
         assert result["status"] == "closed"
+        assert result["event_delivery"] == ("queued" if publish_failure else "published")
         async with sqlite_session_factory() as session:
             stored = await IncidentRepository(session).get_incident(str(action.incident_id), tenant_id=action.tenant_id)
+            from common.repository import ContextEnrichmentRepository
+            operations = await ContextEnrichmentRepository(session).incident_operations_state(
+                tenant_id=action.tenant_id, incident_id=str(action.incident_id),
+            )
+            assert operations["validation"]["closure_kind"] == "manual"
+            assert operations["validation"]["status"] == "closed"
+            assert operations["validation"]["report_id"]
+            assert operations["validation"]["health_restored"] is False
+            assert operations["validation"]["alerts_cleared"] is False
+            assert await IncidentRepository(session).committed_non_execution_closure_report(
+                tenant_id="another-tenant", incident_id=action.incident_id,
+            ) is None
+            # Older administrative reports were incorrectly stored with the
+            # validation_failed default. Their committed closure still binds them.
+            legacy_report = await session.get(RcaReportRecord, UUID(operations["validation"]["report_id"]))
+            legacy_report.closure_status = "validation_failed"
+            await session.flush()
+            assert (await IncidentRepository(session).committed_non_execution_closure_report(
+                tenant_id=action.tenant_id, incident_id=action.incident_id,
+            )).id == legacy_report.id
+            legacy_operations = await ContextEnrichmentRepository(session).incident_operations_state(
+                tenant_id=action.tenant_id, incident_id=str(action.incident_id),
+            )
+            assert legacy_operations["validation"]["status"] == "closed"
+            assert legacy_operations["validation"]["health_restored"] is False
         assert stored["metadata"]["resolution_lifecycle"]["state"] == "closed"
         assert stored["metadata"]["resolution_lifecycle"]["validation"]["passed"] is False
 

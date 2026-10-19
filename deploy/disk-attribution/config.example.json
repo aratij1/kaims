@@ -1,0 +1,9 @@
+{
+  "tenant_id": "default",
+  "environment": "prod",
+  "host_id": "REPLACE_WITH_MONITORED_HOSTNAME",
+  "instance": "REPLACE_WITH_EXACT_ALERT_INSTANCE",
+  "device": "REPLACE_WITH_EXACT_ALERT_DEVICE",
+  "mountpoint": "REPLACE_WITH_EXACT_ALERT_MOUNTPOINT",
+  "host_mount": "/var/lib/docker"
+}
