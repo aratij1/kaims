@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import heapq
+import hmac
 import json
 import os
 import re
@@ -82,6 +83,7 @@ from monitoring_adapter.existing_monitoring import (
     mask_secrets,
     normalize_provider_name,
     verify_hmac_signature,
+    verify_webhook_token,
 )
 from monitoring_adapter.jira_admission import JiraAdmissionState
 from monitoring_adapter.jira_client import JiraClient, JiraClientError
@@ -4872,28 +4874,47 @@ async def _ingest_provider_alert(
     mappings: list[dict[str, Any]] = []
     expected_token = ""
     hmac_secret = ""
+    token_hashes: list[str] = []
+    hmac_required = False
     integration: dict[str, Any] | None = None
     if integration_id:
         async with session_factory() as session:
             repo = IncidentRepository(session)
             integration = await repo.get_monitoring_integration(integration_id)
-            if integration is not None:
+            if integration is not None and integration.get("active"):
                 mappings = await repo.list_monitoring_alert_mappings(integration_id)
+                endpoints = await repo.list_monitoring_webhook_endpoints(integration_id, provider)
+                token_hashes = [str(row["token_hash"]) for row in endpoints if row.get("token_hash")]
+                hmac_required = any(bool(row.get("hmac_enabled")) for row in endpoints)
                 config_payload = integration.get("config_payload") if isinstance(integration.get("config_payload"), dict) else {}
                 expected_token = str(config_payload.get("webhook_token") or "")
                 hmac_secret = str(config_payload.get("hmac_secret") or "")
 
-    auth_valid = True if not expected_token else (str(x_webhook_token or "") == expected_token)
+    token_configured = bool(expected_token or token_hashes)
+    provided_token = str(x_webhook_token or "")
+    auth_valid = not token_configured or (
+        hmac.compare_digest(provided_token, expected_token)
+        if expected_token
+        else any(verify_webhook_token(provided_token, token_hash) for token_hash in token_hashes)
+    )
     body_as_string = json.dumps(payload, sort_keys=True)
-    signature_valid = verify_hmac_signature(hmac_secret, body_as_string, x_signature)
-    verification_configured = bool(expected_token or hmac_secret)
+    signature_valid = (
+        verify_hmac_signature(hmac_secret, body_as_string, x_signature)
+        if hmac_secret
+        else not hmac_required
+    )
+    verification_configured = bool(token_configured or hmac_secret or hmac_required)
     event_mode = str(payload.get("event_mode") or payload.get("eventMode") or "real").strip().lower()
     synthetic = event_mode in {"synthetic", "test", "validation", "simulation"}
     authenticity = (
         "synthetic"
         if synthetic
         else "verified"
-        if integration is not None and verification_configured and auth_valid and signature_valid
+        if integration is not None
+        and integration.get("active")
+        and verification_configured
+        and auth_valid
+        and signature_valid
         else "unverified"
     )
 
@@ -5070,6 +5091,33 @@ async def ingest_generic_provider_alert(provider: str = "prometheus", integratio
         x_webhook_token=x_webhook_token,
         integration_id_hint=integration_id,
     )
+
+
+@app.post("/api/v1/tickets/jira")
+@app.post("/api/v1/alerts/jira")
+async def ingest_jira_webhook(
+    payload: dict = ALERT_BODY,
+    background_tasks: BackgroundTasks = None,
+    token: str | None = None,
+    x_webhook_token: str | None = Header(default=None),
+    x_trace_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Receive authenticated Jira webhooks before the generic provider route."""
+    if not JIRA_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Jira ingestion is not configured (JIRA_WEBHOOK_SECRET unset)")
+    provided_token = str(token or x_webhook_token or "").strip()
+    if not provided_token or provided_token != JIRA_WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid or missing Jira webhook token")
+
+    issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
+    if not isinstance(issue, dict):
+        raise HTTPException(status_code=400, detail="jira webhook payload must contain an issue object")
+    issue_key = str(issue.get("key") or "unknown-issue")
+    webhook_event = str(payload.get("webhookEvent") or "").strip()
+
+    background_tasks.add_task(_process_jira_webhook, payload, x_trace_id)
+    logger.info("received jira webhook event=%s issue=%s", webhook_event, issue_key)
+    return {"received": True, "webhookEvent": webhook_event, "ticket_id": issue_key}
 
 
 @app.post("/api/v1/alerts/{provider}")
@@ -5470,7 +5518,8 @@ async def create_human_evidence_jira_request(request: HumanEvidenceJiraRequest) 
         jira_version = str(issue.get("version") or fields.get("updated") or "") or None
         issue_url = f"{JIRA_API_BASE_URL.rstrip('/')}/browse/{quote(issue_key, safe='')}"
     except JiraClientError as exc:
-        raise HTTPException(status_code=502, detail="Jira rejected the governed evidence request") from exc
+        logger.warning("Jira rejected governed evidence request request_id=%s incident_id=%s: %s", request.request_id, request.incident_id, str(exc)[:200])
+        raise HTTPException(status_code=502, detail=f"Jira synchronization unavailable: {str(exc)[:200]}") from exc
     async with session_factory() as session:
         binding = await ContextEnrichmentRepository(session).bind_human_evidence_jira(
             tenant_id=request.tenant_id, incident_id=request.incident_id,
@@ -6121,47 +6170,6 @@ async def _process_jira_webhook(payload: dict[str, Any], trace_id: str | None) -
     _persist_alert_to_landing_pad(mapped_payload, payload, status="processed")
 
 
-@app.post("/api/v1/tickets/jira")
-@app.post("/api/v1/alerts/jira")
-async def ingest_jira_webhook(
-    payload: dict = ALERT_BODY,
-    background_tasks: BackgroundTasks = None,
-    token: str | None = None,
-    x_webhook_token: str | None = Header(default=None),
-    x_trace_id: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """Ingest a Jira issue-created/updated webhook into the same landing pad
-    pipeline Prometheus alerts use. Auth is a shared secret, checked via
-    either ?token=... or the X-Webhook-Token header — configured via
-    JIRA_WEBHOOK_SECRET. Fails closed: if the secret isn't configured, this
-    endpoint refuses all requests rather than accepting unverified webhooks.
-
-    Registered under both /api/v1/tickets/jira (original path) and
-    /api/v1/alerts/jira (the provider-webhook convention build_webhook_path()
-    uses for every other monitoring provider), so register-webhook's
-    auto-generated URL for the "jira" provider resolves to a real receiver.
-
-    Responds 200 immediately after basic validation; the actual alert build +
-    publish + landing-pad persistence happens in a background task so slow
-    downstream steps can't cause Jira to time out and retry the webhook.
-    """
-    if not JIRA_WEBHOOK_SECRET:
-        raise HTTPException(status_code=503, detail="Jira ingestion is not configured (JIRA_WEBHOOK_SECRET unset)")
-    provided_token = str(token or x_webhook_token or "").strip()
-    if not provided_token or provided_token != JIRA_WEBHOOK_SECRET:
-        raise HTTPException(status_code=401, detail="invalid or missing Jira webhook token")
-
-    issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
-    if not isinstance(issue, dict):
-        raise HTTPException(status_code=400, detail="jira webhook payload must contain an issue object")
-    issue_key = str(issue.get("key") or "unknown-issue")
-    webhook_event = str(payload.get("webhookEvent") or "").strip()
-
-    background_tasks.add_task(_process_jira_webhook, payload, x_trace_id)
-    logger.info("received jira webhook event=%s issue=%s", webhook_event, issue_key)
-    return {"received": True, "webhookEvent": webhook_event, "ticket_id": issue_key}
-
-
 @app.get("/alerts")
 async def alerts_help() -> dict[str, Any]:
     return {
@@ -6229,7 +6237,7 @@ async def get_recent_alerts(limit: int = 50, tenant_id: str | None = None) -> di
 
 def _compact_alert_row(row: dict[str, Any]) -> dict[str, Any]:
     fields = {
-        "id", "alert_id", "incident_id", "correlation_id", "trace_id",
+        "id", "alert_id", "incident_id", "correlation_id", "trace_id", "tenant_id",
         "fingerprint", "alert_fingerprint", "name", "alert_name", "service",
         "application", "project", "project_name", "environment", "source",
         "source_channel", "severity", "status", "alert_status", "description",
@@ -6245,17 +6253,24 @@ def _compact_alert_row(row: dict[str, Any]) -> dict[str, Any]:
         "alertname", "service", "job", "application", "project", "project_name",
         "environment", "severity", "fingerprint", "alert_fingerprint",
         "source_alert_id", "ticket_id", "ticket_key", "issue_key", "jira_issue_key",
+        "owner_team", "team",
     }
     compact["labels"] = {key: value for key, value in labels.items() if key in label_fields}
     compact["annotations"] = {
         key: value for key, value in annotations.items() if key in {"summary", "description"}
     }
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    if metadata:
+        meta_fields = {"owner_team", "team", "application", "project", "project_name"}
+        compact_meta = {key: value for key, value in metadata.items() if key in meta_fields and isinstance(value, str)}
+        if compact_meta:
+            compact["metadata"] = compact_meta
     return compact
 
 
 @app.get("/alerts/all")
 async def get_all_alerts(limit: int = 500, tenant_id: str | None = None, compact: bool = False) -> dict[str, Any]:
-    safe_limit = max(1, min(int(limit), 5000))
+    safe_limit = max(1, min(int(limit), 200))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
@@ -6282,7 +6297,7 @@ async def get_all_alerts(limit: int = 500, tenant_id: str | None = None, compact
 
 @app.get("/alerts/applications")
 async def get_alert_applications(limit: int = 5000, tenant_id: str = "default") -> dict[str, Any]:
-    safe_limit = max(1, min(int(limit), 10000))
+    safe_limit = max(1, min(int(limit), 200))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:
@@ -6816,7 +6831,7 @@ async def get_incident_metadata(
     service: str | None = None,
     incident_id: str | None = None,
 ) -> dict[str, Any]:
-    safe_limit = max(1, min(int(limit), 1000))
+    safe_limit = max(1, min(int(limit), 100))
     session_factory = getattr(app.state, "session_factory", None)
     if settings.database_enabled and session_factory is not None:
         async with session_factory() as session:

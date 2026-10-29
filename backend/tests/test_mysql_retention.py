@@ -41,10 +41,17 @@ def test_rejects_short_retention_and_unsafe_identifiers():
         retention.quote("table; DROP DATABASE")
 
 
+def _resolve_container(default_name: str, fallback_name: str) -> str:
+    for candidate in (default_name, fallback_name):
+        if subprocess.run(["docker", "inspect", candidate], capture_output=True, text=True).returncode == 0:
+            return candidate
+    return default_name
+
+
 @pytest.mark.skipif(os.getenv("MYSQL_RETENTION_INTEGRATION") != "1", reason="Explicit local Docker integration")
 def test_mysql_retention_preserves_live_data_references_and_event_identity(tmp_path):
     import inspect
-    info = json.loads(subprocess.check_output(["docker", "inspect", "kaims-mysql-1"], text=True))[0]
+    info = json.loads(subprocess.check_output(["docker", "inspect", _resolve_container("kaims-mysql-1", "kaims-latest-mysql-1")], text=True))[0]
     env = dict(entry.split("=", 1) for entry in info["Config"]["Env"] if "=" in entry)
     payload = {"password": env["MYSQL_ROOT_PASSWORD"], "source": Path(retention.__file__).read_text(),
                "exercise": inspect.getsource(_exercise_retention)}
@@ -61,7 +68,7 @@ with tempfile.TemporaryDirectory() as directory:
  _exercise_retention(conn,Path(directory))
 print('MySQL integration passed')
 """
-    result = subprocess.run(["docker", "exec", "-i", "kaims-api-gateway-1", "python", "-c", runner],
+    result = subprocess.run(["docker", "exec", "-i", _resolve_container("kaims-api-gateway-1", "kaims-latest-api-gateway-1"), "python", "-c", runner],
                             input=json.dumps(payload),text=True,capture_output=True,timeout=120)
     assert result.returncode == 0, result.stderr
 
@@ -129,7 +136,7 @@ def test_backup_restores_temporary_mysql_database(tmp_path):
     import hashlib
     import sys
     db = "retention_backup_test_" + uuid4().hex
-    command = ["docker", "exec", "-i", "kaims-mysql-1", "sh", "-c",
+    command = ["docker", "exec", "-i", _resolve_container("kaims-mysql-1", "kaims-latest-mysql-1"), "sh", "-c",
                'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot --batch --skip-column-names']
     def sql(statement):
         result = subprocess.run(command,input=statement,text=True,capture_output=True,timeout=60)
@@ -150,3 +157,186 @@ def test_backup_restores_temporary_mysql_database(tmp_path):
         assert sql("SELECT note FROM " + db + ".probe WHERE id=1").strip() == "backup-roundtrip"
     finally:
         sql("DROP DATABASE IF EXISTS " + db)
+
+
+
+def test_compact_alert_and_projection_payloads_preserve_identity_and_generated_column_paths(tmp_path):
+    alert_payload = {
+        "id": "alert-123",
+        "tenant_id": "tenant-a",
+        "source": "prometheus",
+        "name": "PaymentGatewayTimeout",
+        "service": "payments",
+        "environment": "prod",
+        "severity": "critical",
+        "status": "firing",
+        "description": "Upstream timeout",
+        "labels": {"project": "PROJ-1", "service": "payments", "env": "prod"},
+        "annotations": {"summary": "Gateway timeout"},
+        "metadata": {
+            "incident_id": "inc-123",
+            "deduplication": {
+                "canonical_incident_id": "inc-123",
+                "is_duplicate": True,
+                "matched_alert_ids": [f"alert-{i}" for i in range(25)],
+                "matches": [{"alert_id": f"alert-{i}", "description": "x" * 400} for i in range(25)],
+            },
+            "raw_payload": {"series": ["y" * 500 for _ in range(10)]},
+        },
+    }
+    alert_row = {
+        "id": "alert-123",
+        "tenant_id": "tenant-a",
+        "incident_id": "inc-123",
+        "payload": alert_payload,
+    }
+    alert_receipt = retention.archive_row(tmp_path, "alerts", alert_row)
+    compacted_alert = retention.compact_alert_payload(alert_payload, alert_receipt)
+
+    assert compacted_alert["retention_archive"]["schema"] == retention.MARKER
+    # Virtual generated column JSON paths on `alerts` must remain intact:
+    assert compacted_alert["labels"]["project"] == "PROJ-1"
+    assert compacted_alert["metadata"]["deduplication"]["canonical_incident_id"] == "inc-123"
+    assert compacted_alert["metadata"]["deduplication"]["matches_compacted_count"] == 25
+    assert compacted_alert["metadata"]["deduplication"]["matched_alert_ids_compacted_count"] == 25
+    assert "matches" not in compacted_alert["metadata"]["deduplication"]
+    assert "matched_alert_ids" not in compacted_alert["metadata"]["deduplication"]
+    assert "raw_payload" not in compacted_alert["metadata"]
+    assert len(json.dumps(compacted_alert)) < len(json.dumps(alert_payload))
+
+    projection_payload = {
+        "incident_id": "inc-123",
+        "alert_id": "alert-123",
+        "tenant_id": "tenant-a",
+        "service": "payments",
+        "environment": "prod",
+        "status": "closed",
+        "lifecycle_state": "closed",
+        "recommendation_id": "rec-123",
+        "jira_issue_key": "PAY-101",
+        "rca": {"root_cause": "Pool exhausted", "confidence": 0.91},
+        "recommendation": {"summary": "Increase pool size"},
+        "event_payload": {
+            "incident_id": "inc-123",
+            "alert_id": "alert-123",
+            "status": "closed",
+            "context_evidence": {"telemetry": [{"blob": "z" * 4000}]},
+            "discovery_evidence": {"logs": [{"blob": "w" * 4000}]},
+            "related_incidents": [{"id": f"rel-{i}", "notes": "n" * 500} for i in range(20)],
+            "context": {
+                "service": "payments",
+                "environment": "prod",
+                "metadata": {
+                    "alert_id": "alert-123",
+                    "project_id": "PROJ-1",
+                    "context_quality": {"score": 0.92, "reusable": True},
+                    "context_evidence": {"telemetry": [{"blob": "z" * 4000}]},
+                    "context_package": {"bundle": "b" * 4000},
+                    "prior_resolution": {
+                        "incident_id": "inc-prior",
+                        "summary": "Prior pool exhaustion fix",
+                        "confidence": 0.88,
+                        "metadata": {
+                            "iterative_investigation": {"rounds": ["r" * 8000 for _ in range(10)]},
+                        },
+                    },
+                },
+            },
+        },
+    }
+    proj_row = {
+        "incident_id": "inc-123",
+        "tenant_id": "tenant-a",
+        "status": "closed",
+        "projection_payload": projection_payload,
+    }
+    proj_receipt = retention.archive_row(tmp_path, "incident_projections", proj_row)
+    compacted_proj = retention.compact_projection_payload(projection_payload, proj_receipt)
+
+    assert compacted_proj["retention_archive"]["schema"] == retention.MARKER
+    assert compacted_proj["incident_id"] == "inc-123"
+    assert compacted_proj["jira_issue_key"] == "PAY-101"
+    assert compacted_proj["rca"]["root_cause"] == "Pool exhausted"
+    assert compacted_proj["event_payload"]["context"]["metadata"]["context_quality"]["score"] == 0.92
+    assert compacted_proj["event_payload"]["context"]["metadata"]["prior_resolution"]["incident_id"] == "inc-prior"
+    assert "iterative_investigation" not in compacted_proj["event_payload"]["context"]["metadata"]["prior_resolution"].get("metadata", {})
+    assert "context_evidence" not in compacted_proj["event_payload"]
+    assert len(json.dumps(compacted_proj)) < len(json.dumps(projection_payload))
+
+
+def test_restore_archive_supports_compacted_alerts_and_incident_projections(tmp_path):
+    executed_queries = []
+    alert_row = {
+        "id": "alert-restore-1",
+        "tenant_id": "tenant-a",
+        "payload": {"id": "alert-restore-1", "labels": {"project": "P1"}},
+    }
+    proj_row = {
+        "incident_id": "inc-restore-1",
+        "tenant_id": "tenant-a",
+        "projection_payload": {"incident_id": "inc-restore-1", "status": "closed"},
+    }
+    alert_receipt = retention.archive_row(tmp_path, "alerts", alert_row)
+    proj_receipt = retention.archive_row(tmp_path, "incident_projections", proj_row)
+
+    compacted_alert_db = {
+        "id": "alert-restore-1",
+        "tenant_id": "tenant-a",
+        "payload": json.dumps(retention.compact_alert_payload(alert_row["payload"], alert_receipt)),
+    }
+    compacted_proj_db = {
+        "incident_id": "inc-restore-1",
+        "tenant_id": "tenant-a",
+        "projection_payload": json.dumps(retention.compact_projection_payload(proj_row["projection_payload"], proj_receipt)),
+    }
+
+    class FakeCursor:
+        def __init__(self):
+            self._last_sql = ""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            self._last_sql = sql
+            executed_queries.append((sql, params))
+
+        def fetchone(self):
+            if "FROM `alerts`" in self._last_sql:
+                return dict(compacted_alert_db)
+            if "FROM `incident_projections`" in self._last_sql:
+                return dict(compacted_proj_db)
+            return None
+
+    class FakeConnection:
+        def begin(self):
+            executed_queries.append(("BEGIN", None))
+
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            executed_queries.append(("COMMIT", None))
+
+        def rollback(self):
+            executed_queries.append(("ROLLBACK", None))
+
+    conn = FakeConnection()
+    dry_alert = retention.restore_archive(conn, tmp_path / alert_receipt["archive"], execute=False)
+    assert dry_alert == {"dry_run": True, "restored": False, "table": "alerts"}
+    assert not any(sql.startswith("UPDATE") for sql, _ in executed_queries)
+
+    live_alert = retention.restore_archive(conn, tmp_path / alert_receipt["archive"], execute=True)
+    assert live_alert["restored"] is True
+    assert live_alert["table"] == "alerts"
+
+    live_proj = retention.restore_archive(conn, tmp_path / proj_receipt["archive"], execute=True)
+    assert live_proj["restored"] is True
+    assert live_proj["table"] == "incident_projections"
+
+    update_sqls = [sql for sql, _ in executed_queries if sql.startswith("UPDATE")]
+    assert any("UPDATE `alerts` SET `payload`=" in sql for sql in update_sqls)
+    assert any("UPDATE `incident_projections` SET `projection_payload`=" in sql for sql in update_sqls)

@@ -132,7 +132,7 @@ class ExecutionPlanV2(BaseModel):
     evidence_snapshot_id: UUID | None = None
     context_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     resolution_selection_id: UUID | None = None
-    policy_version: str | None = None
+    policy_version: str | None = "resolution-policy.v1"
     recommendation_version: str | None = None
     service: str
     environment: str

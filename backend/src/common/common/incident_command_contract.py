@@ -78,11 +78,12 @@ class IncidentCommandWorkspace(BaseModel):
     def validate_identity(self) -> IncidentCommandWorkspace:
         incident_identity = str(
             self.incident.get("incident_id") or self.incident.get("id") or ""
-        ).strip()
-        operations_identity = str(self.operations.get("incident_id") or "").strip()
-        if incident_identity != self.incident_id:
+        ).strip().replace("-", "")
+        operations_identity = str(self.operations.get("incident_id") or "").strip().replace("-", "")
+        normalized_id = self.incident_id.strip().replace("-", "")
+        if incident_identity != normalized_id:
             raise ValueError("incident projection identity does not match command workspace")
-        if operations_identity != self.incident_id:
+        if operations_identity != normalized_id:
             raise ValueError("operations identity does not match command workspace")
         # Independent service reads may straddle a recommendation commit.
         # Never compose a detail payload with another generation's operations.

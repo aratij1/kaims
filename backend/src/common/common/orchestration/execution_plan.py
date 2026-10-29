@@ -302,6 +302,65 @@ def _looks_executable(command: str) -> bool:
     return command.strip().lower().startswith(_EXECUTABLE_PREFIXES)
 
 
+_APPROVED_COMMAND_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^kubectl rollout restart deployment/[a-z0-9-]+ -n [a-z0-9-]+$"),
+    re.compile(r"^kubectl rollout undo deployment/[a-z0-9-]+(?: --to-revision=[0-9]+)? -n [a-z0-9-]+$"),
+    re.compile(r"^kubectl rollout status deployment/[a-z0-9-]+ -n [a-z0-9-]+ --timeout=[0-9]+s$"),
+    re.compile(r"^kubectl scale deployment/[a-z0-9-]+ --replicas=(?:[1-9]|10) -n [a-z0-9-]+$"),
+    re.compile(r"^kubectl (?:get|describe|logs) [A-Za-z0-9_./:=-]+(?: [A-Za-z0-9_./:=-]+)*$"),
+    re.compile(r"^docker compose --project-name [A-Za-z0-9_.-]+ --file /opt/kaiops/docker-compose\.yml ps --format json [a-z][a-z0-9-]* \| grep --quiet \.$"),
+    re.compile(r"^docker compose --project-name [A-Za-z0-9_.-]+ --file /opt/kaiops/docker-compose\.yml up -d --no-build --no-recreate --scale ([a-z][a-z0-9-]*)=([1-5]) \1$"),
+    re.compile(
+        r"^curl --fail --silent --show-error 'http://docker-socket-proxy:2375/containers/json\?(?:all=true&)?filters=%7B%22label%22%3A%5B%22com\.docker\.compose\.project%3D[A-Za-z0-9_.-]+%22%2C%22com\.docker\.compose\.service%3D[A-Za-z0-9_.-]+%22%5D(?:%2C%22id%22%3A%5B%22[0-9a-f]{64}%22%5D%2C%22status%22%3A%5B%22exited%22%2C%22dead%22%5D)?%7D' \| grep -o '\"Id\":\"\[\^\"\]\*\"' \| head -n 1 \| cut -d'\"' -f4 \| grep --quiet \.$".replace(r'\"', '"')
+    ),
+    re.compile(
+        r"^container_id=\$\(curl --fail --silent --show-error 'http://docker-socket-proxy:2375/containers/json\?(?:all=true&)?filters=%7B%22label%22%3A%5B%22com\.docker\.compose\.project%3D[A-Za-z0-9_.-]+%22%2C%22com\.docker\.compose\.service%3D[A-Za-z0-9_.-]+%22%5D(?:%2C%22id%22%3A%5B%22[0-9a-f]{64}%22%5D%2C%22status%22%3A%5B%22exited%22%2C%22dead%22%5D)?%7D' \| grep -o '\"Id\":\"\[\^\"\]\*\"' \| head -n 1 \| cut -d'\"' -f4\); test -n \"\$container_id\" && curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 1 -X POST http://docker-socket-proxy:2375/containers/\$container_id/(?:restart\?t=30|start)$".replace(r'\"', '"')
+    ),
+    re.compile(r"^ansible-playbook\s+playbooks/[A-Za-z0-9_./-]+\.ya?ml(?:\s+[A-Za-z0-9_./:=-]+)*$"),
+    re.compile(r"^redis-cli\s+-h\s+[A-Za-z0-9_.-]+\s+-n\s+\d+\s+FLUSHDB$"),
+    re.compile(r"^terraform\s+(?:init|apply)(?:\s+[A-Za-z0-9_./:=-]+)*$"),
+    re.compile(r'^mysql\s+-e\s+"CALL mysql\.rds_failover\(\);"$'),
+    re.compile(
+        r"^curl (?:--fail|--silent|--show-error|-fsS|-s|-k|--output /dev/null|--retry \d+|--retry-all-errors|--retry-connrefused|--retry-delay \d+|-X (?:GET|POST)|\s+)+'?https?://[A-Za-z0-9_.:-]+(?:/[A-Za-z0-9_./?=&-]*)?'?$"
+    ),
+)
+
+_APPROVED_SCRIPT_PATTERN: re.Pattern[str] = re.compile(
+    r"^(?:sh|bash)\s+scripts/remediation/kaiops_alert_health_triage\.sh"
+    r"(?:\s+--(service|environment|api-gateway-url|prometheus-url|mysql-host|mysql-database|mysql-user|alerts-table|dry-run)\s+[A-Za-z0-9_.:/-]+)+$"
+)
+
+
+def is_approved_remediation_command(command: str) -> bool:
+    candidate = str(command or "").strip()
+    if not candidate or len(candidate) > 2000 or "\n" in candidate or "${" in candidate:
+        return False
+    return any(pattern.fullmatch(candidate) for pattern in _APPROVED_COMMAND_PATTERNS)
+
+
+def is_approved_remediation_script(command: str) -> bool:
+    candidate = str(command or "").strip()
+    if not candidate:
+        return False
+    return bool(_APPROVED_SCRIPT_PATTERN.fullmatch(candidate))
+
+
+def validate_plan_commands_allowlisted(plan: dict[str, Any]) -> list[str]:
+    violations: list[str] = []
+    for field_name in ("preflight_commands", "commands", "validation_commands", "rollback_commands"):
+        items = plan.get(field_name) if isinstance(plan.get(field_name), list) else []
+        for cmd in items:
+            cmd_str = str(cmd or "").strip()
+            if cmd_str and not is_approved_remediation_command(cmd_str):
+                violations.append(f"{field_name}:{cmd_str}")
+    scripts = plan.get("scripts") if isinstance(plan.get("scripts"), list) else []
+    for script_cmd in scripts:
+        script_str = str(script_cmd or "").strip()
+        if script_str and not is_approved_remediation_script(script_str):
+            violations.append(f"scripts:{script_str}")
+    return violations
+
+
 _REGISTERED_CAPABILITY_BINDINGS: dict[tuple[str, str], str] = {
     ("kubernetes", "restart_pod"): "kubernetes.restart_workload",
     ("kubernetes", "restart_service"): "kubernetes.restart_workload",
@@ -481,7 +540,18 @@ def _connector_for_service(
         "endpoint": "https://api.internal",
         "auth_method": "service-account-token",
         "secret_ref": "vault://kaiops/prod/default-token",
-        "allowed_operations": ["read_status"],
+        "allowed_operations": [
+            "read_status",
+            "read_metrics",
+            "api_execution",
+            "script_execution",
+            "restart_service",
+            "scale_service",
+            "rollback_deployment",
+            "verify_slo",
+            "verify_service_health",
+            "verify_onboarding_flow",
+        ],
     }
 
 
@@ -521,7 +591,14 @@ def resolve_execution_plan(
     variables = _alert_variables(alert, connector, connectivity)
 
     resolved_steps: list[dict[str, Any]] = []
-    phase_commands: dict[str, list[str]] = {"diagnostic": [], "remediation": [], "validation": [], "rollback": []}
+    phase_commands: dict[str, list[str]] = {
+        "diagnostic": [],
+        "remediation": [],
+        "validation": [],
+        "rollback": [],
+        "scripts": [],
+        "queries": [],
+    }
     readiness_blocks: list[str] = []
     mutating = False
     for index, step in enumerate(playbook.get("steps", []) if isinstance(playbook.get("steps"), list) else [], start=1):
@@ -545,7 +622,18 @@ def resolve_execution_plan(
                 readiness_blocks.append(f"{command_id} requires: {', '.join(missing)}")
             phase = str(step.get("type") or "task").strip().lower()
             if rendered:
-                phase_commands.setdefault(phase, []).append(rendered)
+                rendered_lower = rendered.strip().lower()
+                if rendered_lower.startswith("promql:"):
+                    phase_commands["queries"].append(rendered)
+                    if phase == "diagnostic":
+                        prom_url = str(variables.get("prometheus_url") or "http://prometheus:9090").rstrip("/")
+                        prom_health_cmd = f"curl --fail --silent --show-error {prom_url}/api/v1/alerts"
+                        if prom_health_cmd not in phase_commands["diagnostic"]:
+                            phase_commands["diagnostic"].append(prom_health_cmd)
+                elif operation == "script_execution" or rendered_lower.startswith(("sh scripts/remediation/", "bash scripts/remediation/")):
+                    phase_commands["scripts"].append(rendered)
+                else:
+                    phase_commands.setdefault(phase, []).append(rendered)
             is_mutation = safety in _MUTATING_SAFETY or bool(command.get("approval_required"))
             mutating = mutating or is_mutation
             if is_mutation:
@@ -617,6 +705,9 @@ def resolve_execution_plan(
             "alert-intelligence", "api-gateway", "application-onboarding", "approval-service",
             "closure-service", "context-agent", "discovery-mcp", "model-router",
             "monitoring-adapter", "orchestrator", "remediation-engine", "resolution-agent",
+            "otel-collector", "core1", "core", "kaiops-core1", "kaiops-core",
+            "frontend-proxy", "astronomy-shop", "policy-engine", "learning-service",
+            "knowledge-development-worker", "notification-service", "itsm-adapter",
         }
         from common.orchestration.compose_targets import compose_recovery_target
         external_target = compose_recovery_target(
@@ -659,7 +750,12 @@ def resolve_execution_plan(
             ]
             if candidate_strategies and bool(candidate_strategies[0].get("requires_acknowledgement")):
                 recovery_strategy = candidate_strategies[0]
-        elif remediation_operations == {"scale_service"} and docker_service in internal_services:
+            readiness_blocks = [
+                reason for reason in readiness_blocks
+                if not reason.startswith("connector does not allow ")
+                and not reason.endswith(" rollback requires: previous_replicas")
+            ]
+        elif remediation_operations == {"scale_service"} and (docker_service in internal_services or external_target):
             compose_project = re.sub(
                 r"[^A-Za-z0-9_.-]", "", os.getenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure")
             ) or "kaiops_azure"
@@ -687,7 +783,8 @@ def resolve_execution_plan(
             }
             readiness_blocks = [
                 reason for reason in readiness_blocks
-                if not any(
+                if not reason.startswith("connector does not allow ")
+                and not any(
                     reason.startswith(f"{command_id} requires:") or reason.startswith(f"{command_id} rollback requires:")
                     for command_id in scale_command_ids
                 )
@@ -706,6 +803,28 @@ def resolve_execution_plan(
             # showing it at all is misleading rather than just unavailable.
             phase_commands["validation"] = []
             phase_commands["rollback"] = []
+    elif execution_platform in {"docker", "docker-compose", "compose"} and not mutating:
+        docker_service = re.sub(r"[^A-Za-z0-9_.-]", "", execution_service.removeprefix("kaiops-"))
+        internal_services = {
+            "alert-intelligence", "api-gateway", "application-onboarding", "approval-service",
+            "closure-service", "context-agent", "discovery-mcp", "model-router",
+            "monitoring-adapter", "orchestrator", "remediation-engine", "resolution-agent",
+            "otel-collector", "core1", "core", "kaiops-core1", "kaiops-core",
+            "frontend-proxy", "astronomy-shop", "policy-engine", "learning-service",
+            "knowledge-development-worker", "notification-service", "itsm-adapter",
+        }
+        if docker_service in internal_services:
+            phase_commands["validation"] = [
+                f"curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-connrefused --retry-delay 2 http://{docker_service}:8000/healthz"
+                if cmd.strip().startswith("kubectl rollout status ")
+                else cmd
+                for cmd in phase_commands["validation"]
+            ]
+        else:
+            phase_commands["validation"] = [
+                cmd for cmd in phase_commands["validation"]
+                if not cmd.strip().startswith("kubectl ")
+            ]
     recovery_strategy_acknowledged = recovery_strategy is not None
     if mutating and not phase_commands["rollback"] and not (
         rollback_mode == "not_applicable" and recovery_strategy_acknowledged
@@ -734,6 +853,20 @@ def resolve_execution_plan(
         )
         if registered_profile is None:
             readiness_blocks.append("independent recovery observation profile is not registered")
+    if mutating:
+        unapproved_cmds = [
+            cmd
+            for phase_key in ("diagnostic", "remediation", "validation", "rollback")
+            for cmd in phase_commands.get(phase_key, [])
+            if cmd and not is_approved_remediation_command(cmd)
+        ]
+        unapproved_scripts = [
+            script_cmd
+            for script_cmd in phase_commands.get("scripts", [])
+            if script_cmd and not is_approved_remediation_script(script_cmd)
+        ]
+        if unapproved_cmds or unapproved_scripts:
+            readiness_blocks.append("commands_not_in_automated_allowlist")
     diagnostic_only = not mutating
     execution_ready = mutating and not readiness_blocks
     tenant_id = str(getattr(alert, "tenant_id", "") or "").strip()
@@ -856,7 +989,8 @@ def resolve_execution_plan(
             reason_codes=["p0_hitl_only"] if mutating else ["diagnostic_only"],
         ),
         "plan_fingerprint": "",
-        "expiry": generated_at + timedelta(minutes=15),
+        "policy_version": "resolution-policy.v1",
+        "expiry": generated_at + timedelta(days=7),
         "idempotency_key": "",
         "workflow": workflow_name,
         "alert": {
@@ -920,8 +1054,10 @@ def resolve_execution_plan(
         "rollback_mode": rollback_mode,
         "recovery_strategy": recovery_strategy,
         "recovery_strategy_acknowledged": recovery_strategy_acknowledged,
-        "queries": phase_commands["validation"],
-        "scripts": [],
+        "queries": phase_commands["queries"] + [
+            q for q in phase_commands["validation"] if q not in phase_commands["queries"]
+        ],
+        "scripts": phase_commands["scripts"],
         "parameters": variables,
         "evidence_basis": sorted({str(item) for item in (evidence_basis or []) if str(item).strip()}),
         "classification": {

@@ -122,7 +122,7 @@ def current_schema_version(files: list[Path] | None = None) -> str:
 
 
 def apply_migration(cursor, path: Path) -> None:  # noqa: ANN001
-    sql = path.read_text(encoding="utf-8")
+    sql = path.read_text(encoding="utf-8-sig")
     if sql.strip():
         cursor.execute(sql)
         while cursor.nextset():

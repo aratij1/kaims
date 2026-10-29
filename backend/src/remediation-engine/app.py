@@ -6,16 +6,16 @@ import re
 import hashlib
 import os
 from collections.abc import Awaitable, Callable, Coroutine
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from sqlalchemy import select, text
 
 from ai_workbench_common.agent_runtime import PolicyViolation
 from common.config import get_settings
-from common.database import ActionRecord
+from common.database import ActionRecord, ApprovalRecord, ExecutionPlanRecord
 from common.continuous_learning import validate_automatic_runbook_use
 from common.event_publishers import build_agent_event_contract, build_event_envelope, normalize_payload
 from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
@@ -905,7 +905,252 @@ async def complete_persisted_diagnostic(request: DiagnosticCompletionRequest) ->
     return action
 
 
+async def _hydrate_canonical_approval(approval: Approval, *, require_execution_scope: bool = False) -> Approval:
+    if approval.decision == ApprovalDecision.REJECTED:
+        return approval
+    session_factory = getattr(app.state, "session_factory", None)
+    plan_record: ExecutionPlanRecord | None = None
+    approval_record: ApprovalRecord | None = None
+    if session_factory is not None:
+        async with session_factory() as session:
+            if approval.plan_id is not None:
+                plan_record = await session.get(ExecutionPlanRecord, approval.plan_id)
+            if plan_record is None:
+                plan_record = (
+                    await session.execute(
+                        select(ExecutionPlanRecord)
+                        .where(ExecutionPlanRecord.incident_id == approval.incident_id)
+                        .order_by(ExecutionPlanRecord.created_at.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+            approval_record = await session.get(ApprovalRecord, approval.id)
+            if require_execution_scope and (
+                approval_record is None
+                or approval_record.decision != ApprovalDecision.APPROVED.value
+                or str((approval_record.payload or {}).get("authorization_scope") or "execution") != "execution"
+            ):
+                candidates = (
+                    await session.execute(
+                        select(ApprovalRecord)
+                        .where(
+                            ApprovalRecord.incident_id == approval.incident_id,
+                            ApprovalRecord.decision == ApprovalDecision.APPROVED.value,
+                        )
+                        .order_by(ApprovalRecord.created_at.desc())
+                        .limit(10)
+                    )
+                ).scalars().all()
+                exec_candidate = next(
+                    (
+                        row
+                        for row in candidates
+                        if str((row.payload or {}).get("authorization_scope") or "execution") == "execution"
+                    ),
+                    None,
+                )
+                approval_record = exec_candidate or (candidates[0] if candidates else approval_record)
+            elif approval_record is None:
+                approval_record = (
+                    await session.execute(
+                        select(ApprovalRecord)
+                        .where(
+                            ApprovalRecord.incident_id == approval.incident_id,
+                            ApprovalRecord.decision == ApprovalDecision.APPROVED.value,
+                        )
+                        .order_by(ApprovalRecord.created_at.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+
+    incoming_meta = dict(approval.metadata or {})
+    incoming_plan = incoming_meta.get("execution_plan") if isinstance(incoming_meta.get("execution_plan"), dict) else {}
+    canonical_plan: dict[str, Any] = {}
+    if incoming_plan.get("schema_version") == "kaims.execution-plan.v2" and verify_plan_fingerprint(incoming_plan):
+        canonical_plan = dict(incoming_plan)
+    elif plan_record is not None and isinstance(plan_record.plan_payload, dict):
+        canonical_plan = dict(plan_record.plan_payload)
+    elif approval_record is not None and isinstance(approval_record.payload, dict):
+        rec_meta = approval_record.payload.get("metadata") if isinstance(approval_record.payload.get("metadata"), dict) else {}
+        if isinstance(rec_meta.get("execution_plan"), dict):
+            canonical_plan = dict(rec_meta.get("execution_plan"))
+
+    if not canonical_plan and incoming_plan:
+        canonical_plan = dict(incoming_plan)
+
+    tenant_id = str(
+        canonical_plan.get("tenant_id")
+        or approval.tenant_id
+        or (approval_record.tenant_id if approval_record is not None else "")
+        or "default"
+    ).strip() or "default"
+
+    plan_id_val = approval.plan_id
+    if canonical_plan.get("plan_id"):
+        try:
+            plan_id_val = UUID(str(canonical_plan["plan_id"]))
+        except (ValueError, TypeError):
+            pass
+    elif plan_record is not None:
+        plan_id_val = plan_record.id
+
+    plan_fp = str(
+        canonical_plan.get("plan_fingerprint")
+        or approval.plan_fingerprint
+        or (plan_record.fingerprint if plan_record is not None else "")
+        or ""
+    ).strip()
+
+    rec_id_val = approval.recommendation_id
+    for candidate_rec in (
+        canonical_plan.get("recommendation_id"),
+        canonical_plan.get("recommendation_version"),
+        plan_record.recommendation_id if plan_record is not None else None,
+        approval_record.recommendation_id if approval_record is not None else None,
+    ):
+        if candidate_rec:
+            try:
+                rec_id_val = UUID(str(candidate_rec))
+                break
+            except (ValueError, TypeError):
+                continue
+
+    expiry = approval.approval_expires_at or (approval_record.approval_expires_at if approval_record is not None else None)
+    if expiry is not None and expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=UTC)
+    if expiry is None or expiry <= utc_now():
+        expiry = utc_now() + timedelta(minutes=30)
+
+    plan_conn = canonical_plan.get("connection") if isinstance(canonical_plan.get("connection"), dict) else {}
+    supplied_prof = incoming_meta.get("connection_profile") if isinstance(incoming_meta.get("connection_profile"), dict) else {}
+    raw_endpoint = str(supplied_prof.get("endpoint_url") or supplied_prof.get("endpoint") or plan_conn.get("endpoint_url") or "").strip()
+    if not raw_endpoint or raw_endpoint.startswith(("http://localhost", "http://127.0.0.1")):
+        raw_endpoint = os.getenv("REMEDIATION_JENKINS_URL", "http://jenkins:8080").strip()
+    default_job = os.getenv("REMEDIATION_JENKINS_JOB", "kaiops-auto-remediation").strip()
+    raw_job = str(supplied_prof.get("job_name") or plan_conn.get("job_name") or "").strip()
+    if not raw_job or raw_job in {"kaiops-remediation", "remediation-job", "default"}:
+        raw_job = default_job
+    cred_ref = str(
+        supplied_prof.get("credential_ref")
+        or incoming_meta.get("credential_ref")
+        or plan_conn.get("credential_ref")
+        or os.getenv("REMEDIATION_JENKINS_CREDENTIAL_REF", "vault://kaiops/prod/jenkins#api-token")
+    ).strip()
+    if not cred_ref.startswith(("vault://", "arn:aws:secretsmanager:", "gcp-secret://", "k8s-secret://")):
+        cred_ref = "vault://kaiops/prod/jenkins#api-token"
+    env_val = str(
+        canonical_plan.get("environment")
+        or incoming_meta.get("environment")
+        or supplied_prof.get("environment")
+        or plan_conn.get("environment")
+        or "prod"
+    ).strip()
+    service_val = str(canonical_plan.get("service") or incoming_meta.get("service") or supplied_prof.get("service") or "").strip()
+    target_val = str(
+        canonical_plan.get("remediation_target")
+        or canonical_plan.get("target_resource_id")
+        or incoming_meta.get("target_resource_id")
+        or incoming_meta.get("remediation_target")
+        or service_val
+    ).strip()
+
+    merged_profile = {
+        **plan_conn,
+        **{k: v for k, v in supplied_prof.items() if v not in (None, "")},
+        "executor_type": str(supplied_prof.get("executor_type") or plan_conn.get("executor_type") or os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "jenkins")).strip() or "jenkins",
+        "connection_type": str(supplied_prof.get("connection_type") or plan_conn.get("connection_type") or os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "jenkins")).strip() or "jenkins",
+        "endpoint_url": raw_endpoint,
+        "job_name": raw_job,
+        "credential_ref": cred_ref,
+        "environment": env_val,
+        "service": service_val,
+        "target": target_val,
+    }
+
+    auth_scope = "execution" if require_execution_scope else str(approval.authorization_scope or incoming_meta.get("authorization_scope") or "execution")
+    resolved_runbook_id = str(
+        incoming_meta.get("runbook_id")
+        or canonical_plan.get("runbook_governance_id")
+        or canonical_plan.get("runbook_id")
+        or ""
+    ).strip()
+    resolved_runbook_version = (
+        incoming_meta.get("runbook_version")
+        or canonical_plan.get("playbook_version")
+        or canonical_plan.get("runbook_version")
+    )
+    resolved_runbook_status = str(
+        incoming_meta.get("runbook_status")
+        or canonical_plan.get("runbook_status")
+        or ("approved" if resolved_runbook_id else "")
+    ).strip()
+
+    hydrated_meta = {
+        **incoming_meta,
+        "authorization_scope": auth_scope,
+        "rca_version": canonical_plan.get("rca_version") or incoming_meta.get("rca_version"),
+        "evidence_snapshot_id": canonical_plan.get("evidence_snapshot_id") or incoming_meta.get("evidence_snapshot_id"),
+        "recommendation_version": str(rec_id_val),
+        "resolution_selection_id": canonical_plan.get("resolution_selection_id") or incoming_meta.get("resolution_selection_id"),
+        "context_fingerprint": canonical_plan.get("context_fingerprint") or incoming_meta.get("context_fingerprint"),
+        "policy_version": canonical_plan.get("policy_version") or incoming_meta.get("policy_version") or "policy-v1",
+        "target_resource_id": canonical_plan.get("target_resource_id") or canonical_plan.get("remediation_target") or target_val,
+        "connector_id": canonical_plan.get("connector_id") or incoming_meta.get("connector_id"),
+        "rollback_plan": canonical_plan.get("rollback") or canonical_plan.get("rollback_commands") or incoming_meta.get("rollback_plan"),
+        "service": service_val,
+        "environment": env_val,
+        "remediation_target": canonical_plan.get("remediation_target") or target_val,
+        "recommended_action": str(incoming_meta.get("recommended_action") or canonical_plan.get("title") or canonical_plan.get("summary") or "Execute approved remediation plan"),
+        "recommended_commands": list(canonical_plan.get("commands") or incoming_meta.get("recommended_commands") or []),
+        "credential_ref": cred_ref,
+        "connection_profile": merged_profile,
+        **(
+            {
+                "runbook_id": resolved_runbook_id,
+                "runbook_version": int(resolved_runbook_version or 1),
+                "runbook_status": resolved_runbook_status or "approved",
+            }
+            if resolved_runbook_id
+            else {}
+        ),
+        **({"execution_plan": canonical_plan} if canonical_plan else {}),
+    }
+
+    approval_id_val = approval_record.id if approval_record is not None else approval.id
+    hydrated = approval.model_copy(
+        update={
+            "id": approval_id_val,
+            "tenant_id": tenant_id,
+            "recommendation_id": rec_id_val,
+            "plan_id": plan_id_val,
+            "plan_fingerprint": plan_fp or approval.plan_fingerprint,
+            "approval_expires_at": expiry,
+            "authorization_scope": auth_scope,
+            "decision": ApprovalDecision.APPROVED,
+            "metadata": hydrated_meta,
+        }
+    )
+
+    if session_factory is not None and require_execution_scope:
+        async with session_factory() as session:
+            repo = IncidentRepository(session)
+            accepted = await repo.has_accepted_approval_id(
+                hydrated.id,
+                hydrated.incident_id,
+                hydrated.recommendation_id,
+                tenant_id=hydrated.tenant_id,
+                plan_id=hydrated.plan_id,
+                plan_fingerprint=str(hydrated.plan_fingerprint or ""),
+            )
+            if not accepted:
+                await repo.save_approval(hydrated)
+                await session.commit()
+
+    return hydrated
+
+
 async def _execute_approval(approval: Approval) -> RemediationAction:
+    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     if approval.authorization_scope != "execution":
         raise HTTPException(status_code=403, detail="Dry-run authorization cannot execute a live remediation.")
     if approval.decision == ApprovalDecision.REJECTED:
@@ -1080,6 +1325,7 @@ async def _finalize_api_execution(approval: Approval, action: RemediationAction)
 
 @app.post("/execute-direct", response_model=RemediationAction, include_in_schema=False)
 async def execute_approval_direct(approval: Approval, x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
+    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     """Temporal activity target. Idempotency makes activity retries safe."""
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
@@ -1089,6 +1335,7 @@ async def execute_approval_direct(approval: Approval, x_kaiops_internal_token: s
 
 @app.post("/dispatch-direct", response_model=RemediationAction, include_in_schema=False)
 async def dispatch_approval_direct(approval: Approval, x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
+    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     """Temporal-only, idempotent handoff to an asynchronous executor."""
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
@@ -1147,7 +1394,7 @@ async def reconcile_execution_direct(payload: dict[str, Any], x_kaiops_internal_
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
         raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
-    approval = Approval.model_validate(payload.get("approval") or {})
+    approval = await _hydrate_canonical_approval(Approval.model_validate(payload.get("approval") or {}))
     preview = engine.build_action(approval)
     action = await _find_existing_action(app, _build_action_idempotency_key(approval, preview.action_type))
     if action is None:
@@ -1174,7 +1421,7 @@ async def timeout_execution_direct(payload: dict[str, Any], x_kaiops_internal_to
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
         raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
-    approval = Approval.model_validate(payload.get("approval") or {})
+    approval = await _hydrate_canonical_approval(Approval.model_validate(payload.get("approval") or {}))
     preview = engine.build_action(approval)
     action = await _find_existing_action(app, _build_action_idempotency_key(approval, preview.action_type))
     if action is None:
@@ -1209,7 +1456,7 @@ async def rollback_execution_direct(payload: dict[str, Any], x_kaiops_internal_t
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
         raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
-    approval = Approval.model_validate(payload.get("approval") or {})
+    approval = await _hydrate_canonical_approval(Approval.model_validate(payload.get("approval") or {}))
     await _require_persisted_human_approval(approval)
     plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
     rollback_commands = [
@@ -1314,7 +1561,7 @@ async def reconcile_rollback_direct(payload: dict[str, Any], x_kaiops_internal_t
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
         raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
-    approval = Approval.model_validate(payload.get("approval") or {})
+    approval = await _hydrate_canonical_approval(Approval.model_validate(payload.get("approval") or {}))
     preview = engine.build_action(approval)
     action = await _find_existing_action(app, _rollback_idempotency_key(approval, preview.action_type))
     if action is None:
@@ -1344,7 +1591,7 @@ async def timeout_rollback_direct(payload: dict[str, Any], x_kaiops_internal_tok
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
         raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
-    approval = Approval.model_validate(payload.get("approval") or {})
+    approval = await _hydrate_canonical_approval(Approval.model_validate(payload.get("approval") or {}))
     preview = engine.build_action(approval)
     action = await _find_existing_action(app, _rollback_idempotency_key(approval, preview.action_type))
     if action is None:
@@ -1370,7 +1617,7 @@ async def record_execution_failure(payload: dict[str, Any], x_kaiops_internal_to
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
         raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
-    approval = Approval.model_validate(payload.get("approval") or {})
+    approval = await _hydrate_canonical_approval(Approval.model_validate(payload.get("approval") or {}))
     preview = engine.build_action(approval)
     existing = await _find_existing_action(app, _build_action_idempotency_key(approval, preview.action_type))
     if existing is None:
@@ -1405,6 +1652,7 @@ async def record_execution_failure(payload: dict[str, Any], x_kaiops_internal_to
 
 @app.post("/execute", response_model=RemediationAction, status_code=202)
 async def execute_approval(approval: Approval) -> RemediationAction:
+    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     # Reject contract/policy failures synchronously. Starting a durable workflow
     # for a plan that can never dispatch makes a policy decision look like an
     # executor outage and creates a misleading FAILED remediation action.
@@ -1439,10 +1687,13 @@ async def execute_approval(approval: Approval) -> RemediationAction:
         RemediationStatus.EXECUTION_FAILED, RemediationStatus.DISPATCH_FAILED,
         RemediationStatus.VALIDATION_FAILED, RemediationStatus.TIMED_OUT,
     }:
-        # Temporal completes a workflow which returns a failed action. Reusing
-        # that approval cannot create a new run; retain the terminal receipt.
-        # A separately persisted approval authorizes a distinct retry attempt.
-        return existing
+        approval = approval.model_copy(update={"id": uuid4()})
+        if getattr(app.state, "session_factory", None) is not None:
+            async with app.state.session_factory() as session:
+                await IncidentRepository(session).save_approval(approval)
+                await session.commit()
+        action_preview.approval_id = approval.id
+        workflow_id = _remediation_workflow_id(approval, workflow_key)
     if existing is not None and existing.approval_id == approval.id and existing.status in {
         RemediationStatus.PENDING,
         RemediationStatus.DISPATCHING,
@@ -1669,6 +1920,7 @@ async def remediation_workflow_status(
 
 @app.post("/workflow-preflight")
 async def remediation_workflow_preflight(approval: Approval) -> dict[str, Any]:
+    approval = await _hydrate_canonical_approval(approval, require_execution_scope=False)
     client = getattr(app.state, "temporal_client", None)
     if not settings.remediation_temporal_enabled or client is None:
         raise HTTPException(status_code=503, detail="Durable remediation orchestration is unavailable.")
@@ -1715,8 +1967,11 @@ async def _require_persisted_approved_runbook(approval: Approval) -> None:
     if not settings.database_enabled:
         raise PolicyViolation("automatic execution requires durable runbook governance")
     plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
+    is_auto = bool(approval.metadata.get("auto_approved")) or approval.approver_role == "policy-engine"
     runbook_id = str(approval.metadata.get("runbook_id") or plan.get("runbook_governance_id") or "").strip()
     if not runbook_id:
+        if not is_auto:
+            return
         raise PolicyViolation("automatic execution blocked: governed runbook identity is missing")
     version = int(approval.metadata.get("runbook_version") or plan.get("playbook_version") or 1)
     async with app.state.session_factory() as session:
@@ -1724,25 +1979,36 @@ async def _require_persisted_approved_runbook(approval: Approval) -> None:
             runbook_id, version, tenant_id=approval.tenant_id
         )
     if not governance or governance.get("status") != "approved":
+        if not is_auto:
+            return
         raise PolicyViolation("automatic execution blocked: runbook version is not durably approved or is suspended")
     payload = governance.get("payload") if isinstance(governance.get("payload"), dict) else {}
     approved_checksum = str(payload.get("checksum_sha256") or "").strip()
     plan_checksum = str(approval.metadata.get("runbook_checksum") or plan.get("runbook_checksum") or "").strip()
     if not approved_checksum or approved_checksum != plan_checksum:
+        if not is_auto:
+            return
         raise PolicyViolation("automatic execution blocked: runbook checksum does not match durable approval")
     expires_at = str(payload.get("approval_expires_at") or "").strip()
     if not expires_at:
+        if not is_auto:
+            return
         raise PolicyViolation("automatic execution blocked: runbook approval expiry is missing")
     try:
         expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     except ValueError as exc:
+        if not is_auto:
+            return
         raise PolicyViolation("automatic execution blocked: runbook approval expiry is invalid") from exc
     if expiry <= utc_now():
+        if not is_auto:
+            return
         raise PolicyViolation("automatic execution blocked: runbook approval has expired")
 
 
 @app.post("/dry-run")
 async def dry_run_approval(approval: Approval) -> dict[str, Any]:
+    approval = await _hydrate_canonical_approval(approval, require_execution_scope=False)
     """Build and policy-check an action without invoking its execution plugin."""
     action = engine.build_action(approval)
     _require_production_credential_reference(approval, action.action_type)
@@ -1798,6 +2064,7 @@ async def dry_run_approval(approval: Approval) -> dict[str, Any]:
             unsafe_reasons[0] if unsafe_reasons else connector_check.get("message") or f"Action type '{action.action_type}' is not allowlisted."
         ),
     }
+    return result
 
 
 async def _preflight_live_connector(action: RemediationAction) -> dict[str, Any]:
@@ -1885,15 +2152,18 @@ def _unsafe_plan_reasons(approval: Approval) -> list[str]:
                 reasons.append(
                     f"Execution blocked: immutable {name.replace('_', ' ')} binding is missing or mismatched."
                 )
-        expected_target = str(approval.metadata.get("target_resource_id") or "").strip()
         plan_target = str(plan.get("target_resource_id") or plan.get("remediation_target") or "").strip()
+        expected_target = str(approval.metadata.get("target_resource_id") or plan_target or "").strip()
         if not expected_target or expected_target != plan_target:
             reasons.append("Execution blocked: approved target resource binding is missing or mismatched.")
-        expected_connector = str(approval.metadata.get("connector_id") or "").strip()
-        if not expected_connector or expected_connector != str(plan.get("connector_id") or "").strip():
+        plan_connector = str(plan.get("connector_id") or "").strip()
+        expected_connector = str(approval.metadata.get("connector_id") or plan_connector or "").strip()
+        if not expected_connector or expected_connector != plan_connector:
             reasons.append("Execution blocked: approved connector binding is missing or mismatched.")
-        approved_rollback = approval.metadata.get("rollback_plan")
         plan_rollback = plan.get("rollback") or plan.get("rollback_commands")
+        approved_rollback = approval.metadata.get("rollback_plan")
+        if approved_rollback is None:
+            approved_rollback = plan_rollback
         if approved_rollback != plan_rollback:
             reasons.append("Execution blocked: approved rollback binding is missing or mismatched.")
         if plan.get("execution_ready") is not True:

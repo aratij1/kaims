@@ -53,7 +53,9 @@ async def recover_stalled_investigation(repo, alert, incident, *, now=None) -> b
         return False
     # Correlation holds the canonical incident's transaction lock. One key per
     # five-minute interval bounds replay even under repeated source deliveries.
-    generation = int(onset.timestamp()) if new_cycle else int(now.timestamp()) // 300
+    expires_utc = (expires.replace(tzinfo=UTC) if expires.tzinfo is None else expires) if expires else None
+    use_onset = new_cycle and (recommendation is not None or expires_utc is None or expires_utc > now)
+    generation = int(onset.timestamp()) if use_onset else int(now.timestamp()) // 300
     event_id = f"initial-investigation-recovery:{incident.id}:{generation}"
     return await repo.enqueue_resolution_event(
         event_id=event_id,

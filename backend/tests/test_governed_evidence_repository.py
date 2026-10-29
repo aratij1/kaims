@@ -397,3 +397,255 @@ async def test_approved_replacement_increments_version_and_index_gate_is_explici
     incident_replacement = next(row for row in replacements if row["document_kind"] == "incident")
     assert incident_replacement["document_version"] == 2
     assert incident_replacement["draft_id"] != first["draft_id"]
+
+
+
+class FlakyVectorConnector:
+    def __init__(self, *, fail: bool = True) -> None:
+        self.fail = fail
+        self.upsert_calls = 0
+        self.documents: dict[str, dict] = {}
+
+    async def index_governed_document(self, document):
+        self.upsert_calls += 1
+        if self.fail:
+            raise RuntimeError("vector store connection refused")
+        indexed = {
+            "document_id": str(document.document_id),
+            "tenant_id": document.tenant_id,
+            "content": document.content,
+            "content_checksum": document.content_checksum,
+            "kind": document.document_kind,
+        }
+        self.documents[str(document.document_id)] = indexed
+        return {**indexed, "indexed": 1, "metadata": indexed}
+
+    async def verify_index_receipt(self, receipt, *, expected_checksum):
+        if self.fail:
+            raise RuntimeError("vector store receipt verification unavailable")
+        assert receipt["content_checksum"] == expected_checksum
+        assert receipt["indexed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_indexing_recovery_lifecycle_pending_failed_stale_indexing_and_fallback(
+    sqlite_session_factory,
+):
+    from uuid import NAMESPACE_URL, UUID, uuid5
+    from common.database import RunbookVersionRecord
+
+    source_ref = "runbook://payments/gateway-timeout"
+    rb_id = uuid5(NAMESPACE_URL, f"kaiops:runbook:tenant-a:{source_ref}")
+
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        draft = await repo.create_knowledge_rag_draft(
+            tenant_id="tenant-a",
+            created_by="operator-a",
+            document_kind="runbook",
+            source_ref=source_ref,
+            title="Payments Gateway Timeout Runbook",
+            content=(
+                "# Payments Gateway Timeout Runbook\n\n"
+                "## Observed Symptoms\nUpstream pool saturation on payments.\n\n"
+                "## Remediation Steps\n1. `kubectl top pods`\n2. `kubectl rollout restart deploy/payments`\n"
+            ),
+            metadata={
+                "service": "payments",
+                "environment": "prod",
+                "alert_name": "PaymentGatewayTimeout",
+                "alert_signature": "sig-payments-timeout",
+            },
+        )
+        reviewed = await repo.review_knowledge_rag_draft(
+            tenant_id="tenant-a",
+            draft_id=draft["draft_id"],
+            expected_row_version=draft["row_version"],
+            title=draft["title"],
+            content=draft["content"],
+            review_notes="Validated steps against incident telemetry",
+            reviewed_by="reviewer-a",
+        )
+        assert reviewed is not None
+        approved_draft, event_payload = await repo.approve_knowledge_rag_draft(
+            tenant_id="tenant-a",
+            draft_id=draft["draft_id"],
+            expected_row_version=reviewed["row_version"],
+            approved_by="approver-a",
+        )
+        await session.commit()
+        doc_id = UUID(str(event_payload["document_id"]))
+        event_id = f"rag-document-approved:{doc_id}"
+
+        # 1. Initial state after approval: pending index, outbox event persisted, picked up by reconciliation query
+        outbox_row = await session.scalar(
+            select(ResolutionOutboxRecord).where(ResolutionOutboxRecord.event_id == event_id)
+        )
+        assert outbox_row is not None
+        assert outbox_row.topic == "rag.document.approved"
+        due_initial = await repo.list_due_governed_rag_index_retries(retry_limit=5)
+        assert [str(row.document_id) for row in due_initial] == [str(doc_id)]
+        assert await repo.list_retrievable_governed_rag_documents(tenant_id="tenant-a") == []
+
+        # Verify MySQL fallback retrieval works while indexing is pending, and remains tenant-scoped
+        # and approval-gated.
+        fallback_tenant_a = await repo.find_learned_runbooks(
+            tenant_id="tenant-a",
+            service="payments",
+            environment="prod",
+            alert_signature="sig-payments-timeout",
+            alert_name="PaymentGatewayTimeout",
+        )
+        assert len(fallback_tenant_a) == 1
+        assert fallback_tenant_a[0]["runbook_id"] == str(rb_id)
+        assert fallback_tenant_a[0]["approval_status"] == "approved"
+
+        fallback_tenant_b = await repo.find_learned_runbooks(
+            tenant_id="tenant-b",
+            service="payments",
+            environment="prod",
+            alert_signature="sig-payments-timeout",
+            alert_name="PaymentGatewayTimeout",
+        )
+        assert fallback_tenant_b == []
+
+    # 2. Vector store unavailable during worker reconciliation pass -> transitions to failed with backoff
+    module = load_context_app_module()
+    connector = FlakyVectorConnector(fail=True)
+    module.vector_connector = lambda: connector
+    worker_app = SimpleNamespace(state=SimpleNamespace(session_factory=sqlite_session_factory))
+
+    processed = await module._run_governed_rag_retry_pass(worker_app)
+    assert processed == 0
+    assert connector.upsert_calls == 1
+
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        doc = await session.get(GovernedRagDocumentRecord, doc_id)
+        assert doc is not None
+        assert doc.index_status == "failed"
+        assert doc.index_attempts == 1
+        assert "vector store connection refused" in (doc.index_error or "")
+        assert doc.next_index_attempt_at is not None
+        assert await repo.list_retrievable_governed_rag_documents(tenant_id="tenant-a") == []
+        # Backoff window has not elapsed yet
+        assert await repo.list_due_governed_rag_index_retries(retry_limit=5) == []
+
+        # 3. Simulate worker in-flight ("indexing") lease: active lease is protected, expired lease is recovered
+        doc.index_status = "indexing"
+        doc.last_index_attempt_at = datetime.now(UTC)
+        await session.commit()
+
+        assert await repo.list_due_governed_rag_index_retries(retry_limit=5, stale_indexing_seconds=60.0) == []
+        assert await repo.claim_governed_rag_document_for_indexing(
+            tenant_id="tenant-a", document_id=doc_id, stale_indexing_seconds=60.0
+        ) is None
+
+        # Age the "indexing" lease past stale_indexing_seconds to simulate a worker crash mid-indexing
+        doc.last_index_attempt_at = datetime.now(UTC) - timedelta(seconds=120)
+        await session.commit()
+        due_stale = await repo.list_due_governed_rag_index_retries(retry_limit=5, stale_indexing_seconds=60.0)
+        assert [str(row.document_id) for row in due_stale] == [str(doc_id)]
+
+    # 4. Vector store recovers -> background retry pass claims stale/failed doc, upserts, verifies receipt, marks indexed
+    connector.fail = False
+    recovered = await module._run_governed_rag_retry_pass(worker_app, stale_indexing_seconds=60.0)
+    assert recovered == 1
+    assert connector.upsert_calls == 2
+    assert len(connector.documents) == 1
+
+    async with sqlite_session_factory() as session:
+        repo = IncidentRepository(session)
+        doc = await session.get(GovernedRagDocumentRecord, doc_id)
+        version_row = await session.get(RunbookVersionRecord, (rb_id, 1))
+        assert doc is not None
+        assert doc.index_status == "indexed"
+        assert doc.index_attempts == 2
+        assert doc.index_error is None
+        assert doc.next_index_attempt_at is None
+        assert doc.index_receipt["content_checksum"] == doc.content_checksum
+        assert doc.indexed_at is not None
+        assert version_row is not None
+        assert version_row.content["index_status"] == "indexed"
+        retrievable = await repo.list_retrievable_governed_rag_documents(tenant_id="tenant-a")
+        assert [str(r.document_id) for r in retrievable] == [str(doc_id)]
+
+    # 5. Repeated delivery & duplicate indexing events are idempotent no-ops once indexed
+    await module._index_governed_document(worker_app, event_payload)
+    assert connector.upsert_calls == 2
+    assert len(connector.documents) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_retry_endpoint_resets_exhausted_attempts_and_handles_transient_vector_failure(
+    sqlite_session_factory,
+):
+    from uuid import UUID
+
+    async with sqlite_session_factory() as session:
+        binding = await seed_binding(session, "tenant-a")
+        repo = IncidentRepository(session)
+        draft = (await repo.create_evidence_rag_drafts(
+            tenant_id="tenant-a",
+            created_by="author",
+            binding=binding,
+            documents=[{
+                "document_kind": "remediation",
+                "title": "Dead-lettered recovery doc",
+                "content": "verified remediation steps for manual retry recovery test",
+            }],
+            evidence_ids=binding["evidence_ids"],
+            source_uris=binding["source_uris"],
+        ))[0]
+        reviewed = await repo.review_evidence_rag_draft(
+            tenant_id="tenant-a",
+            draft_id=draft["draft_id"],
+            expected_row_version=1,
+            title=draft["title"],
+            content=draft["content"],
+            review_notes="verified",
+            reviewed_by="reviewer-a",
+        )
+        _, event = await repo.approve_evidence_rag_draft(
+            tenant_id="tenant-a",
+            draft_id=draft["draft_id"],
+            expected_row_version=reviewed["row_version"],
+            approved_by="approver-a",
+        )
+        doc_id = UUID(str(event["document_id"]))
+        doc = await session.get(GovernedRagDocumentRecord, doc_id)
+        assert doc is not None
+        doc.index_status = "failed"
+        doc.index_attempts = 5
+        doc.index_error = "exhausted retries"
+        doc.next_index_attempt_at = datetime.now(UTC) - timedelta(minutes=10)
+        await session.commit()
+
+        # Automatic retry loop stops after retry_limit=5
+        assert await repo.list_due_governed_rag_index_retries(retry_limit=5) == []
+
+    module = load_context_app_module()
+    connector = FlakyVectorConnector(fail=True)
+    module.vector_connector = lambda: connector
+    module.app.state.session_factory = sqlite_session_factory
+    retry_req = module.GovernedRagIndexRetryRequest(tenant_scope="tenant-a", requested_by="operator-a")
+
+    # Manual retry while vector store is still down resets attempts to 0, tries once (attempts=1),
+    # and returns structured status instead of raising HTTP 500.
+    failed_resp = await module.retry_governed_rag_index(str(doc_id), retry_req)
+    assert failed_resp["status"] == "retry_requested"
+    assert failed_resp["indexing_status"] == "failed"
+    assert "vector store connection refused" in (failed_resp["indexing_error"] or "")
+
+    async with sqlite_session_factory() as session:
+        doc = await session.get(GovernedRagDocumentRecord, doc_id)
+        assert doc is not None
+        assert doc.index_attempts == 1
+        assert doc.index_status == "failed"
+
+    # Manual retry when vector store is healthy succeeds immediately
+    connector.fail = False
+    ok_resp = await module.retry_governed_rag_index(str(doc_id), retry_req)
+    assert ok_resp["status"] == "retry_requested"
+    assert ok_resp["indexing_status"] == "indexed"
+    assert ok_resp["indexing_error"] is None

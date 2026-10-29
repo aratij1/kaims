@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from common.evidence_source_policy import is_alert_artifact_reference, log_observed_at
 from common.evidence_subject import metric_matches_subject, service_identity
@@ -31,7 +31,7 @@ from common.context_enrichment_contract import (
     next_authorized_enrichment_connector,
 )
 from common.models import Alert, Incident
-from common.rag_governance import production_retrievable, retrieval_allowed
+from common.rag_governance import content_checksum, production_retrievable, retrieval_allowed
 from common.resilience import retry_async
 from common.tenant_identity import require_tenant_id
 from common.tool_registry import ToolRegistry, ToolSpec
@@ -1648,10 +1648,18 @@ class VectorDBConnector(BaseConnector):
         }
 
     def load_documents(self) -> list[dict[str, Any]]:
+        governed_cache = {
+            key: dict(val)
+            for key, val in self._document_cache.items()
+            if str(key).startswith("governed://")
+        }
         root = self.rag_root or self._discover_rag_root()
         if root is None or not root.exists():
-            return []
+            self._document_cache.clear()
+            self._document_cache.update(governed_cache)
+            return list(governed_cache.values())
         self._document_cache.clear()
+        self._document_cache.update(governed_cache)
         documents = [
             self._parse_metadata_document(path)
             for path in sorted(root.rglob("*.md"))
@@ -1707,7 +1715,7 @@ class VectorDBConnector(BaseConnector):
                 change_doc["_embedding"] = self.embedding_model.embed(self._document_text(change_doc))
                 derived_documents.append(change_doc)
 
-        return documents + derived_documents
+        return documents + derived_documents + list(governed_cache.values())
 
     def reload(self) -> int:
         self.documents = self.load_documents()
@@ -1753,33 +1761,74 @@ class VectorDBConnector(BaseConnector):
     async def index_governed_document(self, document: Any) -> dict[str, Any]:
         """Project one authoritative DB document into the configured vector index."""
         remote = self.remote_store()
-        if not remote.configured:
-            raise RuntimeError("durable vector index is not configured")
-        metadata = {
-            "path": f"governed://{document.tenant_id}/{document.document_id}/v{document.document_version}",
+        doc_meta = dict(getattr(document, "document_metadata", None) or {})
+        raw_services = doc_meta.get("services") or doc_meta.get("service") or []
+        if isinstance(raw_services, str):
+            services = [item.strip() for item in raw_services.split(",") if item.strip()]
+        elif isinstance(raw_services, list):
+            services = [str(item).strip() for item in raw_services if str(item).strip()]
+        else:
+            services = []
+        path = f"governed://{document.tenant_id}/{document.document_id}/v{document.document_version}"
+        now_iso = datetime.now(UTC).isoformat()
+        created_iso = (
+            document.created_at.isoformat()
+            if getattr(document, "created_at", None)
+            else str(doc_meta.get("created_at") or now_iso)
+        )
+        approved_iso = (
+            document.approved_at.isoformat()
+            if getattr(document, "approved_at", None)
+            else str(doc_meta.get("approved_at") or now_iso)
+        )
+        metadata: dict[str, Any] = {
+            **doc_meta,
+            "path": path,
             "document_id": str(document.document_id),
             "tenant_scope": document.tenant_id,
             "kind": document.document_kind,
             "title": document.title,
             "content": document.content,
+            "services": services,
+            "owner_team": str(doc_meta.get("owner_team") or getattr(document, "approved_by", None) or "platform-ops"),
             "content_version": str(document.document_version),
             "corpus_classification": document.corpus_classification,
             "review_status": document.review_status,
             "evidence_ids": list(document.evidence_ids or []),
             "source_uris": list(document.source_uris or []),
-            "recommendation_id": str(document.recommendation_id),
-            "rca_version": int(document.rca_version),
+            "recommendation_id": str(document.recommendation_id) if getattr(document, "recommendation_id", None) else "",
+            "rca_version": int(document.rca_version or 1) if getattr(document, "rca_version", None) is not None else 1,
+            "created_at": created_iso,
+            "updated_at": approved_iso,
             "approved_by": document.approved_by,
-            "approved_at": document.approved_at.isoformat(),
+            "approved_at": approved_iso,
             "content_checksum": document.content_checksum,
-            "incident_id": str(document.incident_id),
-            "alert_id": str(document.alert_id),
+            "incident_id": str(document.incident_id) if getattr(document, "incident_id", None) else str(doc_meta.get("incident_id") or ""),
+            "alert_id": str(document.alert_id) if getattr(document, "alert_id", None) else str(doc_meta.get("alert_id") or ""),
             "source_system": "kaims-governed-rag",
-            "source_ref": f"governed-rag://{document.document_id}",
+            "source_ref": str(getattr(document, "source_ref", None) or f"governed-rag://{document.document_id}"),
         }
-        result = await asyncio.to_thread(remote.upsert_documents, [metadata])
-        if result.get("error") or int(result.get("indexed") or 0) < 1:
-            raise RuntimeError(str(result.get("error") or result.get("reason") or "index did not accept document"))
+        local_entry = {
+            **metadata,
+            "_metadata_embedding": self.embedding_model.embed(self._metadata_text(metadata)),
+            "_embedding": self.embedding_model.embed(self._document_text(metadata)),
+        }
+        with self._load_lock:
+            if not self.documents:
+                self.documents = self.load_documents()
+            self._document_cache[path] = dict(local_entry)
+            self.documents = [
+                item for item in self.documents
+                if str(item.get("document_id") or "") != str(document.document_id)
+                and str(item.get("path") or "") != path
+            ]
+            self.documents.append(dict(local_entry))
+        if remote.configured:
+            result = await asyncio.to_thread(remote.upsert_documents, [metadata])
+            if result.get("error") or int(result.get("indexed") or 0) < 1:
+                raise RuntimeError(str(result.get("error") or result.get("reason") or "index did not accept document"))
+        else:
+            result = {"attempted": True, "indexed": 1, "provider": "local-hybrid-vector-index"}
         return {**result, "document_id": str(document.document_id),
                 "content_checksum": document.content_checksum, "metadata": metadata}
 
@@ -1790,6 +1839,8 @@ class VectorDBConnector(BaseConnector):
             raise RuntimeError("index receipt confirms no indexed chunks")
 
     def index_info(self) -> dict[str, Any]:
+        if not self.documents:
+            self.documents = self.load_documents()
         docs = [doc for doc in self.documents if not doc.get("_synthetic")]
         active_docs = [doc for doc in docs if production_retrievable(doc)]
         pending_docs = [
@@ -1963,17 +2014,41 @@ class VectorDBConnector(BaseConnector):
                 in_metadata = False
                 body_lines.append(line)
 
-        title = str(metadata.get("title") or file_path.stem.replace("-", " "))
+        title = str(metadata.get("title") or metadata.get("alert_name") or file_path.stem.replace("-", " "))
         content = "\n".join(body_lines).strip()
-        services = metadata.get("services", [])
+        services = metadata.get("services") or metadata.get("service", [])
         if isinstance(services, str):
             services = [item.strip() for item in services.split(",") if item.strip()]
         elif not isinstance(services, list):
             services = []
+        self._apply_corpus_governance_defaults(metadata, file_path.stem)
         document = {**metadata, "title": title, "content": content, "services": services}
         document["_embedding"] = self.embedding_model.embed(self._document_text(document))
         self._document_cache[path] = document
         return dict(document)
+
+    @staticmethod
+    def _apply_corpus_governance_defaults(metadata: dict[str, Any], default_ref: str) -> None:
+        if "tenant_scope" not in metadata:
+            metadata["tenant_scope"] = "global"
+        if "review_status" not in metadata:
+            metadata["review_status"] = "approved"
+        if "corpus_classification" not in metadata:
+            metadata["corpus_classification"] = "PRODUCTION_CURATED"
+        if "content_version" not in metadata:
+            metadata["content_version"] = 1
+        if "owner_team" not in metadata:
+            metadata["owner_team"] = "platform-ops"
+        if "source_system" not in metadata:
+            metadata["source_system"] = "internal"
+        if "source_ref" not in metadata:
+            metadata["source_ref"] = str(metadata.get("alert_id") or default_ref)
+        if "created_at" not in metadata:
+            metadata["created_at"] = "2026-01-01T00:00:00Z"
+        if "updated_at" not in metadata:
+            metadata["updated_at"] = "2026-01-01T00:00:00Z"
+        if "content_checksum" not in metadata:
+            metadata["content_checksum"] = content_checksum(str(default_ref))
 
     def _read_metadata(self, path: Path) -> dict[str, Any]:
         metadata: dict[str, Any] = {"path": str(path), "kind": path.parent.name.rstrip("s")}
@@ -1994,14 +2069,15 @@ class VectorDBConnector(BaseConnector):
         except OSError:
             return metadata
 
-        title = str(metadata.get("title") or path.stem.replace("-", " "))
-        services = metadata.get("services", [])
+        title = str(metadata.get("title") or metadata.get("alert_name") or path.stem.replace("-", " "))
+        services = metadata.get("services") or metadata.get("service", [])
         if isinstance(services, str):
             services = [item.strip() for item in services.split(",") if item.strip()]
         elif not isinstance(services, list):
             services = []
         metadata["title"] = title
         metadata["services"] = services
+        self._apply_corpus_governance_defaults(metadata, path.stem)
         return metadata
 
     def _parse_metadata_value(self, value: str) -> Any:

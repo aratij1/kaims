@@ -11,6 +11,7 @@
       "read_metrics",
       "script_execution",
       "restart_service",
+      "scale_service",
       "verify_slo",
       "verify_service_health"
     ]
@@ -269,7 +270,12 @@
         "read_metrics",
         "api_execution",
         "script_execution",
-        "verify_service_health"
+        "restart_service",
+        "scale_service",
+        "rollback_deployment",
+        "verify_slo",
+        "verify_service_health",
+        "verify_onboarding_flow"
       ],
       "health_check": {
         "method": "GET",

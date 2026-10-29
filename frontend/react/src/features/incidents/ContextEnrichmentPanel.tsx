@@ -65,6 +65,9 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
   const [error, setError] = useState("");
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [references, setReferences] = useState<Record<string, string>>({});
+  const [observedSymptoms, setObservedSymptoms] = useState<Record<string, string>>({});
+  const [businessImpacts, setBusinessImpacts] = useState<Record<string, string>>({});
+  const [remediationSteps, setRemediationSteps] = useState<Record<string, string>>({});
   const [expandedRequirements, setExpandedRequirements] = useState<Set<string>>(new Set());
   const [activeRequirementId, setActiveRequirementId] = useState("");
   const [announcement, setAnnouncement] = useState("");
@@ -134,15 +137,51 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
     return () => { cancelled = true; if (timer) window.clearTimeout(timer); document.removeEventListener("visibilitychange", resume); };
   }, [incidentId, load, operationsState]);
 
+  const buildPreparedDraft = useCallback((item: Requirement) => {
+    const gap = declaredGaps.find((candidate) => candidate.category.toLowerCase() === item.category.toLowerCase());
+    return [
+      `Evidence requirement: ${item.question}`,
+      item.reason || gap?.reason ? `Why it is needed: ${item.reason || gap?.reason}` : "",
+      proposedRcaDraft ? `AI hypothesis to verify or correct: ${proposedRcaDraft}` : "",
+      "",
+      `Verified ${item.category.replaceAll("_", " ")} observation: `,
+    ].filter(Boolean).join("\n");
+  }, [declaredGaps, proposedRcaDraft]);
+
   const submit = async (requirementId: string) => {
     const response = String(answers[requirementId] || "").trim();
     const sourceReference = String(references[requirementId] || "").trim();
-    if (!response || !sourceReference) return;
+    const observedSymptomsText = String(observedSymptoms[requirementId] || "").trim();
+    const businessImpactText = String(businessImpacts[requirementId] || "").trim();
+    const remediationStepsText = String(remediationSteps[requirementId] || "").trim();
+    if ((!response && !observedSymptomsText) || !sourceReference) return;
     setLoading(true); setError("");
     try {
-      await routeJson(`/api-gateway/incidents/${encodeURIComponent(incidentId)}/context-gaps/${encodeURIComponent(requirementId)}/responses`, { method: "POST", headers, body: JSON.stringify({ response, source_reference: sourceReference }) });
+      const payload: Record<string, unknown> = {
+        response: response || observedSymptomsText,
+        source_reference: sourceReference,
+      };
+      if (observedSymptomsText) {
+        payload.observed_symptoms = observedSymptomsText;
+        payload.root_cause = observedSymptomsText;
+      }
+      if (businessImpactText) {
+        payload.business_impact = businessImpactText;
+      }
+      if (remediationStepsText) {
+        payload.remediation_steps = remediationStepsText;
+        payload.create_runbook_draft = true;
+      }
+      await routeJson(`/api-gateway/incidents/${encodeURIComponent(incidentId)}/context-gaps/${encodeURIComponent(requirementId)}/responses`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
       setAnswers((current) => ({ ...current, [requirementId]: "" }));
       setReferences((current) => ({ ...current, [requirementId]: "" }));
+      setObservedSymptoms((current) => ({ ...current, [requirementId]: "" }));
+      setBusinessImpacts((current) => ({ ...current, [requirementId]: "" }));
+      setRemediationSteps((current) => ({ ...current, [requirementId]: "" }));
       setAnnouncement("Human evidence was accepted. KaiMS will publish a new governed context snapshot and analysis.");
       await load(true);
       await incidentRefresh.current();
@@ -239,13 +278,13 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
     setReferences((values) => {
       const next = { ...values };
       current.forEach((item) => {
-        if (!next[item.requirement_id]?.trim() && item.suggested_source_reference) {
+        if (item.suggested_source_reference && !next[item.requirement_id]?.trim()) {
           next[item.requirement_id] = String(item.suggested_source_reference);
         }
       });
       return next;
     });
-  }, [current, proposedRcaDraft]);
+  }, [current, incidentId, proposedRcaDraft]);
 
   const card = (item: Requirement, historical = false) => {
     const request = item.active_human_request; const job = item.latest_job;
@@ -286,17 +325,52 @@ export default function ContextEnrichmentPanel({ incidentId, alertId, accessToke
       }}>
         <summary><span>{request?.status === "assignment_blocked" ? "Provide evidence yourself" : request?.status === "pending" ? "Review and provide evidence" : "Add optional evidence"}</span><small>{expandedRequirements.has(item.requirement_id) ? "Hide form" : "Open form"}</small></summary>
         <div className="context-enrichment-response">
-        <small>{request?.status === "assignment_blocked" ? "Human evidence assignment is blocked. An authorized operator can provide a verified observation here." : request?.status === "pending" ? `Assigned to ${request.expected_responder || "an authorized responder"}${request.due_at ? ` · due ${formatUtcTimestamp(request.due_at)}` : ""}` : "A verified user response may be submitted here. Collection progress is shown only when a job is recorded."}</small>
-        <small>Replace the prepared draft with verified facts and a supporting source.</small>
-        <label>Verified observation<textarea rows={6} ref={(node) => {
-          if (!node && focusedReviewInput.current?.dataset.requirementResponse === item.requirement_id
-            && document.activeElement === focusedReviewInput.current) reviewFocusPending.current = true;
-          if (node && reviewFocusPending.current && !historical && item.requirement_id === activeRequirementId) {
-            node.focus(); focusedReviewInput.current = node; reviewFocusPending.current = false;
-          }
-        }} data-requirement-response={item.requirement_id} aria-label={`Response for ${item.category}`} value={answers[item.requirement_id] || ""} onChange={(event) => setAnswers((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="State the verified factual observation. Remove any AI claim you could not confirm." /></label>
-        <label>Supporting source<input aria-label={`Source reference for ${item.category}`} value={references[item.requirement_id] || ""} onChange={(event) => setReferences((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Source reference (ticket, dashboard, or catalog URL)" /></label>
-        <button type="button" className="button-primary" disabled={loading || !String(answers[item.requirement_id] || "").trim() || !String(references[item.requirement_id] || "").trim()} onClick={() => void submit(item.requirement_id)}>Submit reviewed evidence and rerun RCA</button>
+        <div className="context-enrichment-guidance">
+          <strong>Who provides this &amp; what is missing</strong>
+          <p><strong>Intended responder roles:</strong> Internal operational responders (<em>Assigned Responder, On-Call SRE, L1/L2/L3 Engineer, Service Owner, or Administrator</em>) — not end users. Requires authenticated operator permissions (<code>ADMIN</code>, <code>OPERATOR</code>, or <code>HITL_APPROVER</code>).</p>
+          <p><strong>Missing information for this requirement:</strong> {item.question} ({item.reason || "Needed to corroborate the root cause with attributable evidence."})</p>
+          <p><strong>RCA sufficiency rule:</strong> Confirming an RCA and unlocking an executable remediation plan requires <strong>&ge; 65% confidence</strong> and <strong>&ge; 2 independent corroborating evidence sources</strong> (currently {citationCount} traceable citation{citationCount === 1 ? "" : "s"} bound). Submitting a single uncorroborated source records context but will not falsely confirm the RCA.</p>
+        </div>
+        <small>{request?.status === "assignment_blocked" ? "Human evidence assignment is blocked. An authorized operator can provide a verified observation here." : request?.status === "pending" ? `Assigned to ${request.expected_responder || "an authorized responder (L1/L2/L3 Engineer, On-Call SRE, or Service Owner)"}${request.due_at ? ` · due ${formatUtcTimestamp(request.due_at)}` : ""}` : "A verified operator response may be submitted here. Collection progress is shown only when a job is recorded."}</small>
+        <div className="action-row">
+          <small>Complete the required fields below using verified facts and an attributable source reference.</small>
+          <button type="button" className="button-secondary" onClick={() => setAnswers((value) => ({ ...value, [item.requirement_id]: buildPreparedDraft(item) }))}>Reset to prepared draft</button>
+        </div>
+        <label>
+          <span>Verified observation <strong>(Required)</strong></span>
+          <small>Plain-language factual observation verified from source code, logs, metrics, or traces. Example: <code>In app.py line 42, healthz divides by zero when count=0; HTTP 500 observed at 14:02 UTC.</code></small>
+          <textarea rows={6} ref={(node) => {
+            if (!node && focusedReviewInput.current?.dataset.requirementResponse === item.requirement_id
+              && document.activeElement === focusedReviewInput.current) reviewFocusPending.current = true;
+            if (node && reviewFocusPending.current && !historical && item.requirement_id === activeRequirementId) {
+              node.focus(); focusedReviewInput.current = node; reviewFocusPending.current = false;
+            }
+          }} data-requirement-response={item.requirement_id} aria-label={`Response for ${item.category}`} value={answers[item.requirement_id] || ""} onChange={(event) => setAnswers((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="State the verified factual observation. Remove any AI claim you could not confirm." />
+        </label>
+        <label>
+          <span>Supporting source <strong>(Required)</strong></span>
+          <small>Attributable URI, ticket key, commit/file path, or dashboard link. Example: <code>git://service-repo/app.py#L42</code>, <code>jira://OPS-204</code>, or click &ldquo;Use internal evidence URI&rdquo;.</small>
+          <div className="action-row">
+            <input aria-label={`Source reference for ${item.category}`} value={references[item.requirement_id] || ""} onChange={(event) => setReferences((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder={item.suggested_source_reference || `e.g. git://repo/file#L42 or kaiops://human-evidence/${incidentId}/${item.requirement_id}`} />
+            <button type="button" className="button-secondary" onClick={() => setReferences((value) => ({ ...value, [item.requirement_id]: String(item.suggested_source_reference || `kaiops://human-evidence/${incidentId}/${item.requirement_id}`) }))}>Use internal evidence URI</button>
+          </div>
+        </label>
+        <label>
+          <span>Observed symptoms / root cause <em>(Optional — enriches RCA &amp; knowledge draft)</em></span>
+          <small>Summarize the technical symptom and verified root cause. Example: <code>Unhandled ZeroDivisionError in /healthz endpoint when request counter is 0.</code></small>
+          <textarea rows={3} aria-label={`Observed symptoms or root cause for ${item.category}`} value={observedSymptoms[item.requirement_id] || ""} onChange={(event) => setObservedSymptoms((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Example: Unhandled ZeroDivisionError in /healthz when counter is zero..." />
+        </label>
+        <label>
+          <span>Business impact <em>(Optional — records operational/SLA impact)</em></span>
+          <small>Describe customer, SLA, or service impact during the incident window. Example: <code>Synthetic probe failing every 15s in dev; no customer data loss.</code></small>
+          <textarea rows={2} aria-label={`Business impact for ${item.category}`} value={businessImpacts[item.requirement_id] || ""} onChange={(event) => setBusinessImpacts((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Example: Synthetic health check failing in dev; no production customer transactions dropped..." />
+        </label>
+        <label>
+          <span>Recommended remediation steps <em>(Optional — creates Draft Runbook &amp; Knowledge Document)</em></span>
+          <small>Step-by-step fix and validation commands saved as a governed draft runbook in Knowledge Development. Example: <code>1. Guard denominator in app.py. 2. Restart container. 3. Verify GET /healthz returns HTTP 200.</code></small>
+          <textarea rows={3} aria-label={`Recommended remediation steps for ${item.category}`} value={remediationSteps[item.requirement_id] || ""} onChange={(event) => setRemediationSteps((value) => ({ ...value, [item.requirement_id]: event.target.value }))} placeholder="Example: 1. Patch denominator check in app.py. 2. Redeploy service. 3. Verify /healthz returns 200 OK..." />
+        </label>
+        <button type="button" className="button-primary" disabled={loading || (!String(answers[item.requirement_id] || "").trim() && !String(observedSymptoms[item.requirement_id] || "").trim()) || !String(references[item.requirement_id] || "").trim()} onClick={() => void submit(item.requirement_id)}>Submit reviewed evidence and rerun RCA</button>
         </div>
       </details> : null}
     </article>;

@@ -3439,6 +3439,26 @@ async def review_knowledge_catalog_candidate(
     )
 
 
+@app.post("/knowledge-development/runbooks/{runbook_id}/approve")
+async def approve_knowledge_runbook_draft(
+    runbook_id: str,
+    request: Request,
+    version: int = 1,
+    payload: dict[str, Any] = REQUEST_BODY,
+    x_trace_id: str | None = Header(default=None),
+    auth: AuthContext = Depends(require_roles(SystemRole.ADMINISTRATOR.value, "HITL_APPROVER")),
+) -> dict[str, Any]:
+    return await guarded_proxy(
+        request=request,
+        method="POST",
+        path=f"/runbooks/{quote(runbook_id, safe='')}/approve?{urlencode({'version': version})}",
+        target_base=settings.knowledge_development_url,
+        payload={**payload, "tenant_id": auth.tenant_id, "actor": auth.username or str(auth.user_id)},
+        trace_id=trace_id_from_header(x_trace_id),
+        timeout_seconds=30,
+    )
+
+
 async def _evidence_queue_health(tenant_id: str) -> dict[str, Any]:
     factory = getattr(app.state, "session_factory", None)
     if not settings.database_enabled or factory is None:
@@ -4078,9 +4098,14 @@ async def get_unified_incident_inbox(
         "inbox_view": inbox_view,
         "record_type": record_type,
     }
+    effective_project_id = (
+        None
+        if str(project_id or "").strip().lower() in {"all", "all applications", "all-applications", "unscoped", "all_applications"}
+        else project_id
+    )
     for key, value in {
         "cursor": cursor,
-        "project_id": project_id,
+        "project_id": effective_project_id,
         "risk_tier": risk_tier,
         "execution_mode": execution_mode,
         "transport_provider": transport_provider,

@@ -8,7 +8,7 @@ from uuid import UUID
 from common.database import ContextSnapshotRecord
 
 REFERENCE_VERSION = "kaims.context-outbox-ref.v1"
-CONTEXT_TOPICS = frozenset({"context-events", "context-initial-events"})
+CONTEXT_TOPICS = frozenset({"context-events", "context-initial-events", "resolution-events"})
 
 
 def context_checksum(context: dict) -> str:

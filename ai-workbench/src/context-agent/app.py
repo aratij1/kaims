@@ -26,7 +26,7 @@ from common.context_enrichment_contract import (
     next_authorized_enrichment_connector,
     normalize_connector_response,
 )
-from common.database import AuditLogRecord, ContextEnrichmentJobRecord
+from common.database import AuditLogRecord, ContextEnrichmentJobRecord, GovernedRagDocumentRecord
 from common.event_publishers import EventPublisher, RabbitMQPublisher, build_agent_event_contract, build_event_envelope
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
@@ -60,7 +60,7 @@ from context_agent.context_quality import (
 from context_agent.knowledge_graph import KnowledgeGraph
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 settings = get_settings()
 settings.service_name = "context-agent"
@@ -295,9 +295,39 @@ async def _collect_context_with_strategy_unlocked(
                         CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", "invalid").inc()
                         logger.exception("invalid cached context knowledge id=%s; refreshing", cached.get("id"))
                     else:
-                        cached_metadata = context.metadata if isinstance(context.metadata, dict) else {}
+                        cached_metadata = dict(context.metadata if isinstance(context.metadata, dict) else {})
+                        learned_runbooks = await repo.find_learned_runbooks(
+                            tenant_id=tenant_id,
+                            service=service,
+                            alert_name=str(alert.name or "unknown"),
+                            alert_signature=signature,
+                            limit=5,
+                        )
+                        if learned_runbooks:
+                            if not str(context.runbook or "").strip():
+                                context.runbook = str(learned_runbooks[0].get("markdown") or "")
+                            cached_metadata["matched_learned_runbook"] = learned_runbooks[0]
+                            cached_metadata["learned_runbooks"] = learned_runbooks
+                            cached_metadata["document_available"] = True
+                        alert_meta = alert.metadata if isinstance(alert.metadata, dict) else {}
+                        if isinstance(alert_meta.get("observability"), dict) and alert_meta.get("observability"):
+                            context.observability = {**dict(context.observability or {}), **dict(alert_meta["observability"])}
+                        if isinstance(alert_meta.get("discovery_report"), dict):
+                            cached_metadata["discovery_report"] = dict(alert_meta["discovery_report"])
+                        if isinstance(alert_meta.get("current_evidence"), dict):
+                            merged_ev = dict(cached_metadata.get("context_evidence") or {})
+                            for k, v in alert_meta["current_evidence"].items():
+                                if isinstance(v, list):
+                                    merged_ev[k] = list(v)
+                            cached_metadata["context_evidence"] = merged_ev
+                        if supplied_context is not None:
+                            if supplied_context.observability:
+                                context.observability = {**dict(context.observability or {}), **dict(supplied_context.observability)}
+                            sup_meta = supplied_context.metadata if isinstance(supplied_context.metadata, dict) else {}
+                            if isinstance(sup_meta.get("discovery_report"), dict):
+                                cached_metadata["discovery_report"] = dict(sup_meta["discovery_report"])
                         cached_subject = str(cached_metadata.get("context_subject_fingerprint") or "")
-                        scope_matches = bool(cached_subject and cached_subject == subject_fingerprint)
+                        scope_matches = bool(not cached_subject or cached_subject == subject_fingerprint)
                         cached_resolution = cached.get("resolution_payload", {})
                         resolution_reusable = _qualified_resolution_cache(cached_resolution)
                         context.metadata = {
@@ -316,11 +346,35 @@ async def _collect_context_with_strategy_unlocked(
                             max_evidence_per_source=max_evidence,
                         )
                         quality = context.metadata["context_quality"]
-                        continue_with_refresh = not scope_matches or (
-                            strategy == "auto" and not bool(quality.get("reusable"))
+                        runbook_now_available = False
+                        if not str(context.runbook or "").strip():
+                            try:
+                                vc = vector_connector()
+                                rb_matches = vc.search(
+                                    f"{alert.name} {service}",
+                                    limit=1,
+                                    preferred_kind="runbook",
+                                    service=service,
+                                    tenant_id=tenant_id,
+                                )
+                                runbook_now_available = any(
+                                    str(m.get("kind", "")).lower() == "runbook"
+                                    and vc.context_match_relevant(m, service)
+                                    for m in rb_matches
+                                )
+                            except Exception:
+                                runbook_now_available = False
+                        continue_with_refresh = (
+                            not scope_matches
+                            or runbook_now_available
+                            or (strategy == "auto" and not bool(quality.get("reusable")))
                         )
                         if continue_with_refresh:
-                            reason = "subject_scope_changed" if not scope_matches else "cached_context_below_quality"
+                            reason = (
+                                "subject_scope_changed"
+                                if not scope_matches
+                                else ("runbook_now_available" if runbook_now_available else "cached_context_below_quality")
+                            )
                             CONTEXT_KNOWLEDGE_OPERATIONS.labels("lookup", reason).inc()
                             _record_context_quality(context, "refresh", reason)
                             logger.info(
@@ -409,6 +463,27 @@ async def _collect_context_with_strategy_unlocked(
         CONTEXT_STRATEGY_DURATION.labels(strategy, "error").observe(max(0.0, perf_counter() - started))
         raise
     collected_at = datetime.now(UTC)
+    if database_available:
+        try:
+            async with session_factory() as session:
+                repo = IncidentRepository(session)
+                learned_runbooks = await repo.find_learned_runbooks(
+                    tenant_id=tenant_id,
+                    service=service,
+                    alert_name=str(alert.name or "unknown"),
+                    alert_signature=signature,
+                    limit=5,
+                )
+                if learned_runbooks:
+                    if not str(context.runbook or "").strip():
+                        context.runbook = str(learned_runbooks[0].get("markdown") or "")
+                    meta_dict = dict(context.metadata if isinstance(context.metadata, dict) else {})
+                    meta_dict["matched_learned_runbook"] = learned_runbooks[0]
+                    meta_dict["learned_runbooks"] = learned_runbooks
+                    meta_dict["document_available"] = True
+                    context.metadata = meta_dict
+        except Exception:
+            logger.exception("learned runbook lookup failed during fresh context collection")
     context.metadata = {
         **(context.metadata if isinstance(context.metadata, dict) else {}),
         "context_strategy": strategy,
@@ -1073,13 +1148,20 @@ def _validate_governed_index_event(payload: dict[str, Any]) -> tuple[str, UUID]:
     return tenant_id, document_id
 
 
-async def _index_governed_document(app: FastAPI, payload: dict[str, Any]) -> None:
+async def _index_governed_document(
+    app: FastAPI,
+    payload: dict[str, Any],
+    *,
+    stale_indexing_seconds: float = 60.0,
+) -> None:
     tenant_id, document_id = _validate_governed_index_event(payload)
     retry_limit = max(1, int(getattr(settings, "rag_index_retry_limit", 5) or 5))
     async with app.state.session_factory() as session:
         repo = IncidentRepository(session)
         document = await repo.claim_governed_rag_document_for_indexing(
-            tenant_id=tenant_id, document_id=document_id,
+            tenant_id=tenant_id,
+            document_id=document_id,
+            stale_indexing_seconds=stale_indexing_seconds,
         )
         if document is None:
             await session.rollback()
@@ -1107,27 +1189,43 @@ async def _index_governed_document(app: FastAPI, payload: dict[str, Any]) -> Non
             raise
 
 
-async def _governed_rag_retry_loop(app: FastAPI) -> None:
+async def _run_governed_rag_retry_pass(
+    app: FastAPI,
+    *,
+    stale_indexing_seconds: float = 60.0,
+) -> int:
     retry_limit = max(1, int(getattr(settings, "rag_index_retry_limit", 5) or 5))
+    async with app.state.session_factory() as session:
+        due = await IncidentRepository(session).list_due_governed_rag_index_retries(
+            retry_limit=retry_limit,
+            stale_indexing_seconds=stale_indexing_seconds,
+        )
+    processed = 0
+    for document in due:
+        payload = {
+            "tenant_id": document.tenant_id,
+            "document_id": str(document.document_id),
+            "content_checksum": document.content_checksum,
+        }
+        try:
+            await _index_governed_document(
+                app,
+                payload,
+                stale_indexing_seconds=stale_indexing_seconds,
+            )
+            processed += 1
+        except Exception:
+            logger.exception(
+                "governed RAG index retry failed",
+                extra={"document_id": str(document.document_id)},
+            )
+    return processed
+
+
+async def _governed_rag_retry_loop(app: FastAPI) -> None:
     while True:
         try:
-            async with app.state.session_factory() as session:
-                due = await IncidentRepository(session).list_due_governed_rag_index_retries(
-                    retry_limit=retry_limit,
-                )
-            for document in due:
-                payload = {
-                    "tenant_id": document.tenant_id,
-                    "document_id": str(document.document_id),
-                    "content_checksum": document.content_checksum,
-                }
-                try:
-                    await _index_governed_document(app, payload)
-                except Exception:
-                    logger.exception(
-                        "governed RAG index retry failed",
-                        extra={"document_id": str(document.document_id)},
-                    )
+            await _run_governed_rag_retry_pass(app)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1281,6 +1379,32 @@ async def startup(app: FastAPI) -> None:
             raise RuntimeError(
                 "context enrichment schema is incompatible; run pending migrations before startup"
             ) from exc
+        try:
+            async with app.state.session_factory() as session:
+                gov_rows = (await session.execute(
+                    select(GovernedRagDocumentRecord).where(
+                        GovernedRagDocumentRecord.review_status == "approved",
+                        GovernedRagDocumentRecord.index_status.in_(("indexed", "pending")),
+                    )
+                )).scalars().all()
+            vc = vector_connector()
+            for gov_doc in gov_rows:
+                try:
+                    if gov_doc.index_status == "indexed":
+                        await vc.index_governed_document(gov_doc)
+                    elif gov_doc.index_status == "pending":
+                        await _index_governed_document(app, {
+                            "tenant_id": gov_doc.tenant_id,
+                            "document_id": str(gov_doc.document_id),
+                            "content_checksum": gov_doc.content_checksum,
+                        })
+                except Exception:
+                    logger.exception(
+                        "governed RAG startup hydration failed for document; retry loop will recover",
+                        extra={"document_id": str(gov_doc.document_id)},
+                    )
+        except Exception:
+            logger.exception("governed RAG startup hydration failed; retry loop will recover")
     provider = str(getattr(settings, "event_bus_provider", "rabbitmq") or "rabbitmq").strip().lower()
     app.state.message_bus_publishers = {provider: app.state.producer, "rabbitmq": app.state.producer}
 
@@ -2091,6 +2215,8 @@ async def _create_crawled_evidence_drafts(
         tenant_id=tenant_id, alert_id=candidate["alert_id"],
     )
     existing_kinds = {str(row.get("document_kind") or "").lower() for row in existing}
+    if set(INCIDENT_DOCUMENT_KINDS).issubset(existing_kinds):
+        return 0
     documents = [
         row for row in _crawled_incident_document_bundle(
             alert_name=str(alert.name or incident.title or "Incident"),
@@ -2633,6 +2759,38 @@ async def _reconcile_context_enrichment_tenant(
                     if str((existing_by_key.get((row.rca_version, row.category, row.question)) or {}).get("status") or "identified").lower()
                     not in {"collected", "answered", "satisfied", "scheduled", "collecting"}
                 ]
+                settled_prior_keys = {
+                    (str(row["category"]), str(row["question"]).strip().casefold())
+                    for row in existing
+                    if int(row.get("rca_version") or 0) < int(candidate["rca_version"])
+                    and str(row.get("status") or "").lower() in {
+                        "collected", "answered", "satisfied", "blocked", "human_requested", "assignment_blocked",
+                    }
+                }
+                settled_prior_categories = {
+                    str(row["category"])
+                    for row in existing
+                    if int(row.get("rca_version") or 0) < int(candidate["rca_version"])
+                    and str(row.get("status") or "").lower() in {
+                        "collected", "answered", "satisfied", "blocked", "human_requested", "assignment_blocked",
+                    }
+                }
+                if int(candidate["rca_version"]) > 1 and (settled_prior_keys or settled_prior_categories):
+                    requirements = [
+                        row for row in requirements
+                        if (row.category, row.question.strip().casefold()) not in settled_prior_keys
+                        and row.category not in settled_prior_categories
+                    ]
+                    missing = [
+                        row for row in missing
+                        if (row.category, row.question.strip().casefold()) not in settled_prior_keys
+                        and row.category not in settled_prior_categories
+                    ]
+                    work = [
+                        row for row in work
+                        if (row.category, row.question.strip().casefold()) not in settled_prior_keys
+                        and row.category not in settled_prior_categories
+                    ]
                 summary["requirements_created"] += len(missing)
                 context_payload = candidate["context"] if isinstance(candidate["context"], dict) else {}
                 alert_payload = context_payload.get("alert") if isinstance(context_payload.get("alert"), dict) else {}
@@ -2698,7 +2856,7 @@ async def _reconcile_context_enrichment_tenant(
                     and str(row["requirement_id"]) in dead_letter_requirement_ids
                     and str(row["requirement_id"]) not in recoverable_ids
                     and str(row["requirement_id"]) not in active_job_requirement_ids
-                    and str(row.get("status")) not in {"human_requested", "assignment_blocked", "collected", "satisfied", "answered"}
+                    and str(row.get("status")) not in {"human_requested", "assignment_blocked", "collected", "satisfied", "answered", "blocked", "cancelled"}
                 ]
                 summary["jobs_scheduled"] += sum(1 for _, connector in planned if connector)
                 summary["human_requests_created"] += (
@@ -2826,7 +2984,7 @@ async def respond_to_context_gap(
         try:
             result = await ContextEnrichmentRepository(session).record_human_evidence_response(
                 tenant_id=tenant, incident_id=incident_id, requirement_id=requirement_id,
-                response=request.model_dump(mode="json"),
+                response=request.model_dump(mode="json", exclude_unset=True),
             )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -2839,6 +2997,25 @@ async def respond_to_context_gap(
                 "code": "human_evidence_rejected", "message": str(exc),
             }) from exc
         await session.commit()
+    gov_doc = result.get("governed_document")
+    if isinstance(gov_doc, dict) and gov_doc.get("document_id"):
+        try:
+            await _index_governed_document(app, {
+                "tenant_id": tenant,
+                "document_id": gov_doc["document_id"],
+                "content_checksum": gov_doc["content_checksum"],
+            })
+            result["indexing_status"] = "indexed"
+            result["runbook_status"] = "indexed"
+            result["learning_complete"] = bool(result.get("reusable", True))
+        except Exception as exc:
+            logger.exception("immediate governed RAG indexing failed after human evidence response; retry loop will recover")
+            result["indexing_status"] = "failed"
+            result["indexing_error"] = str(exc)
+            result["learning_complete"] = False
+    else:
+        result["indexing_status"] = "pending_approval" if result.get("knowledge_draft_id") else "not_applicable"
+        result["learning_complete"] = False
     return result
 
 
@@ -2906,7 +3083,26 @@ async def approve_knowledge_rag_draft(
             await session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     draft, document = approved
-    return {"status": "approved_pending_index", "draft": draft, "document": document}
+    indexed = False
+    index_error: str | None = None
+    try:
+        await _index_governed_document(app, {
+            "tenant_id": tenant,
+            "document_id": document["document_id"],
+            "content_checksum": document["content_checksum"],
+        })
+        indexed = True
+    except Exception as exc:
+        index_error = str(exc)
+        logger.exception("immediate governed RAG indexing failed; retry loop will recover")
+    return {
+        "status": "approved_pending_index",
+        "indexing_status": "indexed" if indexed else "failed",
+        "learning_complete": indexed,
+        "indexing_error": index_error,
+        "draft": draft,
+        "document": document,
+    }
 
 
 def _list_evidence_rag_drafts_sync(
@@ -3044,7 +3240,26 @@ async def approve_evidence_rag_draft(
             await session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     draft, document = approved
-    return {"status": "approved_pending_index", "draft": draft, "document": document}
+    indexed = False
+    index_error: str | None = None
+    try:
+        await _index_governed_document(app, {
+            "tenant_id": tenant,
+            "document_id": document["document_id"],
+            "content_checksum": document["content_checksum"],
+        })
+        indexed = True
+    except Exception as exc:
+        index_error = str(exc)
+        logger.exception("immediate governed RAG indexing failed; retry loop will recover")
+    return {
+        "status": "approved_pending_index",
+        "indexing_status": "indexed" if indexed else "failed",
+        "learning_complete": indexed,
+        "indexing_error": index_error,
+        "draft": draft,
+        "document": document,
+    }
 
 
 @app.post("/rag/evidence-drafts/{draft_id}/revision")
@@ -3081,12 +3296,24 @@ async def retry_governed_rag_index(
         if retry is None:
             raise HTTPException(status_code=404, detail="failed governed document was not found")
         await session.commit()
-    await _index_governed_document(app, {
-        "tenant_id": tenant,
+    indexed = False
+    index_error: str | None = None
+    try:
+        await _index_governed_document(app, {
+            "tenant_id": tenant,
+            "document_id": document_id,
+            "content_checksum": retry["content_checksum"],
+        })
+        indexed = True
+    except Exception as exc:
+        index_error = str(exc)
+        logger.exception("manual governed RAG index retry failed; retry loop will recover")
+    return {
+        "status": "retry_requested",
         "document_id": document_id,
-        "content_checksum": retry["content_checksum"],
-    })
-    return {"status": "retry_requested", "document_id": document_id}
+        "indexing_status": "indexed" if indexed else "failed",
+        "indexing_error": index_error,
+    }
 
 
 @app.post("/knowledge-pack/draft")

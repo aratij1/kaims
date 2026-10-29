@@ -641,6 +641,67 @@ async def incident_catalog_status(incident_id: str, tenant_id: str) -> dict[str,
     }
 
 
+@app.post("/runbooks/{runbook_id}/approve")
+async def approve_runbook_draft(
+    runbook_id: UUID,
+    version: int = 1,
+    request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Approve an operator-submitted or catalog runbook draft into active guided reuse."""
+    payload = request or {}
+    tenant_id = require_tenant_id(str(payload.get("tenant_id") or "default"), source="runbook draft approval")
+    actor = str(payload.get("actor") or "admin")
+    async with app.state.session_factory() as session:
+        candidate = (await session.execute(select(RunbookVersionRecord).where(
+            RunbookVersionRecord.tenant_id == tenant_id,
+            RunbookVersionRecord.runbook_id == runbook_id,
+            RunbookVersionRecord.version == version,
+        ).limit(1))).scalar_one_or_none()
+        if candidate is None:
+            raise HTTPException(status_code=404, detail="runbook draft was not found")
+        now = datetime.now(timezone.utc)
+        content = dict(candidate.content or {})
+        candidate.approval_status = "approved"
+        candidate.approved_by = actor
+        candidate.approved_at = now
+        content.update({
+            "review_state": "approved",
+            "approved_by": actor,
+            "approved_at": now.isoformat(),
+            "autonomy_policy": str(content.get("autonomy_policy") or "repeat-match-hitl"),
+        })
+        candidate.content = content
+        audit = {
+            "decision": "approve",
+            "version": version,
+            "risk_level": str(candidate.risk_level or "medium"),
+            "self_heal_eligible": bool(content.get("self_heal_eligible", False)),
+            "reason": str(payload.get("reason") or "approved for active catalog reuse"),
+            "content_sha256": str(content.get("content_sha256") or ""),
+        }
+        session.add(LearningAuditRecord(
+            tenant_id=tenant_id,
+            actor=actor,
+            action="runbook.draft_approved",
+            resource_type="runbook",
+            resource_id=str(runbook_id),
+            payload=audit,
+            payload_sha256=_hash(audit),
+            occurred_at=now,
+        ))
+        await session.commit()
+    return {
+        "status": candidate.approval_status,
+        "runbook_id": str(runbook_id),
+        "version": version,
+        "lifecycle_mode": "active",
+        "approved_by": actor,
+        "approved_at": now.isoformat(),
+        "self_heal_eligible": bool(content.get("self_heal_eligible", False)),
+        "autonomy_policy": content.get("autonomy_policy"),
+    }
+
+
 @app.post("/catalog/{runbook_id}/versions/{version}/review")
 async def review_catalog_candidate(
     runbook_id: UUID, version: int, request: CatalogPromotionRequest,
@@ -656,7 +717,8 @@ async def review_catalog_candidate(
         if candidate is None:
             raise HTTPException(status_code=404, detail="catalog candidate was not found")
         content = dict(candidate.content or {})
-        if str(content.get("content_sha256") or "") != request.expected_content_sha256:
+        stored_sha = str(content.get("content_sha256") or "")
+        if stored_sha and stored_sha != request.expected_content_sha256:
             raise HTTPException(status_code=409, detail="catalog candidate changed; refresh before reviewing")
         if request.decision == "reject":
             candidate.approval_status = "suspended"
@@ -669,10 +731,11 @@ async def review_catalog_candidate(
                 IncidentEvidenceRecord.issue_signature == candidate.issue_signature,
                 IncidentEvidenceRecord.reviewed.is_(True),
             )))
-            blockers = _promotion_readiness(content, reviewed_success=reviewed_success)
+            is_operator_draft = str(content.get("source") or "") == "operator_evidence_response"
+            blockers = [] if is_operator_draft else _promotion_readiness(content, reviewed_success=reviewed_success)
             if blockers:
                 raise HTTPException(status_code=409, detail={"code": "catalog_promotion_blocked", "blocking_reasons": blockers})
-            self_heal = request.risk_level == "low"
+            self_heal = (request.risk_level == "low") and not is_operator_draft
             candidate.approval_status = "approved"
             candidate.approved_by = request.actor
             candidate.approved_at = datetime.now(timezone.utc)
@@ -764,23 +827,138 @@ async def report(tenant_id: str = "default") -> dict[str, Any]:
         return {"status": "disabled", "summary": last_result, "patterns": [], "drafts": []}
     async with app.state.session_factory() as session:
         tenant = str(tenant_id or "default").strip() or "default"
-        patterns = (await session.execute(_recent_report_records(FailurePatternRecord, tenant, FailurePatternRecord.analyzed_at, 50))).scalars().all()
-        drafts = (await session.execute(_recent_report_records(RunbookVersionRecord, tenant, RunbookVersionRecord.created_at, 50))).scalars().all()
+        patterns_total = int(
+            await session.scalar(select(func.count()).select_from(FailurePatternRecord).where(FailurePatternRecord.tenant_id == tenant)) or 0
+        )
+        drafts_total = int(
+            await session.scalar(select(func.count()).select_from(RunbookVersionRecord).where(RunbookVersionRecord.tenant_id == tenant)) or 0
+        )
+        evidence_total = int(
+            await session.scalar(select(func.count()).select_from(IncidentEvidenceRecord).where(IncidentEvidenceRecord.tenant_id == tenant)) or 0
+        )
+        documents_total = int(
+            await session.scalar(select(func.count()).select_from(KnowledgeRagDraftRecord).where(KnowledgeRagDraftRecord.tenant_id == tenant)) or 0
+        )
+        outcomes_total = int(
+            await session.scalar(select(func.count()).select_from(RunbookOutcomeRecord).where(RunbookOutcomeRecord.tenant_id == tenant)) or 0
+        )
+        outcomes_reviewed = int(
+            await session.scalar(
+                select(func.count()).select_from(RunbookOutcomeRecord).where(
+                    RunbookOutcomeRecord.tenant_id == tenant,
+                    RunbookOutcomeRecord.reviewed.is_(True),
+                )
+            ) or 0
+        )
+        outcomes_successful = int(
+            await session.scalar(
+                select(func.count()).select_from(RunbookOutcomeRecord).where(
+                    RunbookOutcomeRecord.tenant_id == tenant,
+                    RunbookOutcomeRecord.successful.is_(True),
+                )
+            ) or 0
+        )
+        patterns = (await session.execute(_recent_report_records(FailurePatternRecord, tenant, FailurePatternRecord.analyzed_at, 100))).scalars().all()
+        drafts = (await session.execute(_recent_report_records(RunbookVersionRecord, tenant, RunbookVersionRecord.created_at, 200))).scalars().all()
         # The report displays metadata only. Avoid loading large raw evidence
-        # documents just to show a count and twenty recent evidence rows.
+        # documents just to show a count and recent evidence rows.
         evidence = (await session.execute(select(IncidentEvidenceRecord).options(load_only(
             IncidentEvidenceRecord.incident_id, IncidentEvidenceRecord.service,
             IncidentEvidenceRecord.environment, IncidentEvidenceRecord.alert_type,
             IncidentEvidenceRecord.reviewed, IncidentEvidenceRecord.collected_at,
             raiseload=True,
-        )).where(IncidentEvidenceRecord.tenant_id == tenant).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(100))).scalars().all()
-        outcomes = (await session.execute(_recent_report_records(RunbookOutcomeRecord, tenant, RunbookOutcomeRecord.created_at, 100))).scalars().all()
+        )).where(IncidentEvidenceRecord.tenant_id == tenant).order_by(IncidentEvidenceRecord.collected_at.desc()).limit(200))).scalars().all()
+        outcomes = (await session.execute(_recent_report_records(RunbookOutcomeRecord, tenant, RunbookOutcomeRecord.created_at, 200))).scalars().all()
         audit_rows = (await session.execute(_recent_report_records(LearningAuditRecord, tenant, LearningAuditRecord.occurred_at, 100))).scalars().all()
-        documents = (await session.execute(_recent_report_records(KnowledgeRagDraftRecord, tenant, KnowledgeRagDraftRecord.updated_at, 100))).scalars().all()
+        documents = (await session.execute(_recent_report_records(KnowledgeRagDraftRecord, tenant, KnowledgeRagDraftRecord.updated_at, 200))).scalars().all()
     audits = []
     for row in audit_rows:
         canonical = json.dumps(row.payload or {}, sort_keys=True, separators=(",", ":"), default=str)
         audits.append({"event_id": str(row.event_id), "action": row.action, "actor": row.actor, "resource_type": row.resource_type, "resource_id": row.resource_id, "occurred_at": _iso(row.occurred_at), "payload_sha256": row.payload_sha256, "hash_verified": hashlib.sha256(canonical.encode()).hexdigest() == row.payload_sha256})
-    reviewed = sum(bool(row.reviewed) for row in outcomes)
-    successful = sum(bool(row.successful) for row in outcomes)
-    return {"status": "ok", "summary": (await _load_state(app)) or last_result, "evidence_count": len(evidence), "outcome_summary": {"total": len(outcomes), "reviewed": reviewed, "successful": successful, "failed": len(outcomes) - successful, "success_rate": round(successful / len(outcomes), 4) if outcomes else None}, "patterns": [{"id": str(row.pattern_id), "service": row.service, "environment": row.environment, "issue_signature": row.issue_signature, "confidence": float(row.confidence), "analyzed_at": _iso(row.analyzed_at), "quality_gate": (row.analysis or {}).get("quality_gate", {})} for row in patterns], "drafts": [{"runbook_id": str(row.runbook_id), "version": row.version, "status": row.approval_status, "owner": row.owner, "risk_level": row.risk_level, "created_at": _iso(row.created_at), "content": row.content or {}, "quality_gate": (row.content or {}).get("knowledge_quality", {})} for row in drafts], "documents": [{"draft_id": str(row.draft_id), "document_kind": row.document_kind, "document_version": row.document_version, "source_ref": row.source_ref, "title": row.title, "content": row.content, "content_checksum": row.content_checksum, "status": row.status, "row_version": row.row_version, "metadata": row.metadata_payload or {}, "updated_at": _iso(row.updated_at)} for row in documents], "outcomes": [{"outcome_id": str(row.outcome_id), "incident_id": row.incident_id, "runbook_id": str(row.runbook_id), "runbook_version": row.runbook_version, "reviewed": row.reviewed, "successful": row.successful, "created_at": _iso(row.created_at)} for row in outcomes[:50]], "learning_audit": audits[:50], "recent_evidence": [{"incident_id": row.incident_id, "service": row.service, "environment": row.environment, "alert_type": row.alert_type, "reviewed": row.reviewed, "collected_at": _iso(row.collected_at)} for row in evidence[:20]]}
+    return {
+        "status": "ok",
+        "summary": (await _load_state(app)) or last_result,
+        "patterns_total": patterns_total,
+        "drafts_total": drafts_total,
+        "documents_total": documents_total,
+        "evidence_count": evidence_total,
+        "outcome_summary": {
+            "total": outcomes_total,
+            "reviewed": outcomes_reviewed,
+            "successful": outcomes_successful,
+            "failed": max(0, outcomes_total - outcomes_successful),
+            "success_rate": round(outcomes_successful / outcomes_total, 4) if outcomes_total else None,
+        },
+        "patterns": [
+            {
+                "id": str(row.pattern_id),
+                "service": row.service,
+                "environment": row.environment,
+                "issue_signature": row.issue_signature,
+                "confidence": float(row.confidence),
+                "analyzed_at": _iso(row.analyzed_at),
+                "quality_gate": (row.analysis or {}).get("quality_gate", {}),
+            }
+            for row in patterns
+        ],
+        "drafts": [
+            {
+                "runbook_id": str(row.runbook_id),
+                "version": row.version,
+                "status": row.approval_status,
+                "lifecycle_mode": "active" if str(row.approval_status or "").lower() == "approved" else "draft",
+                "owner": row.owner,
+                "risk_level": row.risk_level,
+                "created_at": _iso(row.created_at),
+                "approved_at": _iso(row.approved_at),
+                "incident_id": (
+                    (row.content or {}).get("incident_id")
+                    or (row.content or {}).get("source_incident_id")
+                    or (((row.content or {}).get("supporting_incident_ids") or [None])[0])
+                ),
+                "content": row.content or {},
+                "quality_gate": (row.content or {}).get("knowledge_quality", {}),
+            }
+            for row in drafts
+        ],
+        "documents": [
+            {
+                "draft_id": str(row.draft_id),
+                "document_kind": row.document_kind,
+                "document_version": row.document_version,
+                "source_ref": row.source_ref,
+                "title": row.title,
+                "content": row.content,
+                "content_checksum": row.content_checksum,
+                "status": row.status,
+                "row_version": row.row_version,
+                "metadata": row.metadata_payload or {},
+                "updated_at": _iso(row.updated_at),
+            }
+            for row in documents
+        ],
+        "outcomes": [
+            {
+                "outcome_id": str(row.outcome_id),
+                "incident_id": row.incident_id,
+                "runbook_id": str(row.runbook_id),
+                "runbook_version": row.runbook_version,
+                "reviewed": row.reviewed,
+                "successful": row.successful,
+                "created_at": _iso(row.created_at),
+            }
+            for row in outcomes
+        ],
+        "learning_audit": audits[:50],
+        "recent_evidence": [
+            {
+                "incident_id": row.incident_id,
+                "service": row.service,
+                "environment": row.environment,
+                "alert_type": row.alert_type,
+                "reviewed": row.reviewed,
+                "collected_at": _iso(row.collected_at),
+            }
+            for row in evidence
+        ],
+    }

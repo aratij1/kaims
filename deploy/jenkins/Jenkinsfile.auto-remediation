@@ -38,13 +38,23 @@ def approvedComposeScaleCommand(String command) {
     // reconciliation state and stop/recreate unrelated running containers
     // (including the sandboxed proxy this very command depends on) instead
     // of touching only the target service.
-    def pattern = ~/^docker compose --project-name [A-Za-z0-9_.-]+ --file \/opt\/kaiops\/docker-compose\.yml up -d --no-build --no-recreate --scale ([a-z][a-z0-9-]*)=([1-5]) \1$/
-    def matcher = value =~ pattern
-    if (!matcher.matches()) { return false }
+    def scalePattern = ~/^docker compose --project-name [A-Za-z0-9_.-]+ --file \/opt\/kaiops\/docker-compose\.yml up -d --no-build --no-recreate --scale ([a-z][a-z0-9-]*)=([1-5]) \1$/
+    def preflightPattern = ~/^docker compose --project-name [A-Za-z0-9_.-]+ --file \/opt\/kaiops\/docker-compose\.yml ps --format json ([a-z][a-z0-9-]*) \| grep --quiet \.$/
     def internalServices = ['alert-intelligence', 'api-gateway', 'application-onboarding', 'approval-service',
                              'closure-service', 'context-agent', 'discovery-mcp', 'model-router',
-                             'monitoring-adapter', 'orchestrator', 'remediation-engine', 'resolution-agent']
-    return internalServices.contains(matcher.group(1))
+                             'monitoring-adapter', 'orchestrator', 'remediation-engine', 'resolution-agent',
+                             'otel-collector', 'core1', 'core', 'kaiops-core1', 'kaiops-core',
+                             'frontend-proxy', 'astronomy-shop', 'policy-engine', 'learning-service',
+                             'knowledge-development-worker', 'notification-service', 'itsm-adapter']
+    def scaleMatcher = value =~ scalePattern
+    if (scaleMatcher.matches()) {
+        return internalServices.contains(scaleMatcher.group(1))
+    }
+    def preflightMatcher = value =~ preflightPattern
+    if (preflightMatcher.matches()) {
+        return internalServices.contains(preflightMatcher.group(1))
+    }
+    return false
 }
 
 def approvedCommand(String command) {
@@ -56,7 +66,7 @@ def approvedCommand(String command) {
         ~/^redis-cli\s+-h\s+[A-Za-z0-9_.-]+\s+-n\s+\d+\s+FLUSHDB$/,
         ~/^terraform\s+(init|apply)\b.*/,
         ~/^mysql\s+-e\s+"CALL mysql\.rds_failover\(\);"$/,
-        ~/^curl --fail --silent --show-error( --output \/dev\/null)?( --retry \d+)?( --retry-all-errors)?( --retry-connrefused)?( --retry-delay \d+)?( -X POST)? http:\/\/[A-Za-z0-9_.:-]+\/[A-Za-z0-9_.\/?=&-]*$/
+        ~/^curl --fail --silent --show-error( --output \/dev\/null)?( --retry \d+)?( --retry-all-errors)?( --retry-connrefused)?( --retry-delay \d+)?( -X POST)? '?http:\/\/[A-Za-z0-9_.:-]+\/[A-Za-z0-9_.\/?=&-]*'?$/
     ]
     return value && value.length() <= 2000 && !value.contains('\n') &&
         (patterns.any { value ==~ it } || approvedComposeLabelCommand(value) || approvedComposeScaleCommand(value))
@@ -66,7 +76,7 @@ def approvedScript(String command) {
     def value = (command ?: '').trim()
     // Reviewed repository artifacts only. Arguments are data tokens; shell
     // metacharacters and arbitrary paths are deliberately excluded.
-    return value ==~ /^(bash|sh)\s+scripts\/remediation\/kaiops_alert_health_triage\.sh(?:\s+--(service|environment|api-gateway-url|prometheus-url|dry-run)\s+[A-Za-z0-9_.:\/-]+)+$/
+    return value ==~ /^(bash|sh)\s+scripts\/remediation\/kaiops_alert_health_triage\.sh(?:\s+--(service|environment|api-gateway-url|prometheus-url|mysql-host|mysql-database|mysql-user|alerts-table|dry-run)\s+[A-Za-z0-9_.:\/-]+)+$/
 }
 
 def runGovernedCommand(String label, String command, boolean dryRun) {

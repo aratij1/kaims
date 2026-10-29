@@ -132,3 +132,35 @@ def test_diagnostic_closure_does_not_claim_validated_recovery() -> None:
     assert result["status"] == "closed"
     assert "Diagnostic work was completed" in result["reason"]
     assert "without a technical recovery claim" in result["reason"]
+
+
+def test_lifecycle_state_awaiting_approval_is_not_regressed_by_newer_coarse_canonical_timestamp() -> None:
+    result = reduce_incident_status(
+        projection_status="investigating",
+        projection_updated_at=NOW - timedelta(minutes=10),
+        canonical_status="investigating",
+        canonical_updated_at=NOW,
+        lifecycle_state="AWAITING_APPROVAL",
+    )
+
+    assert result["status"] == "awaiting_approval"
+    assert result["source"] == "projection"
+
+
+def test_granular_projection_status_is_not_regressed_by_newer_coarse_canonical_timestamp() -> None:
+    for expected_status, lifecycle_state in (
+        ("waiting_for_human", "WAITING_FOR_HUMAN"),
+        ("plan_ready", "PLAN_READY"),
+        ("awaiting_approval", "AWAITING_APPROVAL"),
+        ("remediating", "EXECUTING"),
+        ("validating", "VALIDATING"),
+    ):
+        result = reduce_incident_status(
+            projection_status=expected_status,
+            projection_updated_at=NOW - timedelta(minutes=5),
+            canonical_status="investigating",
+            canonical_updated_at=NOW,
+            lifecycle_state=lifecycle_state,
+        )
+        assert result["status"] == expected_status
+        assert result["source"] == "projection"

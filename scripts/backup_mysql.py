@@ -18,6 +18,9 @@ def main():
     parser.add_argument("--database", default="kaiops")
     parser.add_argument("--directory", default="backend/retention-archives/backups")
     args = parser.parse_args()
+    if args.container == "kaims-mysql-1" and subprocess.run(["docker", "inspect", args.container], capture_output=True).returncode != 0:
+        if subprocess.run(["docker", "inspect", "kaims-latest-mysql-1"], capture_output=True).returncode == 0:
+            args.container = "kaims-latest-mysql-1"
     if not re.fullmatch(r"[A-Za-z0-9_]+", args.database):
         parser.error("Invalid database identifier")
     directory = Path(args.directory)

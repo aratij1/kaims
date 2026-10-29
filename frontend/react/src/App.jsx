@@ -40,6 +40,8 @@ const LOCAL_JENKINS_ENDPOINT = "http://jenkins:8080", LOCAL_JENKINS_JOB = "kaiop
 import { ALERT_DOC_KIND_OPTIONS, DOCUMENT_PROVIDER_ROLES, ONBOARDING_SOURCE_DOC_EXTENSIONS, ONBOARDING_SOURCE_DOC_SAMPLE_FILES } from "./onboardingConfig";
 import { classifyOnboardingDocumentType, deriveMonitoringRequirementsFromDocument, extractMonitoringToolAndUrl, extractOnboardingProjectName, looksLikeUuid, normalizeRoleName, severityOverrideKey, simplifyMonitoringUrl, summarizeUploadedDocument } from "./onboardingUtils";
 import {
+  ALL_APPLICATIONS_SCOPE,
+  isAllApplicationsSelection,
   DEFAULT_ALERT,
   REAL_USE_CASE_SCOPE,
   TEST_USE_CASE_SCOPE,
@@ -316,7 +318,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const skipNextActiveTabNavigationRef = useRef(false);
   const skipInitialPreferencesPersistRef = useRef(true);
   const [applicationToMonitor, setApplicationToMonitor] = useState("KaiMS");
-  const [monitorApplications, setMonitorApplications] = useState([]);
+  const [monitorApplications, setMonitorApplications] = useState(() => [...CORE_MONITOR_PROJECTS]);
   const [activeTab, setActiveTab] = useState(() => (VALID_LEGACY_TABS.has(initialTab) ? initialTab : "home"));
   const [isCopilotOpen, setIsCopilotOpen] = useState(false);
   const [uiDensity, setUiDensity] = useState("comfortable");
@@ -1785,8 +1787,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const applicationRows = (Array.isArray(data?.rows) ? data.rows : []).map(visibleManagedApplication).filter(Boolean);
       setMonitoringApps({ loading: false, rows: applicationRows, error: "" });
       const options = uniqueMonitorApplications(applicationRows.map((row) => String(row?.name || row?.application || "").trim()).filter(Boolean));
-      setMonitorApplications(options);
-      if (preLogin) setApplicationToMonitor((current) => availableApplication(current, options));
+      setMonitorApplications((current) => uniqueMonitorApplications([...current, ...options]));
+      setApplicationToMonitor((current) => availableApplication(current, options));
     } catch (_error) {
       // A failed request is not proof that the selected application was removed.
       setMonitoringApps((current) => ({ ...current, loading: false, error: "Unable to refresh application workspaces. Retry when the registry is available." }));
@@ -4578,8 +4580,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
       const prefs = JSON.parse(raw);
       if (prefs && typeof prefs === "object") {
-        if (typeof prefs.applicationToMonitor === "string" && prefs.applicationToMonitor.trim()) {
-          setApplicationToMonitor(prefs.applicationToMonitor);
+        const savedScopeVersion = Number(prefs.liveStreamScopeVersion || 0);
+        const savedApp = typeof prefs.applicationToMonitor === "string" ? prefs.applicationToMonitor.trim() : "";
+        if (savedApp && !(savedScopeVersion < 3 && savedApp.toLowerCase() === "payment-gateway")) {
+          setApplicationToMonitor(savedApp);
         }
         if (prefs.uiDensity === "comfortable" || prefs.uiDensity === "compact") {
           setUiDensity(prefs.uiDensity);
@@ -4642,7 +4646,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       ingestionStreamFilters,
       ingestionStreamView,
       ingestionStreamSection,
-      liveStreamScopeVersion: 2,
+      liveStreamScopeVersion: 3,
     };
     window.localStorage.setItem(PREFERENCE_STORAGE_KEY, JSON.stringify(payload));
   }, [applicationToMonitor, uiDensity, uiTheme, selectedFlow, activeTab, closedFilters, ingestionStreamFilters, ingestionStreamView, ingestionStreamSection]);
@@ -6997,9 +7001,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         return true;
       }
       const severity = String(row?.severity || row?.risk_tier || "").toLowerCase();
-      const status = String(row?.status || "").toLowerCase();
       if (approvalFilter === "awaiting_approval") {
-        return status === "awaiting_approval";
+        return hasPendingDecision(row);
       }
       return severity === approvalFilter;
     });
@@ -9301,11 +9304,11 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     const failedAutomation = selectedAlertEventsDisplay.filter((row) => [row?.status, row?.detail, row?.message].some((value) => /failed|error/i.test(String(value || "")))).length;
     const connectorRows = (Array.isArray(monitoringApps.rows) ? monitoringApps.rows : []).filter((row) => {
       const name = String(row?.name || row?.application || "").trim().toLowerCase();
-      return !applicationToMonitor || name === String(applicationToMonitor).trim().toLowerCase();
+      return !applicationToMonitor || isAllApplicationsSelection(applicationToMonitor) || name === String(applicationToMonitor).trim().toLowerCase();
     });
     const unhealthyConnectors = connectorRows.filter((row) => /failed|error|unhealthy|disabled/i.test(String(row?.status || ""))).length;
     const hasScopedAlertSelection = Boolean(selectedAlertRow);
-    const isManagedPlatformScope = ["kaims", "telemetry"].includes(String(applicationToMonitor || "").trim().toLowerCase());
+    const isManagedPlatformScope = isAllApplicationsSelection(applicationToMonitor) || ["kaims", "telemetry"].includes(String(applicationToMonitor || "").trim().toLowerCase());
     const shared = {
       period: "Current operational window",
       timezone: "Asia/Kolkata (IST)",

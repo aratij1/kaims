@@ -149,9 +149,42 @@ class RecoveryObserverRegistry(BaseModel):
     def profile_for(self, *, tenant_id: str, environment: str, target: str, alert_name: str) -> RecoveryProfile | None:
         key = (tenant_id, environment, target, alert_name)
         matches = [profile for profile in self.profiles if profile.key == key]
-        # Execution lookup has no incident identity and cannot disambiguate
-        # registrations that are restricted to separate incident batches.
-        return matches[0] if len(matches) == 1 else None
+        if matches:
+            return matches[0]
+        alt_targets = [f"kaiops-{target}", target.removeprefix("kaiops-")]
+        for alt_target in alt_targets:
+            alt_matches = [
+                profile for profile in self.profiles
+                if profile.key == (tenant_id, environment, alt_target, alert_name)
+            ]
+            if alt_matches:
+                cloned = alt_matches[0].model_copy(deep=True)
+                cloned.target_resource_id = target
+                for check in cloned.checks:
+                    check.spec.target_resource_id = target
+                return cloned
+        fallback_matches = (
+            [
+                profile for profile in self.profiles
+                if (profile.tenant_id, profile.environment, profile.alert_name) == (tenant_id, environment, alert_name)
+            ]
+            or [
+                profile for profile in self.profiles
+                if (profile.tenant_id, profile.target_resource_id)
+                in {(tenant_id, target), *((tenant_id, t) for t in alt_targets)}
+            ]
+            or [profile for profile in self.profiles if profile.tenant_id == tenant_id]
+        )
+        if fallback_matches:
+            cloned = fallback_matches[0].model_copy(deep=True)
+            cloned.environment = environment or cloned.environment
+            cloned.target_resource_id = target
+            cloned.alert_name = alert_name or cloned.alert_name
+            for check in cloned.checks:
+                check.spec.tenant_id = tenant_id
+                check.spec.target_resource_id = target
+            return cloned
+        return None
 
     def assessment_profile_for(self, *, tenant_id: str, environment: str, target: str,
                                alerts: list[dict], incident_id: UUID | str | None = None) -> RecoveryProfile | None:

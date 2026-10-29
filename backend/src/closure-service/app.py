@@ -901,7 +901,7 @@ async def _record_closure_learning(repo: IncidentRepository, action: Remediation
             modified=bool(action.parameters.get("operator_modified")),
             actor=str(action.parameters.get("approved_by") or "closure-service"),
             tenant_id=action.tenant_id,
-            metadata=action.parameters,
+            metadata={**action.parameters, "incident_id": str(action.incident_id)},
         )
 
 
@@ -1019,10 +1019,30 @@ async def manual_close_incident(
         )
     except LifecycleTransitionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    jira_result = await _sync_closure_to_jira(incident_payload, report)
-    if incident_payload.get("ticket_id") and not jira_result.get("commented"):
-        raise HTTPException(status_code=502, detail={"message": "Jira update failed; incident was not closed.", "jira": jira_result})
-    manual_source = {"source": "manual-closure"}
+    try:
+        jira_result = await _sync_closure_to_jira(incident_payload, report)
+    except Exception as exc:
+        logger.warning("Jira synchronization failed during manual closure; recording non-blocking sync failure", exc_info=True)
+        jira_result = {
+            "status": "failed",
+            "commented": False,
+            "transitioned": False,
+            "error": str(exc),
+        }
+    has_ticket = bool(incident_payload.get("ticket_id") or report.ticket_id)
+    if not has_ticket:
+        jira_sync_status = "not_linked"
+    elif jira_result.get("commented") or jira_result.get("transitioned"):
+        jira_sync_status = "synced"
+    else:
+        jira_sync_status = "failed"
+    jira_result = {
+        **dict(jira_result or {}),
+        "jira_sync_status": jira_sync_status,
+    }
+    report.metadata["jira_sync"] = jira_result
+    report.metadata["jira_sync_status"] = jira_sync_status
+    manual_source = {"source": "manual-closure", "jira_sync": jira_result}
     payload_out = _build_closure_event_payload(action=action, report=report, source_payload=manual_source)
     persistence = await _persist_closure_event(
         app=app,
@@ -1051,6 +1071,7 @@ async def manual_close_incident(
         "technical_recovery_verified": False,
         "incident_id": incident_id,
         "comment": request.comment,
+        "jira_sync_status": jira_sync_status,
         "jira": jira_result,
     }
 

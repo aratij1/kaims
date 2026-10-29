@@ -49,15 +49,67 @@ ALLOWED_INCIDENT_TRANSITIONS = {
     state: frozenset({_FORWARD[index + 1], *FAILURE_INCIDENT_STATES})
     for index, state in enumerate(_FORWARD[:-1])
 }
+ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.DETECTED] |= {
+    IncidentLifecycleState.COLLECTING,
+    IncidentLifecycleState.WAITING_FOR_HUMAN,
+    IncidentLifecycleState.CONTEXT_READY,
+    IncidentLifecycleState.INVESTIGATING,
+    IncidentLifecycleState.RCA_READY,
+}
+ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.REQUIREMENTS_IDENTIFIED] |= {
+    IncidentLifecycleState.WAITING_FOR_HUMAN,
+    IncidentLifecycleState.CONTEXT_READY,
+    IncidentLifecycleState.INVESTIGATING,
+}
 ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.COLLECTING] |= {
     IncidentLifecycleState.WAITING_FOR_HUMAN,
+    IncidentLifecycleState.INVESTIGATING,
+    IncidentLifecycleState.RCA_READY,
 }
 ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.WAITING_FOR_HUMAN] = frozenset({
-    IncidentLifecycleState.COLLECTING, IncidentLifecycleState.CONTEXT_READY,
-    IncidentLifecycleState.COLLECTION_BLOCKED, IncidentLifecycleState.ESCALATED,
+    IncidentLifecycleState.COLLECTING,
+    IncidentLifecycleState.CONTEXT_READY,
+    IncidentLifecycleState.INVESTIGATING,
+    IncidentLifecycleState.RCA_READY,
+    IncidentLifecycleState.COLLECTION_BLOCKED,
+    IncidentLifecycleState.ESCALATED,
 })
+ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.CONTEXT_READY] |= {
+    IncidentLifecycleState.WAITING_FOR_HUMAN,
+    IncidentLifecycleState.RCA_READY,
+}
+ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.INVESTIGATING] |= {
+    IncidentLifecycleState.WAITING_FOR_HUMAN,
+    IncidentLifecycleState.COLLECTING,
+    IncidentLifecycleState.REQUIREMENTS_IDENTIFIED,
+    IncidentLifecycleState.RCA_READY,
+    IncidentLifecycleState.AWAITING_APPROVAL,
+}
+ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.RCA_READY] |= {
+    IncidentLifecycleState.AWAITING_APPROVAL,
+    IncidentLifecycleState.WAITING_FOR_HUMAN,
+    IncidentLifecycleState.EXECUTING,
+    IncidentLifecycleState.CLOSED,
+}
+ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.PLAN_READY] |= {
+    IncidentLifecycleState.EXECUTING,
+    IncidentLifecycleState.CLOSED,
+}
+ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.AWAITING_APPROVAL] |= {
+    IncidentLifecycleState.INVESTIGATING,
+    IncidentLifecycleState.EXECUTING,
+    IncidentLifecycleState.VALIDATING,
+    IncidentLifecycleState.CLOSED,
+}
+ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.EXECUTING] |= {
+    IncidentLifecycleState.CLOSED,
+}
 ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.COLLECTION_BLOCKED] = frozenset({
-    IncidentLifecycleState.COLLECTING, IncidentLifecycleState.WAITING_FOR_HUMAN,
+    IncidentLifecycleState.COLLECTING,
+    IncidentLifecycleState.WAITING_FOR_HUMAN,
+    IncidentLifecycleState.CONTEXT_READY,
+    IncidentLifecycleState.INVESTIGATING,
+    IncidentLifecycleState.RCA_READY,
     IncidentLifecycleState.ESCALATED,
 })
 ALLOWED_INCIDENT_TRANSITIONS[IncidentLifecycleState.INVESTIGATION_FAILED] = frozenset({

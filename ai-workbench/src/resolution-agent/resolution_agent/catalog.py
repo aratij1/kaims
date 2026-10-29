@@ -10,7 +10,7 @@ from typing import Any
 FAMILIES = (
     (
         "availability",
-        "down unavailable health crash restart",
+        "down unavailable health crash restart stopped exit",
         "Inspect health checks, restarts, events, and dependencies",
         "Restore only the unhealthy component",
         "Health checks and transactions remain stable",
@@ -189,7 +189,7 @@ def _build_catalog() -> tuple[dict[str, Any], ...]:
                         "family": family,
                         "platform": platform,
                         "strategy": strategy,
-                        "patterns": [*terms.split(), platform, platform_label.lower()],
+                        "patterns": [*terms.split(), *family.split("-"), platform, platform_label.lower()],
                         "risk": risk,
                         "applicability": f"Use when evidence confirms {family.replace('-', ' ')} on {platform_label}.",
                         "prerequisites": [
@@ -230,7 +230,8 @@ _LEARNED: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _tokens(value: str) -> set[str]:
-    return {t for t in re.findall(r"[a-z0-9]+", value.lower()) if len(t) > 1}
+    expanded = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(value or ""))
+    return {t for t in re.findall(r"[a-z0-9]+", expanded.lower()) if len(t) > 1}
 
 
 _OPTION_TOKENS = tuple(frozenset(_tokens(" ".join(row["patterns"]))) for row in RESOLUTION_CATALOG)
@@ -266,9 +267,30 @@ def _ranked_matches(
         if score:
             ranked.append((index, round(score, 3), tuple(sorted(set(exact) | overlap))))
     risk_order = {"low": 0, "medium": 1, "high": 2}
+    platform_order = {
+        "linux": 0,
+        "kubernetes": 1,
+        "database": 2,
+        "network": 3,
+        "aws": 4,
+        "azure": 5,
+        "gcp": 6,
+        "data-platform": 7,
+        "saas": 8,
+        "windows": 9,
+    }
+    strategy_order = {
+        "recover": 0,
+        "scale": 1,
+        "diagnose": 2,
+        "contain": 3,
+        "rollback": 4,
+    }
     ranked.sort(
         key=lambda match: (
             -match[1],
+            platform_order.get(RESOLUTION_CATALOG[match[0]]["platform"], 9),
+            strategy_order.get(RESOLUTION_CATALOG[match[0]]["strategy"], 9),
             risk_order.get(RESOLUTION_CATALOG[match[0]]["risk"], 9),
             RESOLUTION_CATALOG[match[0]]["id"],
         )
@@ -332,8 +354,104 @@ def register_global_knowledge(*, tenant_id: str, matches: list[dict[str, Any]]) 
     return rows
 
 
+def _extract_markdown_runbook_fields(markdown: str, service: str = "") -> dict[str, Any]:
+    raw_text = str(markdown or "").strip()
+    if not raw_text:
+        return {}
+
+    frontmatter: dict[str, str] = {}
+    fm_match = re.match(r"\A---\s*\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)", raw_text)
+    if fm_match:
+        for fm_line in fm_match.group(1).splitlines():
+            if ":" in fm_line:
+                key, value = fm_line.split(":", 1)
+                frontmatter[key.strip().lower()] = value.strip().strip("'\"`")
+
+    def _section_text(heading_pattern: str) -> str:
+        match = re.search(
+            rf"^##\s+(?:{heading_pattern})\s*$([\s\S]*?)(?=^##\s+|\Z)",
+            raw_text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        return match.group(1).strip() if match else ""
+
+    def _clean_items(section: str) -> list[str]:
+        if not section:
+            return []
+        fenced = re.findall(r"```(?:[a-zA-Z0-9_-]+)?\s*\n([\s\S]*?)```", section)
+        if fenced:
+            items: list[str] = []
+            for block in fenced:
+                for line in block.splitlines():
+                    cleaned = line.strip()
+                    if cleaned and not cleaned.startswith("#"):
+                        items.append(cleaned)
+            if items:
+                return items
+        items = []
+        for raw_line in section.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("```"):
+                continue
+            line = re.sub(r"^(?:[-*+]|\d+[.)])\s*", "", line).strip()
+            if line.startswith("`") and line.endswith("`") and len(line) > 2:
+                line = line[1:-1].strip()
+            if line:
+                items.append(line)
+        return items
+
+    title_match = re.search(r"^#\s+(.+)$", raw_text, flags=re.MULTILINE)
+    service_match = re.search(
+        r"^\s*-\s*\*{0,2}Service\*{0,2}:\s*(.+)$",
+        raw_text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    alert_match = re.search(
+        r"^\s*-\s*\*{0,2}Alert\*{0,2}:\s*(.+)$",
+        raw_text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    parsed_service = (
+        (service_match.group(1).strip().strip("`'\"* ") if service_match else "")
+        or frontmatter.get("service", "")
+        or str(service or "").strip()
+    )
+    parsed_alert = (
+        (alert_match.group(1).strip().strip("`'\"* ") if alert_match else "")
+        or frontmatter.get("alert_name", "")
+        or frontmatter.get("alert", "")
+    )
+    title = title_match.group(1).strip() if title_match else ""
+    if not parsed_alert and ":" in title:
+        parsed_alert = title.split(":", 1)[1].strip()
+
+    symptoms_section = _section_text(r"(?:Observed\s+)?Symptoms\s*&\s*Root\s*Cause|Root\s*Cause")
+    root_cause_guidance = " ".join(
+        line.strip()
+        for line in symptoms_section.splitlines()
+        if line.strip() and not line.strip().startswith("```")
+    ).strip()
+
+    return {
+        "name": title,
+        "alert_name": parsed_alert,
+        "service_scope": [parsed_service.lower()] if parsed_service else [],
+        "prerequisites": _clean_items(_section_text(r"Preconditions|Prerequisites")),
+        "diagnostic_steps": _clean_items(_section_text(r"Diagnostic\s*Steps|Diagnostics")),
+        "remediation_steps": _clean_items(_section_text(r"Remediation\s*Steps|Remediation|Resolution\s*Steps")),
+        "validation_steps": _clean_items(_section_text(r"Validation(?:\s*Steps)?|Verification(?:\s*Steps)?")),
+        "rollback_steps": _clean_items(_section_text(r"Rollback\s*Plan|Rollback(?:\s*Steps)?")),
+        "root_cause_guidance": root_cause_guidance,
+    }
+
+
 def register_learned_runbooks(
-    *, tenant_id: str, runbooks: list[dict[str, Any]], issue: str, service: str,
+    *,
+    tenant_id: str,
+    runbooks: list[dict[str, Any]],
+    issue: str,
+    service: str,
+    alert_name: str = "",
 ) -> list[dict[str, Any]]:
     """Expose approved, outcome-backed runbooks as tenant-local catalog options.
 
@@ -341,45 +459,183 @@ def register_learned_runbooks(
     Automatic eligibility requires an approved immutable version, a verified
     prior success, no failures, low risk, and complete recovery controls.
     """
-    query_tokens = _tokens(f"{issue} {service}")
+    from resolution_agent.runbooks import contains_unresolved_placeholders
+
+    query_tokens = _tokens(f"{issue} {service} {alert_name}")
     registered: list[dict[str, Any]] = []
+    normalized_tenant = str(tenant_id or "").strip()
+    normalized_service = str(service or "").strip().lower()
+    normalized_requested_alert = str(alert_name or "").strip().lower()
+    def _as_step_list(raw_val: Any) -> list[str]:
+        if isinstance(raw_val, list):
+            return [str(v).strip() for v in raw_val if str(v).strip()]
+        if isinstance(raw_val, str) and raw_val.strip():
+            items: list[str] = []
+            for raw_line in raw_val.splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("```"):
+                    continue
+                line = re.sub(r"^(?:[-*+]|\d+[.)])\s*", "", line).strip()
+                if line.startswith("`") and line.endswith("`") and len(line) > 2:
+                    line = line[1:-1].strip()
+                if line:
+                    items.append(line)
+            return items
+        return []
+
     for record in runbooks:
-        content = record.get("content") if isinstance(record.get("content"), dict) else {}
-        remediation = [str(value) for value in content.get("remediation_steps", []) if str(value).strip()]
-        validation = [str(value) for value in content.get("validation_steps", []) if str(value).strip()]
-        rollback = [str(value) for value in content.get("rollback_steps", []) if str(value).strip()]
-        scopes = [str(value).lower() for value in content.get("service_scope", []) if str(value).strip()]
+        if not isinstance(record, dict):
+            continue
+        runbook_id = str(record.get("runbook_id") or "").strip()
+        try:
+            version = int(record.get("version") or 0)
+        except (TypeError, ValueError):
+            version = 0
+        if not runbook_id or version < 1:
+            continue
+        record_tenant = str(record.get("tenant_id") or "").strip()
+        if record_tenant and normalized_tenant and record_tenant != normalized_tenant:
+            continue
+        content = record.get("content") if isinstance(record.get("content"), dict) else record
+        approval_status = str(
+            record.get("approval_status")
+            or content.get("approval_status")
+            or content.get("review_status")
+            or ""
+        ).strip().lower()
+        lifecycle_status = str(
+            record.get("status")
+            or content.get("status")
+            or ""
+        ).strip().lower()
+        index_status = str(
+            record.get("index_status")
+            or content.get("index_status")
+            or ""
+        ).strip().lower()
+        stale = bool(record.get("stale") or content.get("stale"))
+        approved = (
+            approval_status == "approved"
+            and not stale
+            and lifecycle_status not in {"draft", "pending_review", "rejected", "stale", "deprecated", "disabled"}
+            and index_status not in {"pending", "unindexed", "failed"}
+        )
+        if not approved:
+            continue
+        markdown_text = str(content.get("markdown") or record.get("markdown") or "").strip()
+        extracted = _extract_markdown_runbook_fields(
+            markdown_text,
+            service=str(record.get("service") or content.get("service") or ""),
+        ) if markdown_text else {}
+        remediation = (
+            _as_step_list(content.get("remediation_steps") or record.get("remediation_steps") or record.get("steps"))
+            or _as_step_list(extracted.get("remediation_steps"))
+        )
+        validation = (
+            _as_step_list(content.get("validation_steps") or record.get("validation_steps") or content.get("verification_steps"))
+            or _as_step_list(extracted.get("validation_steps"))
+        )
+        rollback = (
+            _as_step_list(content.get("rollback_steps") or record.get("rollback_steps") or content.get("rollback_plan"))
+            or _as_step_list(extracted.get("rollback_steps"))
+        )
+        diagnostics = (
+            _as_step_list(content.get("diagnostic_steps") or record.get("diagnostic_steps"))
+            or _as_step_list(extracted.get("diagnostic_steps"))
+        )
+        prerequisites = (
+            _as_step_list(content.get("prerequisites") or record.get("prerequisites"))
+            or _as_step_list(extracted.get("prerequisites"))
+        )
+        scopes = [
+            str(value).strip().lower()
+            for value in (
+                _as_step_list(content.get("service_scope") or record.get("service_scope"))
+                or _as_step_list(extracted.get("service_scope"))
+            )
+            if str(value).strip()
+        ]
+        record_service = str(record.get("service") or content.get("service") or "").strip().lower()
+        if record_service and record_service not in scopes:
+            scopes.append(record_service)
+        exact_service = bool(normalized_service and normalized_service in scopes)
+        if not exact_service:
+            continue
+        if not remediation or contains_unresolved_placeholders([*remediation, *validation, *rollback]):
+            continue
         risk = str(record.get("risk_level") or content.get("risk_level") or "high").lower()
         successes = int(record.get("success_count") or 0)
         failures = int(record.get("failure_count") or 0)
-        approved = str(record.get("approval_status") or "").lower() == "approved"
         complete = bool(remediation and validation and rollback)
         self_heal = bool(approved and successes >= 1 and failures == 0 and risk == "low" and complete)
-        corpus = " ".join([str(content.get("name") or ""), *scopes, *content.get("diagnostic_steps", []), *remediation])
+        record_alert_name = str(
+            record.get("alert_name")
+            or content.get("alert_name")
+            or extracted.get("alert_name")
+            or ""
+        ).strip()
+        title = str(
+            record.get("title")
+            or content.get("name")
+            or content.get("title")
+            or extracted.get("name")
+            or f"Learned recovery for {service}"
+        )
+        corpus = " ".join([title, record_alert_name, *scopes, *diagnostics, *remediation])
         overlap = query_tokens & _tokens(corpus)
-        exact_service = service.lower() in scopes
-        relevance = min(0.99, (0.65 if exact_service else 0.0) + min(0.3, len(overlap) * 0.06))
+        alert_match = bool(
+            record_alert_name
+            and (
+                record_alert_name.lower() in issue.lower()
+                or (
+                    normalized_requested_alert
+                    and (
+                        record_alert_name.lower() == normalized_requested_alert
+                        or normalized_requested_alert in record_alert_name.lower()
+                        or record_alert_name.lower() in normalized_requested_alert
+                    )
+                )
+            )
+        )
+        if record_alert_name and record_alert_name.lower() not in {"unknown", "general"} and not alert_match and not overlap:
+            continue
+        relevance = min(
+            0.99,
+            (0.65 if exact_service else 0.0) + (0.15 if alert_match else 0.0) + min(0.3, len(overlap) * 0.06),
+        )
         if not exact_service and relevance < 0.35:
             continue
-        option_id = f"learned-{record['runbook_id']}-v{record['version']}"
+        slug_seed = re.sub(r"[^a-z0-9]+", "-", normalized_service or "service").strip("-")
+        runbook_slug = str(
+            record.get("slug")
+            or content.get("slug")
+            or f"learned-{slug_seed}-{runbook_id[:8]}"
+        )
+        option_id = f"learned-{runbook_id}-v{version}"
         option = {
             "id": option_id,
-            "title": str(content.get("name") or f"Learned recovery for {service}"),
+            "title": title,
             "family": "learned-recovery",
             "platform": str(content.get("platform") or "discovered"),
             "strategy": "recover",
             "patterns": sorted(overlap),
             "risk": risk,
             "applicability": "Matched from a previously reviewed and validated recovery for this service.",
-            "prerequisites": list(content.get("prerequisites") or []),
-            "diagnostics": list(content.get("diagnostic_steps") or []),
+            "prerequisites": prerequisites,
+            "diagnostics": diagnostics,
             "steps": remediation,
             "validation": validation,
             "rollback": rollback,
             "source": "tenant-learned-resolution-catalog",
+            "service": record_service or (scopes[0] if scopes else normalized_service),
             "service_scope": scopes,
-            "runbook_id": str(record["runbook_id"]),
-            "runbook_version": int(record["version"]),
+            "runbook_id": runbook_id,
+            "runbook_slug": runbook_slug,
+            "runbook_version": version,
+            "alert_name": record_alert_name,
+            "root_cause_guidance": str(
+                content.get("root_cause_guidance") or extracted.get("root_cause_guidance") or ""
+            ),
             "success_count": successes,
             "failure_count": failures,
             "execution_eligible": self_heal,

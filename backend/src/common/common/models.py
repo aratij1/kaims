@@ -25,6 +25,7 @@ class AlertSeverity(StrEnum):
 class IncidentStatus(StrEnum):
     OPEN = "open"
     INVESTIGATING = "investigating"
+    WAITING_FOR_HUMAN = "waiting_for_human"
     # A grounded, conclusive RCA with no ready-to-execute plan yet - real
     # forward progress past "investigating", not yet in the approval/
     # execution flow (see repository.py's `_STATUS_PRECEDENCE`, which has

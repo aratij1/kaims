@@ -12,9 +12,10 @@ const DEFAULT_ALERT = {
   description: "Payment latency crossed 2.5s threshold for 5m",
 };
 
+const ALL_APPLICATIONS_SCOPE = "All Applications";
 const REAL_USE_CASE_SCOPE = "real-usecases";
 const TEST_USE_CASE_SCOPE = "test-usecases";
-const CORE_MONITOR_PROJECTS = ["KaiMS", "Telemetry"];
+const CORE_MONITOR_PROJECTS = [ALL_APPLICATIONS_SCOPE, "KaiMS", "Telemetry"];
 const FIXED_MONITOR_SCOPES = [...CORE_MONITOR_PROJECTS];
 
 const SERVICE_TOPIC_FLOW = [
@@ -187,6 +188,13 @@ const KAIOPS_CORE_SERVICE_SET = new Set([
   "remediation-engine",
   "closure-service",
   "model-router",
+  "node-exporter",
+  "mysql-exporter",
+  "redis-exporter",
+  "blackbox-exporter",
+  "otel-collector",
+  "prometheus",
+  "alertmanager",
 ]);
 
 function normalizeMonitorToken(value) {
@@ -195,6 +203,11 @@ function normalizeMonitorToken(value) {
     .toLowerCase()
     .replace(/[\s_]+/g, "-")
     .replace(/-+/g, "-");
+}
+
+function isAllApplicationsSelection(value) {
+  const token = normalizeMonitorToken(value);
+  return token === "all-applications" || token === "all" || token === "unscoped";
 }
 
 function isKaiopsCoreSelection(value) {
@@ -344,6 +357,9 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
     return alertRows.filter((row) => isGeneratedOrTestAlert(row));
   }
   const productionRows = alertRows.filter((row) => !isGeneratedOrTestAlert(row));
+  if (isAllApplicationsSelection(target)) {
+    return productionRows;
+  }
   if (target === "telemetry") {
     return productionRows.filter((row) => inferMonitorScope(row) === "telemetry");
   }
@@ -386,6 +402,9 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
     return items.filter((row) => isGeneratedOrTestAlert(row));
   }
   const productionRows = items.filter((row) => !isGeneratedOrTestAlert(row));
+  if (isAllApplicationsSelection(target)) {
+    return productionRows;
+  }
   if (target === "telemetry") {
     return productionRows.filter((row) => inferMonitorScope(row) === "telemetry");
   }
@@ -433,7 +452,8 @@ function inferMonitorScope(row) {
     || metadata?.application
     || ""
   ).trim().toLowerCase();
-  if (explicitProject.includes("telemetry") || explicitProject.includes("astronomy")) {
+  const alertName = String(row?.name || row?.title || labels?.alertname || "").trim().toLowerCase();
+  if (explicitProject.includes("telemetry") || explicitProject.includes("astronomy") || alertName.includes("telemetry")) {
     return "telemetry";
   }
   if (explicitProject.includes("kaiops") || explicitProject.includes("kai-ops")) {
@@ -478,6 +498,11 @@ function isGeneratedOrTestAlert(row) {
     metadata?.test_alert,
   ].some((value) => ["1", "true", "yes", "test"].includes(String(value || "").trim().toLowerCase()));
   if (explicitTestFlag) {
+    return true;
+  }
+  const syntheticLabel = String(labels?.synthetic ?? row?.synthetic ?? projectionLabels?.synthetic ?? "").trim().toLowerCase();
+  const eventMode = String(labels?.event_mode ?? row?.event_mode ?? projectionLabels?.event_mode ?? "").trim().toLowerCase();
+  if (["1", "true", "yes"].includes(syntheticLabel) || ["synthetic", "simulation", "validation", "test"].includes(eventMode)) {
     return true;
   }
   const tokens = [
@@ -526,6 +551,16 @@ function isGeneratedOrTestAlert(row) {
     projectionLabels?.application,
     projectionLabels?.environment,
   ].map((value) => String(value || "").toLowerCase()).join(" ");
+  const isExplicitRealOrTelemetry = (
+    ["0", "false", "no"].includes(syntheticLabel)
+    || eventMode === "real"
+    || inferMonitorScope(row) === "telemetry"
+  );
+  if (isExplicitRealOrTelemetry) {
+    return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test|test\d*|testing|sample|mock|fake|dummy)([-_\s]|$)/i.test(tokens)
+      || tokens.includes("stresspipelinealert")
+      || tokens.includes("onboarding-smoke-test");
+  }
   return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test|test\d*|testing|demo|sample|mock|synthetic|fake|dummy)([-_\s]|$)/i.test(tokens)
     || tokens.includes("stresspipelinealert")
     || tokens.includes("onboarding-smoke-test");
@@ -729,6 +764,9 @@ function monitorScopeLabel(scope) {
   const key = String(scope || "").trim().toLowerCase();
   if (["kaiops", "kaims", "kaiops-core", "kaims-core"].includes(key)) {
     return "KaiMS";
+  }
+  if (isAllApplicationsSelection(key)) {
+    return ALL_APPLICATIONS_SCOPE;
   }
   if (key === REAL_USE_CASE_SCOPE) {
     return "Real Use Cases";
@@ -6960,6 +6998,8 @@ function summarizeAlertRuleContext(row, workflow = {}) {
 }
 
 export {
+  ALL_APPLICATIONS_SCOPE,
+  isAllApplicationsSelection,
   DEFAULT_ALERT,
   REAL_USE_CASE_SCOPE,
   TEST_USE_CASE_SCOPE,

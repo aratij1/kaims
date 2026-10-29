@@ -4,6 +4,7 @@ import { Link, Navigate, useSearchParams } from "react-router-dom";
 import { useRouteRuntimeSlice, type AlertStreamRow, type IncidentFilters, type IncidentRow } from "../../app/routeRuntime";
 import { OperationsWorkflowNav } from "../../components/operations/OperationsWorkflowNav";
 import { effectiveIncidentStatus } from "../../domain/incidentStatus";
+import { hasPendingDecision } from "../../domain/pendingDecision";
 import { formatIstTimestamp } from "../../utils/presentation";
 import { useOpenIncident } from "../../domain/useOpenIncident";
 import { durableIncidentPath } from "../../domain/incidentNavigation";
@@ -28,10 +29,11 @@ function apiErrorMessage(payload: any, fallback: string) {
 
 export function belongsToInboxView(row: IncidentRow, view: InboxView) {
   const status = String(row.status || "").toLowerCase();
+  const lifecycleState = String((row as IncidentRow & { lifecycle_state?: unknown }).lifecycle_state || "").toLowerCase();
   const severity = String(row.severity || "").trim().toLowerCase();
   if (["warning", "warn"].includes(severity)) return false;
-  const terminal = ["closed", "resolved", "recovered", "cancelled"].some((value) => status.includes(value));
-  const needsHuman = status.includes("approval") || ["failed", "blocked", "waiting_for_human", "manual_intervention_required", "validation_failed", "rollback_failed"].some((value) => status.includes(value));
+  const terminal = ["closed", "resolved", "recovered", "cancelled"].some((value) => status.includes(value) || lifecycleState.includes(value));
+  const needsHuman = hasPendingDecision(row as Record<string, unknown>) || status.includes("approval") || lifecycleState.includes("approval") || ["failed", "blocked", "waiting_for_human", "manual_intervention_required", "validation_failed", "rollback_failed", "escalated"].some((value) => status.includes(value) || lifecycleState.includes(value));
   if (view === "needs_me") return !terminal && needsHuman;
   if (view === "kai_handling") return !terminal && !needsHuman;
   if (view === "critical") return !terminal && ["critical", "sev1", "p1"].includes(severity);
@@ -375,6 +377,53 @@ function incidentStatusLabel(row: IncidentRow) {
   return status === "failed" ? "Action required" : status.replaceAll("_", " ");
 }
 
+export function authoritativeLifecycleNote(row: IncidentRow): { label: string; reason: string } {
+  const status = normalizedStatus(row);
+  const blocker = analysisBlocker(row);
+  if (status === "waiting_for_human") {
+    return {
+      label: "Waiting for human",
+      reason: "A human evidence request is open in the Evidence tab awaiting responder input before RCA can be confirmed.",
+    };
+  }
+  if (status === "investigating") {
+    return {
+      label: "Investigating",
+      reason: blocker
+        ? "Automated analysis completed without a confirmed root cause (<65% confidence or <2 corroborating sources) and no pending human prompt is open."
+        : "Automated root-cause analysis is in progress.",
+    };
+  }
+  if (status === "collecting") {
+    return {
+      label: "Collecting",
+      reason: "Automated evidence collection jobs are queued or running.",
+    };
+  }
+  if (status === "collection_blocked") {
+    return {
+      label: "Collection blocked",
+      reason: "Automated evidence collection is blocked by a missing or failing technical source connector.",
+    };
+  }
+  if (status === "context_ready") {
+    return {
+      label: "Context ready",
+      reason: "Context snapshot committed; awaiting root-cause analysis and recommendation generation.",
+    };
+  }
+  if (status === "detected" || status === "open") {
+    return {
+      label: "Detected",
+      reason: "Initial alert intake recorded; awaiting context snapshot and evidence requirement generation.",
+    };
+  }
+  return {
+    label: status.replaceAll("_", " "),
+    reason: String(row.status_reason || blocker || `Lifecycle status: ${status.replaceAll("_", " ")}`),
+  };
+}
+
 export default function IncidentsRoute() {
   const openIncident = useOpenIncident();
   const incidents = useRouteRuntimeSlice("incidents");
@@ -417,7 +466,8 @@ export default function IncidentsRoute() {
     resetInboxFilters();
   }, [selectedProject]);
 
-  if (selectedProject && selectedProject.toLowerCase() !== "all") inboxParams.set("project_id", selectedProject);
+  const isAllApplications = !selectedProject || ["all", "all applications", "all-applications", "unscoped"].includes(selectedProject.trim().toLowerCase());
+  if (!isAllApplications) inboxParams.set("project_id", selectedProject);
   if (cursor) inboxParams.set("cursor", cursor);
   for (const [key, filterValue] of Object.entries({
     risk_tier: restoredFilter("risk_tier"), execution_mode: restoredFilter("execution_mode"),
@@ -549,10 +599,11 @@ export default function IncidentsRoute() {
               {value(row.operation, row.source_alert?.labels?.operation, projectionLabels(row).operation) !== "Not recorded" ? <p className="unified-card-operation"><strong>Affected operation</strong> <code>{value(row.operation, row.source_alert?.labels?.operation, projectionLabels(row).operation)}</code></p> : null}
               <p className="unified-card-summary">{analysisBlocker(row) || value(event.customer_impact, event.business_impact, event.impact, row.summary, "No current processing detail has been published.")}</p>
               <div className="unified-card-context"><span>Source: {value(row.source, row.origin_system, row.source_alert?.source)}</span><span>Alert: {row.alert_id || "Not linked"}</span>{row.source_alert?.labels?.event_authenticity ? <span>{String(row.source_alert.labels.event_authenticity).replaceAll("_", " ")}</span> : null}</div>
-              <div className="unified-card-progress"><span className="unified-progress-node"><Workflow size={14} /></span><div><small>Current stage</small><strong>{currentStage?.label || "Awaiting intake"}</strong><span>{currentStage?.caption || "No executed stage recorded"}</span></div></div>
+              <div className="unified-card-progress"><span className="unified-progress-node"><Workflow size={14} /></span><div><small>Current stage · {authoritativeLifecycleNote(row).label}</small><strong>{currentStage?.label || "Awaiting intake"}</strong><span>{currentStage?.caption || "No executed stage recorded"} — {authoritativeLifecycleNote(row).reason}</span></div></div>
             </div>
             <aside className="unified-card-aside">
               <span className={`pill ${normalizedStatus(row) === "failed" ? "status-warning" : `status-${normalizedStatus(row)}`}`}>{incidentStatusLabel(row)}</span>
+              <small className="unified-lifecycle-state" title={authoritativeLifecycleNote(row).reason}>Lifecycle: {authoritativeLifecycleNote(row).label}</small>
               <span className={`unified-attention-label ${needsHuman ? "is-urgent" : ""}`}>{normalizedStatus(row) === "waiting_for_human" ? <><FileCheck2 size={13} /> Human evidence needed</> : analysisBlocker(row) ? <><ScanSearch size={13} /> Evidence incomplete</> : needsHuman ? <><FileCheck2 size={13} /> Human decision</> : <><BrainCircuit size={13} /> Kai handling</>}</span>
               <button type="button" className="button-primary" onClick={() => openIncident(row, "overview")}>Open incident</button>
             </aside>
@@ -613,7 +664,7 @@ export default function IncidentsRoute() {
         const jiraKey = String(row.ticket_id || row.jira_key || (["closed", "resolved"].includes(normalizedStatus(row)) ? "Not linked" : "Pending"));
         const lifecycle = lifecycleFor(row);
         const currentStage = currentLifecycleStage(row, lifecycle);
-        return <tr key={incidentId || index}><td data-label="Incident"><button type="button" className="incident-table-title" onClick={() => openIncident(row, "overview")}>{incidentTitle(row)}</button><code>{incidentId}</code>{row.duplicateIncidents.length ? <small>{row.duplicateIncidents.length} duplicate {row.duplicateIncidents.length === 1 ? "incident" : "incidents"} grouped</small> : null}</td><td data-label="Service"><strong>{row.service || "Unknown service"}</strong><small>{row.environment || "Environment not set"}</small></td><td data-label="Status"><span className={`pill ${normalizedStatus(row) === "failed" ? "status-warning" : `status-${normalizedStatus(row)}`}`}>{incidentStatusLabel(row)}</span><IncidentStatusExplanation blocker={analysisBlocker(row)} reason={row.status_reason || `Status from ${row.status_source || "lifecycle"}`} /></td><td data-label="Jira">{row.jira_url ? <a href={row.jira_url} target="_blank" rel="noreferrer">{jiraKey}<ExternalLink size={12} /></a> : jiraKey}</td><td data-label="Current stage"><strong>{currentStage?.label || "Not started"}</strong><small>{currentStage?.caption || "No executed stage"}</small></td><td data-label="Updated">{formatIstTimestamp(row.updated_at || row.created_at)}</td><td data-label="Action"><button type="button" className="button-secondary" onClick={() => openIncident(row, currentStage?.cockpit || "overview")}>View details</button></td></tr>;
+        return <tr key={incidentId || index}><td data-label="Incident"><button type="button" className="incident-table-title" onClick={() => openIncident(row, "overview")}>{incidentTitle(row)}</button><code>{incidentId}</code>{row.duplicateIncidents.length ? <small>{row.duplicateIncidents.length} duplicate {row.duplicateIncidents.length === 1 ? "incident" : "incidents"} grouped</small> : null}</td><td data-label="Service"><strong>{row.service || "Unknown service"}</strong><small>{row.environment || "Environment not set"}</small></td><td data-label="Status"><span className={`pill ${normalizedStatus(row) === "failed" ? "status-warning" : `status-${normalizedStatus(row)}`}`}>{incidentStatusLabel(row)}</span><IncidentStatusExplanation blocker={analysisBlocker(row)} reason={row.status_reason || authoritativeLifecycleNote(row).reason} /></td><td data-label="Jira">{row.jira_url ? <a href={row.jira_url} target="_blank" rel="noreferrer">{jiraKey}<ExternalLink size={12} /></a> : jiraKey}</td><td data-label="Current stage"><strong>{currentStage?.label || "Not started"}</strong><small>{currentStage?.caption || "No executed stage"}</small></td><td data-label="Updated">{formatIstTimestamp(row.updated_at || row.created_at)}</td><td data-label="Action"><button type="button" className="button-secondary" onClick={() => openIncident(row, currentStage?.cockpit || "overview")}>View details</button></td></tr>;
       })}</tbody></table></div> : null}
       {showIncidents && presentation !== "summary" ? rows.map((row, index) => {
         const incidentId = String(row.incident_id || row.id || "-");

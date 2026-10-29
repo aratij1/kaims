@@ -68,3 +68,32 @@ config/disk-attribution.local.json
 # Machine-specific integration settings and runtime state
 replacement/telemetry-sources.local.json
 backend/ingested_alerts/jira_admission_state.json
+
+backend/ingested_alerts/archive/**
+
+# Local workspace trackers, scratch scripts, backups, and AI audit notes
+MASTER_TRACKER.md
+docs/KAI_MS_*.md
+scratch/
+backups/
+
+# Runtime and test-generated RAG markdown artifacts
+backend/rag/deployments/*.md
+backend/rag/incidents/????????-????-????-????-????????????.md
+backend/rag/incidents/*-baseline*.md
+backend/rag/incidents/new-alert-onboarding.md
+backend/rag/incidents/rag-doc.md
+backend/rag/runbooks/????????-????-????-????-????????????.md
+backend/rag/runbooks/????????????????.md
+backend/rag/runbooks/autodoc-test-*.md
+backend/rag/runbooks/etl-orders-dq-*.md
+backend/rag/runbooks/kaiops-core1-*.md
+backend/rag/runbooks/landing-alert-e2e-*.md
+backend/rag/runbooks/new-kaiops-*.md
+backend/rag/runbooks/rag-doc*.md
+backend/rag/runbooks/runbook-kaiops-test-*.md
+backend/rag/runbooks/stress-onboard-*.md
+backend/rag/runbooks/test-*.md
+backend/rag/runbooks/verify-fix-test-*.md
+backend/rag/incidents/alert-when-*.md
+backend/rag/runbooks/*-knowledge-pack.md

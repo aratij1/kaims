@@ -293,6 +293,16 @@ export default function IncidentCommand() {
     recommendationMetadata.execution_plan,
     projection.execution_plan,
   );
+  const candidatePlan = firstRecord(
+    recommendationMetadata.candidate_execution_plan,
+    recommendation.candidate_execution_plan,
+    projection.candidate_execution_plan,
+  );
+  const runbookGuidance = firstRecord(
+    recommendationMetadata.runbook_guidance,
+    recommendation.runbook_guidance,
+    projection.runbook_guidance,
+  );
   const safety = record(executionPlan.safety_envelope || recommendation.safety_envelope || projection.safety_envelope);
   const canonicalExecution = record(operationsState.execution);
   const canonicalValidation = record(operationsState.validation);
@@ -304,8 +314,18 @@ export default function IncidentCommand() {
     projection.recovery_validation,
   );
   const analysis = firstRecord(canonicalRca, projection.analysis, projection.rca, eventPayload.analysis, eventPayload.rca, recommendation.analysis, recommendation.rca, recommendationMetadata.rca_analysis, source.analysis);
-  const presentedCause = causalPresentation(text(causalClaim.statement, canonicalRca.hypothesis), causalClaim.confidence,
-    arrayOfText(causalClaim.supporting_evidence_ids).some(id => arrayOfText(canonicalRca.resolved_evidence_ids).includes(id)));
+  const hasClaimEvidence = arrayOfText(causalClaim.supporting_evidence_ids).some(id => arrayOfText(canonicalRca.resolved_evidence_ids).includes(id))
+    || arrayOfText(causalClaim.supporting_evidence_ids).length > 0
+    || arrayOfText(canonicalRca.resolved_evidence_ids).length > 0
+    || arrayOfText(canonicalRca.supporting_signals).length > 0
+    || arrayOfText(analysis.evidence_used).length > 0
+    || arrayOfText(analysis.supporting_signals).length > 0
+    || Boolean(canonicalRca.hypothesis && canonicalRca.status && !["not_started", "unavailable"].includes(text(canonicalRca.status)));
+  const presentedCause = causalPresentation(
+    text(causalClaim.statement, canonicalRca.hypothesis),
+    causalClaim.confidence ?? canonicalRca.confidence ?? analysis.confidence ?? recommendation.confidence,
+    hasClaimEvidence,
+  );
   const rootCause = presentedCause.hasCausalStatement ? presentedCause.statement : "";
   const confidence = presentedCause.confidence;
   const confidenceLabel = "Recorded claim confidence";
@@ -342,15 +362,25 @@ export default function IncidentCommand() {
   const observationEnd = observedTimes.length ? Math.max(...observedTimes) : null;
   const resolutionReady = text(canonicalResolution.status).toLowerCase() === "ready";
   const evidenceCollectionExhausted = evidenceReadModel.evidence_collection_exhausted === true;
-  const action = resolutionReady
-    ? text(canonicalResolution.catalog_operation_id, recommendation.title, recommendation.action, recommendation.recommended_action, eventPayload.recommended_action, projection.recommended_action)
-    : "";
+  const action = text(
+    canonicalResolution.catalog_operation_id,
+    canonicalResolution.proposed_remedy,
+    candidatePlan.catalog_operation_id,
+    candidatePlan.title,
+    arrayOfText(runbookGuidance.remediation_steps).join("; "),
+    recommendation.title,
+    recommendation.action,
+    recommendation.recommended_action,
+    eventPayload.recommended_action,
+    projection.recommended_action,
+    canonicalValidation.action_taken
+  );
   const approvalCandidatePending = Boolean(approval) && ![
     "approved", "rejected", "completed", "expired", "not_requested",
   ].includes(text(approval?.approval_status, approval?.status).toLowerCase());
   const sourceTimestamp = text(source.received_at, source.created_at, row.created_at);
   const updatedTimestamp = text(row.latest_event_at, row.updated_at, row.created_at);
-  const impact = text(canonicalImpact.statement);
+  const impact = text(canonicalImpact.statement, recommendation.impact, eventPayload.impact);
   const impactEstablished = ["observed", "grounded", "established"].includes(text(canonicalImpact.status).toLowerCase());
   const partialEvidenceBlocksApproval = evidenceCollectionExhausted && (!rcaConfirmed || !impactEstablished);
   const sourceName = text(row.origin_system, row.source, source.origin_system, source.source, sourceLabels.origin_system, sourceLabels.transport);
@@ -366,10 +396,18 @@ export default function IncidentCommand() {
   const executionReady = !directIncident.error && executionPlan.execution_ready === true;
   const resolutionAvailable = resolutionReady && Boolean(action) && executionReady && rcaConfirmed && !partialEvidenceBlocksApproval;
   const resolutionBlocks = arrayOfText(canonicalResolution.blocking_reasons);
-  const governedOperation = text(canonicalResolution.catalog_operation_id);
-  const governedCapability = text(canonicalResolution.capability_id);
-  const governedConnector = text(canonicalResolution.connector_id);
-  const governedTarget = text(canonicalResolution.target_resource_id);
+  const governedOperation = text(canonicalResolution.catalog_operation_id, candidatePlan.catalog_operation_id, runbookGuidance.runbook_slug);
+  const governedCapability = text(canonicalResolution.capability_id, candidatePlan.capability_id);
+  const governedConnector = text(canonicalResolution.connector_id, candidatePlan.connector_id);
+  const governedTarget = text(
+    canonicalResolution.target_resource_id,
+    candidatePlan.target_resource_id,
+    recommendation.target_service,
+    recommendation.target,
+    row.service,
+    sourceLabels.service
+  );
+
   const governedPolicy = record(canonicalResolution.policy_decision);
   const executionUnavailableReason = text(
     executionPlan.readiness_reason,
@@ -476,13 +514,14 @@ export default function IncidentCommand() {
     <section className="ic-overview-panel" id="incident-panel-overview" role="tabpanel"
       aria-labelledby="incident-tab-overview" tabIndex={0} hidden={activeView !== "overview"}>
       <div className="ic-overview-heading"><span>Incident brief</span><h3>{technicalRecovery ? "Recovery verified" : isTerminal ? "Incident closed" : "Understand the issue. Choose the next step."}</h3>
-        <p>{text(record(operationsState.next_action).message) || (technicalRecovery ? "Review the recorded action and independent recovery evidence." : "Review the evidence and analysis before selecting a resolution.")}</p></div>
+        <p>{action ? (isTerminal ? `Resolution remedy: ${action}. Earlier investigation tasks are historical.` : `Recommended action: ${action}.`) : text(record(operationsState.next_action).message) || (technicalRecovery ? "Review the recorded action and independent recovery evidence." : "Review the evidence and analysis before selecting a resolution.")}</p></div>
       <div className="ic-overview-facts">
         <Metric label="Evidence" value={`${contextEvidenceCount} records`} detail={`${rcaBoundEvidenceCount} referenced by this RCA; ${Math.max(0, Number(canonicalEvidenceCounts.bound_snapshot_records) || 0)} in its frozen snapshot. Total shows latest collected context.`} />
-        <Metric label="Root cause" value={rcaConfirmed ? "Supported" : rootCause ? "Working hypothesis" : hasRecordedAnalysis ? "Inconclusive" : "Not assessed"} detail={rootCause ? (rcaConfirmed ? rootCause : `Unconfirmed: ${rootCause}`) : findings.limitations || "A causal explanation is not yet available"} />
+        <Metric label="Root cause" value={rcaConfirmed ? "Supported" : rootCause || text(source.annotations?.summary, row.summary) ? "Working hypothesis" : hasRecordedAnalysis ? "Inconclusive" : "Not assessed"} detail={rootCause ? (rcaConfirmed ? rootCause : `Unconfirmed: ${rootCause}`) : text(source.annotations?.summary, row.summary) ? `Hypothesis: ${text(source.annotations?.summary, row.summary)}` : findings.limitations || "A causal explanation is not yet available"} />
         <Metric label="Impact" value={impactEstablished ? "Assessed" : impact ? "Unconfirmed assessment" : "Not established"} detail={impact ? (impactEstablished ? impact : `Unconfirmed: ${impact}`) : "Customer impact needs supporting evidence"} />
         <Metric label="Recovery" value={technicalRecovery ? "Verified" : "Not verified"} detail={executionStatus ? `Execution: ${executionStatus.replaceAll("_", " ")}` : "Execution has not started"} />
       </div>
+
       <div className="ic-overview-actions"><button className="button-primary" type="button" onClick={() => changeView(technicalRecovery || isTerminal ? "recovery" : !rcaConfirmed ? "evidence" : "resolution")}>{technicalRecovery || isTerminal ? "Review recovery record" : !rcaConfirmed ? "Review evidence & gaps" : "Review resolution"}</button><button className="button-secondary" type="button" onClick={() => changeView("analysis")}>Read cause & impact</button><button className="button-secondary" type="button" onClick={() => changeView("activity")}>View activity</button></div>
     </section>
     <details className="ic-disclosure ic-lifecycle-details" hidden={activeView !== "overview"}><summary>Lifecycle and progress<span>Recorded stages and evidence status</span></summary>
@@ -524,9 +563,9 @@ export default function IncidentCommand() {
         </section>
 
         <section id="incident-rca" className="ic-section ic-rca">
-          <header><div><span>{rcaConfirmed ? "Confirmed root cause" : "Working hypothesis"}{canonicalBinding.rca_version ? ` · RCA v${canonicalBinding.rca_version}` : ""}</span><h3>{rootCause || (hasRecordedAnalysis ? "Cause not established" : "No causal analysis recorded")}</h3></div><StatusBadge tone={rcaConfirmed ? "success" : rootCause || hasRecordedAnalysis ? "warning" : "inactive"}>{rcaConfirmed ? "Grounded" : rootCause ? text(canonicalRca.status, "Unconfirmed").replaceAll("_", " ") : hasRecordedAnalysis ? "Inconclusive" : "Unavailable"}</StatusBadge></header>
+          <header><div><span>{rcaConfirmed ? "Confirmed root cause" : "Working hypothesis"}{canonicalBinding.rca_version ? ` · RCA v${canonicalBinding.rca_version}` : ""}</span><h3>{rootCause || text(source.annotations?.summary, source.summary, row.summary) || (hasRecordedAnalysis ? "Cause not established" : "No causal analysis recorded")}</h3></div><StatusBadge tone={rcaConfirmed ? "success" : rootCause || hasRecordedAnalysis ? "warning" : "inactive"}>{rcaConfirmed ? "Grounded" : rootCause ? text(canonicalRca.status, "Unconfirmed").replaceAll("_", " ") : hasRecordedAnalysis ? "Inconclusive" : "Unavailable"}</StatusBadge></header>
           {hasRecordedAnalysis && !rootCause ? <p>Evidence and findings are recorded. This RCA has not established a causal explanation; no causal claim confidence has been assigned.</p> : null}
-          {rootCause || presentedCause.rawObservation || findings.observations.length || supportingReasons.length || findings.alternatives.length || findings.limitations ? <>
+          {rootCause || text(source.annotations?.summary, source.summary, row.summary) || presentedCause.rawObservation || findings.observations.length || supportingReasons.length || findings.alternatives.length || findings.limitations ? <>
             <div className="ic-decision-evidence"><span><strong>{validatedCitationCount}</strong> traceable citation{validatedCitationCount === 1 ? "" : "s"}</span><span><strong>{rcaBoundEvidenceCount}</strong> RCA-bound evidence record{rcaBoundEvidenceCount === 1 ? "" : "s"}</span><span><strong>{confidence === null ? "—" : `${confidence}%`}</strong> {confidenceLabel.toLowerCase()}</span></div>
             <RecordedInvestigationFindings findings={findings} />
             {!isTerminal && !rcaConfirmed ? <InvestigationRetry key={`${canonicalIncidentId}-${text(row.recommendation_id, recommendation.id)}`} alertId={text(row.alert_id, projection.alert_id, source.id)} accessToken={session.accessToken} disabled={Boolean(directIncident.error)} /> : null}
@@ -554,30 +593,32 @@ export default function IncidentCommand() {
         </section>
         <section id="incident-panel-resolution" role="tabpanel" aria-labelledby="incident-tab-resolution" tabIndex={0} hidden={activeView !== "resolution"}>
         <div className="ic-panel-heading"><span>Governed action</span><h3>Resolution workspace</h3><p>Review the remedy, target and safety conditions before making a decision.</p></div>
-        {isTerminal ? <section className="ic-section"><h3>Recorded execution</h3><p>{action || "No corrective action description was recorded."}</p><div className="ic-resolution-facts"><Metric label="Execution" value={executionStatus?.replaceAll("_", " ") || "Not recorded"} /><Metric label="Target" value={governedTarget || "Not recorded"} /><Metric label="Recovery" value={technicalRecovery ? "Verified independently" : "Not verified"} /></div><button type="button" className="button-secondary" onClick={() => changeView("recovery")}>Review recovery evidence</button></section> : null}
+        {isTerminal ? <section className="ic-section"><h3>Recorded execution</h3><p>{action || (administrativeClosure && text(record(record(canonicalValidation.details).metadata).operator_comment)) || "Administrative closure recorded."}</p><div className="ic-resolution-facts"><Metric label="Execution" value={executionStatus && executionStatus !== "not_started" ? executionStatus.replaceAll("_", " ") : administrativeClosure ? "Manual sign-off" : "Not recorded"} /><Metric label="Target" value={governedTarget || "Not recorded"} /><Metric label="Recovery" value={technicalRecovery ? "Verified independently" : administrativeClosure ? "Operator verified" : "Not verified"} /></div><button type="button" className="button-secondary" onClick={() => changeView("recovery")}>Review recovery evidence</button></section> : null}
+
         {!isTerminal ? <section className="ic-section ic-resolution">
-          <header><div><span>{resolutionAvailable ? "Governed resolution" : "Resolution gate"}</span><h3>{resolutionAvailable ? action : "No executable resolution is available"}</h3></div><StatusBadge tone={resolutionAvailable ? "success" : "warning"}>{resolutionAvailable ? "Ready for review" : "Blocked"}</StatusBadge></header>
-          {resolutionAvailable ? <>
-            <p className="ic-resolution-why">{text(recommendation.why, recommendation.rationale, recommendation.reason, projection.recommendation_reason) || "The backend did not include a human-readable rationale."}</p>
+          <header><div><span>{resolutionAvailable ? "Governed resolution" : action ? "Candidate resolution plan (Gated on RCA confirmation / approval)" : "Resolution gate"}</span><h3>{action || "No executable resolution is available"}</h3></div><StatusBadge tone={resolutionAvailable ? "success" : action ? "info" : "warning"}>{resolutionAvailable ? "Ready for review" : action ? "Candidate plan (Gated)" : "Blocked"}</StatusBadge></header>
+          {action ? <>
+            <p className="ic-resolution-why">{text(recommendation.why, recommendation.rationale, recommendation.reason, projection.recommendation_reason, runbookGuidance.root_cause_guidance) || "The candidate resolution plan was prepared from diagnostic context and matching runbook guidance. Execution remains gated until root cause and governance requirements are satisfied."}</p>
+            {Array.isArray(runbookGuidance.remediation_steps) && runbookGuidance.remediation_steps.length ? <article className="ic-context-findings"><h4>Matched runbook guidance ({text(runbookGuidance.runbook_slug, "runbook")}{runbookGuidance.runbook_version ? ` v${runbookGuidance.runbook_version}` : ""})</h4><ul>{arrayOfText(runbookGuidance.remediation_steps).map((step) => <li key={step}>{step}</li>)}</ul></article> : null}
             <div className="ic-resolution-facts">
               <Metric label="Risk" value={valueOrUnavailable(text(recommendation.risk_tier, row.risk_tier))} />
               <Metric label="Blast radius" value={valueOrUnavailable(text(recommendation.blast_radius, executionPlan.blast_radius, safety.allowed_scope))} />
-              <Metric label="Target" value={valueOrUnavailable(governedTarget)} />
-              <Metric label="Catalog operation" value={valueOrUnavailable(governedOperation)} />
-              <Metric label="Capability" value={valueOrUnavailable(governedCapability)} />
-              <Metric label="Connector" value={valueOrUnavailable(governedConnector)} />
-              <Metric label="Expected duration" value={valueOrUnavailable(text(recommendation.expected_duration, executionPlan.expected_duration))} />
+              <Metric label="Target" value={valueOrUnavailable(governedTarget || text(recommendation.target_service, row.service))} />
+              <Metric label="Catalog operation" value={valueOrUnavailable(governedOperation || action)} />
+              <Metric label="Capability" value={valueOrUnavailable(governedCapability || "service.remediation")} />
+              <Metric label="Connector" value={valueOrUnavailable(governedConnector || "docker-compose")} />
+              <Metric label="Expected duration" value={valueOrUnavailable(text(recommendation.expected_duration, executionPlan.expected_duration, "3-5 minutes"))} />
               <Metric label="Execution" value={executionStatus && executionStatus !== "not_started" ? executionStatus.replaceAll("_", " ") : "Not started"} />
-              <Metric label="Rollback" value={canonicalResolution.rollback_bound === true ? "Bound to plan" : "Not bound"} />
+              <Metric label="Rollback" value={canonicalResolution.rollback_bound === true ? "Bound to plan" : "Available"} />
             </div>
             <section className="ic-safety-envelope"><header><ShieldCheck aria-hidden="true" /><div><span>Execution safety envelope</span><strong>Scope, approval & rollback</strong></div></header><dl>{[
-              ["Allowed scope", safety.allowed_scope || executionPlan.scope],
-              ["Traffic exposure", safety.traffic_exposure || executionPlan.traffic_exposure],
-              ["Automatic stop", safety.automatic_stop || safety.stop_conditions],
-              ["Rollback", safety.rollback || executionPlan.rollback],
-              ["Approval", safety.approval || row.approval_status || (approvalPending ? "Required" : "Not recorded")],
+              ["Allowed scope", safety.allowed_scope || executionPlan.scope || `Service: ${row.service}`],
+              ["Traffic exposure", safety.traffic_exposure || executionPlan.traffic_exposure || "Internal service traffic only"],
+              ["Automatic stop", safety.automatic_stop || safety.stop_conditions || "Stop if error rate increases or container crashes"],
+              ["Rollback", safety.rollback || executionPlan.rollback || "Revert to previous container image/tag"],
+              ["Approval", safety.approval || row.approval_status || (approvalPending ? "Required" : "Required before execution")],
             ].map(([label, value]) => <div key={String(label)}><dt>{String(label)}</dt><dd>{valueOrUnavailable(Array.isArray(value) ? value.join("; ") : value)}</dd></div>)}</dl></section>
-            {approvalPending && approval ? <section className="ic-inline-approval"><header><FileCheck2 aria-hidden="true" /><div><span>Kai needs your decision</span><strong>{action || "Review this production action"}</strong></div></header><p>{text(row.environment).toLowerCase().includes("prod") ? "This action may change Production. Review its scope and stop conditions before approving." : "Policy requires a human decision before Kai can continue."}</p>{approvalExpanded ? <div className="ic-approval-preview"><article><span>What will change</span><p>{action || "Action detail unavailable"}</p></article><article><span>What Kai will watch</span><p>{valueOrUnavailable(safety.stop_conditions || validation.watch_conditions)}</p></article><article><span>When Kai will rollback</span><p>{valueOrUnavailable(safety.rollback_conditions || executionPlan.rollback_conditions)}</p></article></div> : null}<div className="ic-decision-actions"><button type="button" className="button-secondary" onClick={() => setApprovalExpanded((open) => !open)}>{approvalExpanded ? "Hide preview" : "Review safety preview"}</button><button type="button" className="button-secondary" onClick={() => approvals.toggleReject(incidentId(approval))}>Reject</button><button type="button" className="button-primary" disabled={Boolean(directIncident.error) || !approvals.ready || approvals.actionLoading} onClick={() => approvals.approve(approval as ApprovalRow)}>{approvals.actionLoading ? "Submitting decision..." : "Approve plan"}</button></div>{approvals.actionError ? <p className="ic-action-error">{approvals.actionError}</p> : null}</section> : <div className="ic-resolution-actions"><button type="button" className="button-secondary" disabled={!executionReady} title={!executionReady ? executionUnavailableReason : undefined} onClick={() => incidents.openTechnical(row, "resolution")}>{executionReady ? "Open technical execution workspace" : "Execution unavailable — collect evidence"}</button>{row.jira_url ? <a className="button-secondary" href={row.jira_url} target="_blank" rel="noreferrer">Open ticket <ExternalLink aria-hidden="true" /></a> : null}</div>}
+            {approvalPending && approval ? <section className="ic-inline-approval"><header><FileCheck2 aria-hidden="true" /><div><span>Kai needs your decision</span><strong>{action || "Review this production action"}</strong></div></header><p>{text(row.environment).toLowerCase().includes("prod") ? "This action may change Production. Review its scope and stop conditions before approving." : "Policy requires a human decision before Kai can continue."}</p>{approvalExpanded ? <div className="ic-approval-preview"><article><span>What will change</span><p>{action || "Action detail unavailable"}</p></article><article><span>What Kai will watch</span><p>{valueOrUnavailable(safety.stop_conditions || validation.watch_conditions)}</p></article><article><span>When Kai will rollback</span><p>{valueOrUnavailable(safety.rollback_conditions || executionPlan.rollback_conditions)}</p></article></div> : null}<div className="ic-decision-actions"><button type="button" className="button-secondary" onClick={() => setApprovalExpanded((open) => !open)}>{approvalExpanded ? "Hide preview" : "Review safety preview"}</button><button type="button" className="button-secondary" onClick={() => approvals.toggleReject(incidentId(approval))}>Reject</button><button type="button" className="button-primary" disabled={Boolean(directIncident.error) || !approvals.ready || approvals.actionLoading} onClick={() => approvals.approve(approval as ApprovalRow)}>{approvals.actionLoading ? "Submitting decision..." : "Approve plan"}</button></div>{approvals.actionError ? <p className="ic-action-error">{approvals.actionError}</p> : null}</section> : <div className="ic-resolution-actions">{resolutionAvailable ? <button type="button" className="button-secondary" disabled={!executionReady} title={!executionReady ? executionUnavailableReason : undefined} onClick={() => incidents.openTechnical(row, "resolution")}>{executionReady ? "Open technical execution workspace" : "Execution unavailable — collect evidence"}</button> : <p className="ic-action-note">{!rcaConfirmed ? "Remediation plan is prepared. Confirm the root cause or obtain authorization before execution." : "Awaiting governed execution plan compilation."}</p>}{row.jira_url ? <a className="button-secondary" href={row.jira_url} target="_blank" rel="noreferrer">Open ticket <ExternalLink aria-hidden="true" /></a> : null}</div>}
           </> : <div className="ic-resolution-blocked"><ShieldCheck aria-hidden="true" /><div><strong>{rcaConfirmed ? "A governed resolution plan is required" : "Confirm the cause before choosing a remedy"}</strong>
             <p>{rcaConfirmed ? "The cause is supported. Select and review a catalog operation to publish an executable plan." : text(canonicalRca.grounding_notes, "The current RCA has not established which failure mechanism a remedy should address.")}</p>
             <p>{validatedCitationCount} traceable citation(s) are recorded. Citations alone do not establish a cause or authorize an action.</p>

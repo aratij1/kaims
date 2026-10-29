@@ -612,6 +612,9 @@ class GovernedRagDocumentRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+KnowledgeRagDocumentRecord = GovernedRagDocumentRecord
+
+
 class KnowledgeRagDraftRecord(Base, TimestampMixin):
     """Durable operational knowledge draft that is not bound to an incident RCA."""
 
@@ -763,6 +766,40 @@ class AuditLogRecord(Base, TimestampMixin):
     resource_type: Mapped[str] = mapped_column(String(128), index=True)
     resource_id: Mapped[str] = mapped_column(String(128), index=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class RunbookRecord(Base, TimestampMixin):
+    """Canonical governed runbook metadata record."""
+
+    __tablename__ = "runbooks"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "slug", name="uq_runbook_slug"),
+    )
+
+    runbook_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
+    slug: Mapped[str] = mapped_column(String(255))
+    owner: Mapped[str] = mapped_column(String(255))
+    service: Mapped[str] = mapped_column(String(255))
+    alert_family: Mapped[str] = mapped_column(String(255))
+
+
+class RunbookApprovalRecord(Base):
+    """Governance approval audit record for an immutable runbook version."""
+
+    __tablename__ = "runbook_approvals"
+    __table_args__ = (
+        UniqueConstraint("runbook_id", "version", "status", name="uq_runbook_version_approval"),
+    )
+
+    approval_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    runbook_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    approver: Mapped[str] = mapped_column(String(255))
+    approver_role: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str | None] = mapped_column(String(1000))
+    approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class RunbookVersionRecord(Base):

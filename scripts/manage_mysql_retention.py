@@ -45,6 +45,104 @@ def archive_row(directory, table, row):
     return {"schema": MARKER, "archive": target.name, "sha256": checksum}
 
 
+def compact_alert_payload(payload, receipt):
+    data = json.loads(payload) if isinstance(payload, str) else dict(payload or {})
+    if not isinstance(data, dict):
+        return {"retention_archive": receipt}
+    compacted = dict(data)
+    for heavy_key in ("raw_event", "raw_payload", "raw_alert", "prometheus_alert", "telemetry", "logs", "metrics", "traces"):
+        compacted.pop(heavy_key, None)
+    meta = dict(compacted.get("metadata") or {}) if isinstance(compacted.get("metadata"), dict) else {}
+    if meta:
+        for heavy_meta_key in ("raw_alert", "raw_payload", "prometheus_alert", "raw_event", "telemetry"):
+            meta.pop(heavy_meta_key, None)
+        dedup = dict(meta.get("deduplication") or {}) if isinstance(meta.get("deduplication"), dict) else {}
+        if dedup:
+            if isinstance(dedup.get("matches"), list):
+                dedup["matches_compacted_count"] = len(dedup.pop("matches"))
+            if isinstance(dedup.get("matched_alert_ids"), list):
+                dedup["matched_alert_ids_compacted_count"] = len(dedup.pop("matched_alert_ids"))
+            if isinstance(dedup.get("occurrences"), list):
+                dedup["occurrences_compacted_count"] = len(dedup.pop("occurrences"))
+            meta["deduplication"] = dedup
+        compacted["metadata"] = meta
+    compacted["retention_archive"] = receipt
+    return compacted
+
+
+def compact_projection_payload(projection_payload, receipt):
+    data = json.loads(projection_payload) if isinstance(projection_payload, str) else dict(projection_payload or {})
+    if not isinstance(data, dict):
+        return {"retention_archive": receipt}
+    compacted = dict(data)
+    if isinstance(compacted.get("source_alert"), dict):
+        source_alert = dict(compacted["source_alert"])
+        if isinstance(source_alert.get("metadata"), dict):
+            smeta = dict(source_alert["metadata"])
+            if isinstance(smeta.get("deduplication"), dict):
+                sdedup = dict(smeta["deduplication"])
+                if isinstance(sdedup.get("matches"), list):
+                    sdedup["matches_compacted_count"] = len(sdedup.pop("matches"))
+                if isinstance(sdedup.get("matched_alert_ids"), list):
+                    sdedup["matched_alert_ids_compacted_count"] = len(sdedup.pop("matched_alert_ids"))
+                smeta["deduplication"] = sdedup
+            source_alert["metadata"] = smeta
+        compacted["source_alert"] = source_alert
+    if isinstance(compacted.get("recommendation"), dict):
+        rec = dict(compacted["recommendation"])
+        if isinstance(rec.get("metadata"), dict):
+            rmeta = dict(rec["metadata"])
+            for heavy_rec_key in ("iterative_investigation", "investigation_report", "discovery_evidence", "evidence", "rag_matches", "rag_documents"):
+                rmeta.pop(heavy_rec_key, None)
+            rec["metadata"] = rmeta
+        compacted["recommendation"] = rec
+    if isinstance(compacted.get("context"), dict):
+        ctx = compacted["context"]
+        ctx_meta = ctx.get("metadata") if isinstance(ctx.get("metadata"), dict) else {}
+        compacted["context"] = {
+            "id": ctx.get("id"),
+            "incident_id": ctx.get("incident_id"),
+            "tenant_id": ctx.get("tenant_id"),
+            "metadata": {
+                "contract_version": ctx_meta.get("contract_version"),
+                "context_snapshot_id": ctx_meta.get("context_snapshot_id"),
+                "context_fingerprint": ctx_meta.get("context_fingerprint"),
+                "context_quality": ctx_meta.get("context_quality"),
+                "recovered": ctx_meta.get("recovered"),
+            },
+        }
+    if isinstance(compacted.get("event_payload"), dict):
+        ep = dict(compacted["event_payload"])
+        for dup_key in ("context_evidence", "discovery_evidence", "related_incidents", "discovery_report"):
+            ep.pop(dup_key, None)
+        if isinstance(ep.get("context"), dict):
+            ep_ctx = ep["context"]
+            ep_meta = ep_ctx.get("metadata") if isinstance(ep_ctx.get("metadata"), dict) else {}
+            prior_res = ep_meta.get("prior_resolution")
+            compact_prior = (
+                {k: v for k, v in prior_res.items() if k not in ("metadata", "iterative_investigation")}
+                if isinstance(prior_res, dict)
+                else None
+            )
+            ep["context"] = {
+                "id": ep_ctx.get("id"),
+                "incident_id": ep_ctx.get("incident_id"),
+                "tenant_id": ep_ctx.get("tenant_id"),
+                "alert": ep_ctx.get("alert") if isinstance(ep_ctx.get("alert"), dict) else None,
+                "metadata": {
+                    "contract_version": ep_meta.get("contract_version"),
+                    "context_snapshot_id": ep_meta.get("context_snapshot_id"),
+                    "context_fingerprint": ep_meta.get("context_fingerprint"),
+                    "context_quality": ep_meta.get("context_quality"),
+                    "recovered": ep_meta.get("recovered"),
+                    **({"prior_resolution": compact_prior} if compact_prior else {}),
+                },
+            }
+        compacted["event_payload"] = ep
+    compacted["retention_archive"] = receipt
+    return compacted
+
+
 def restore_archive(connection, path, *, execute=False):
     path = Path(path)
     raw = gzip.decompress(path.read_bytes())
@@ -53,9 +151,15 @@ def restore_archive(connection, path, *, execute=False):
         raise ValueError("Archive checksum mismatch")
     archived = json.loads(raw)
     table, row = archived["table"], archived["row"]
-    if table not in {"resolution_outbox", "context_snapshots"}:
+    if table not in {"resolution_outbox", "context_snapshots", "alerts", "incident_projections"}:
         raise ValueError("Unsupported archive table")
-    key = "event_id" if table == "resolution_outbox" else "snapshot_id"
+    key_map = {
+        "resolution_outbox": "event_id",
+        "context_snapshots": "snapshot_id",
+        "alerts": "id",
+        "incident_projections": "incident_id",
+    }
+    key = key_map[table]
     result = {"dry_run": not execute, "table": table, "restored": False}
     connection.begin()
     try:
@@ -75,11 +179,35 @@ def restore_archive(connection, path, *, execute=False):
                     raise ValueError("Delivery metadata changed since archival")
                 if execute:
                     c.execute("UPDATE resolution_outbox SET payload=%s WHERE event_id=%s", (row["payload"], row[key]))
+            elif table in {"alerts", "incident_projections"}:
+                if current is None:
+                    raise ValueError(f"Missing {table} record; refusing to recreate row")
+                payload_col = "payload" if table == "alerts" else "projection_payload"
+                current_payload = current[payload_col]
+                current_payload = json.loads(current_payload) if isinstance(current_payload, str) else current_payload
+                archive_meta = current_payload.get("retention_archive") if isinstance(current_payload, dict) else None
+                if not isinstance(archive_meta, dict) or archive_meta.get("schema") != MARKER or archive_meta.get("sha256") != checksum:
+                    raise ValueError(f"{table} payload changed since archival")
+                if execute:
+                    restored_val = row[payload_col] if isinstance(row[payload_col], str) else json.dumps(row[payload_col])
+                    c.execute(
+                        "UPDATE " + quote(table) + " SET " + quote(payload_col) + "=%s WHERE " + quote(key) + "=%s",
+                        (restored_val, row[key]),
+                    )
             else:
                 if current is not None:
                     raise ValueError("Snapshot already exists; refusing overwrite")
                 if execute:
-                    keys = list(row)
+                    c.execute(
+                        "SELECT COLUMN_NAME, EXTRA FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='context_snapshots'"
+                    )
+                    gen_cols = {
+                        r["COLUMN_NAME"]
+                        for r in c.fetchall()
+                        if "GENERATED" in str(r.get("EXTRA") or "").upper()
+                    }
+                    keys = [k for k in row if k not in gen_cols]
                     c.execute("INSERT INTO context_snapshots (" + ",".join(quote(k) for k in keys) +
                               ") VALUES (" + ",".join(["%s"]*len(keys)) + ")", [row[k] for k in keys])
             result["restored"] = execute
@@ -128,17 +256,25 @@ def snapshot_referenced(cursor, row, columns):
 
 
 def run(connection, archive_dir, *, execute=False, batch_size=20, max_batches=50,
-        outbox_days=7, snapshot_days=30, outbox_after="", snapshot_after=None):
+        outbox_days=7, snapshot_days=30, outbox_after="", snapshot_after=None,
+        compact_alerts=False, compact_projections=False, alert_days=14, projection_days=14,
+        alert_after="", projection_after=""):
     if not (1 <= batch_size <= 100 and 1 <= max_batches <= 100):
         raise ValueError("Invalid work limits")
-    if outbox_days < 7 or snapshot_days < 30:
+    if outbox_days < 7 or snapshot_days < 30 or alert_days < 7 or projection_days < 7:
         raise ValueError("Retention cannot be shorter than seven/thirty days")
     deadline = time.monotonic() + 120
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     outbox_cutoff = now - timedelta(days=outbox_days)
     snapshot_cutoff = now - timedelta(days=snapshot_days)
+    alert_cutoff = now - timedelta(days=alert_days)
+    projection_cutoff = now - timedelta(days=projection_days)
     result = {"dry_run": not execute, "outbox_compacted": 0, "snapshots_deleted": 0,
               "outbox_candidates": 0, "snapshot_candidates": 0, "snapshots_protected": 0}
+    if compact_alerts:
+        result.update({"alert_candidates": 0, "alerts_compacted": 0, "alerts_bytes_saved": 0})
+    if compact_projections:
+        result.update({"projection_candidates": 0, "projections_compacted": 0, "projections_bytes_saved": 0})
     with connection.cursor() as c:
         c.execute("SELECT DATABASE() AS db")
         lock_name = "kaims_retention:" + hashlib.sha256(c.fetchone()["db"].encode()).hexdigest()[:32]
@@ -152,6 +288,7 @@ def run(connection, archive_dir, *, execute=False, batch_size=20, max_batches=50
             c.execute("SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE")
             columns = reference_columns(c)
         connection.commit()
+        existing_tables = {col["TABLE_NAME"] for col in columns}
         # Retaining the row's primary key preserves enqueue_resolution_event deduplication.
         # Only known closed incidents qualify; unresolvable aggregate identities stay intact.
         outbox_filter = ("o.status='published' AND o.published_at < %s AND o.updated_at < %s "
@@ -220,7 +357,155 @@ def run(connection, archive_dir, *, execute=False, batch_size=20, max_batches=50
                     c.execute("DELETE FROM context_snapshots WHERE snapshot_id=%s", (sid,))
                     result["snapshots_deleted"] += 1
         connection.commit()
+
+        if compact_alerts and "alerts" in existing_tables:
+            phase = "alerts"
+            a_after = alert_after
+            alert_columns = {col["COLUMN_NAME"] for col in columns if col["TABLE_NAME"] == "alerts"}
+            writable_alert_cols = [
+                col["COLUMN_NAME"]
+                for col in columns
+                if col["TABLE_NAME"] == "alerts"
+                and col["COLUMN_NAME"] not in {"inbox_project", "inbox_canonical_incident_id"}
+            ] or ["*"]
+            select_alert_expr = ",".join("a." + quote(c_name) for c_name in writable_alert_cols) if writable_alert_cols != ["*"] else "a.*"
+            alert_closed_clause = (
+                "EXISTS (SELECT 1 FROM incidents i WHERE i.tenant_id=a.tenant_id "
+                "AND REPLACE(i.id,'-','')=REPLACE(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.payload,'$.metadata.deduplication.canonical_incident_id')),"
+                + ("a.correlation_id," if "correlation_id" in alert_columns else "")
+                + "''),'-','') AND i.status='closed')"
+            )
+            if "incident_projections" in existing_tables:
+                alert_closed_clause = (
+                    "(" + alert_closed_clause + " OR EXISTS (SELECT 1 FROM incident_projections p "
+                    "WHERE p.tenant_id=a.tenant_id AND REPLACE(COALESCE(p.alert_id,''),'-','')=REPLACE(a.id,'-','') "
+                    "AND p.status IN ('closed','resolved') AND p.lifecycle_state='CLOSED'))"
+                )
+            alert_filter = (
+                "a.updated_at < %s "
+                "AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.payload,'$.retention_archive.schema')),'') <> %s "
+                "AND " + alert_closed_clause + " "
+                "AND NOT EXISTS (SELECT 1 FROM incidents i_open WHERE i_open.tenant_id=a.tenant_id "
+                "AND REPLACE(i_open.id,'-','')=REPLACE(COALESCE(JSON_UNQUOTE(JSON_EXTRACT(a.payload,'$.metadata.deduplication.canonical_incident_id')),"
+                + ("a.correlation_id," if "correlation_id" in alert_columns else "")
+                + "''),'-','') AND i_open.status<>'closed')"
+            )
+            for _ in range(max_batches):
+                if time.monotonic() >= deadline:
+                    result["time_budget_reached"] = True
+                    break
+                connection.begin()
+                with connection.cursor() as c:
+                    c.execute(
+                        "SELECT /*+ MAX_EXECUTION_TIME(2000) */ a.id FROM alerts a "
+                        "WHERE a.updated_at < %s AND a.id > %s ORDER BY a.id LIMIT %s",
+                        (alert_cutoff, a_after, batch_size),
+                    )
+                    a_ids = [r["id"] for r in c.fetchall()]
+                    if not a_ids:
+                        connection.rollback()
+                        a_after = ""
+                        break
+                    a_after = a_ids[-1]
+                    for alert_id in a_ids:
+                        c.execute(
+                            "SELECT " + select_alert_expr + " FROM alerts a WHERE " + alert_filter + " AND a.id=%s FOR UPDATE",
+                            (alert_cutoff, MARKER, alert_id),
+                        )
+                        row = c.fetchone()
+                        if not row:
+                            continue
+                        orig_raw = row["payload"] if isinstance(row["payload"], str) else json.dumps(row["payload"], separators=(",", ":"))
+                        preview_compacted = json.dumps(
+                            compact_alert_payload(row["payload"], {"schema": MARKER, "archive": "0" * 64 + ".json.gz", "sha256": "0" * 64}),
+                            separators=(",", ":"),
+                        )
+                        if len(preview_compacted.encode("utf-8")) >= len(orig_raw.encode("utf-8")):
+                            continue
+                        result["alert_candidates"] += 1
+                        if not execute:
+                            result["alerts_bytes_saved"] += len(orig_raw.encode("utf-8")) - len(preview_compacted.encode("utf-8"))
+                            continue
+                        receipt = archive_row(archive_dir, "alerts", row)
+                        compacted_str = json.dumps(compact_alert_payload(row["payload"], receipt), separators=(",", ":"))
+                        c.execute("UPDATE alerts SET payload=%s WHERE id=%s", (compacted_str, alert_id))
+                        result["alerts_compacted"] += 1
+                        result["alerts_bytes_saved"] += len(orig_raw.encode("utf-8")) - len(compacted_str.encode("utf-8"))
+                connection.commit()
+            result["alert_after"] = a_after
+
+        if compact_projections and "incident_projections" in existing_tables:
+            phase = "incident_projections"
+            p_after = projection_after
+            proj_filter = (
+                "p.status IN ('closed','resolved') AND p.lifecycle_state='CLOSED' AND p.updated_at < %s "
+                "AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(p.projection_payload,'$.retention_archive.schema')),'') <> %s "
+                "AND EXISTS (SELECT 1 FROM incidents i WHERE i.tenant_id=p.tenant_id "
+                "AND REPLACE(i.id,'-','')=REPLACE(p.incident_id,'-','') AND i.status='closed')"
+            )
+            for _ in range(max_batches):
+                if time.monotonic() >= deadline:
+                    result["time_budget_reached"] = True
+                    break
+                connection.begin()
+                with connection.cursor() as c:
+                    c.execute(
+                        "SELECT /*+ MAX_EXECUTION_TIME(2000) */ p.incident_id FROM incident_projections p "
+                        "WHERE p.status IN ('closed','resolved') AND p.updated_at < %s "
+                        "AND p.incident_id > %s ORDER BY p.incident_id LIMIT %s",
+                        (projection_cutoff, p_after, batch_size),
+                    )
+                    p_ids = [r["incident_id"] for r in c.fetchall()]
+                    if not p_ids:
+                        connection.rollback()
+                        p_after = ""
+                        break
+                    p_after = p_ids[-1]
+                    for inc_id in p_ids:
+                        c.execute(
+                            "SELECT p.* FROM incident_projections p WHERE " + proj_filter + " AND p.incident_id=%s FOR UPDATE",
+                            (projection_cutoff, MARKER, inc_id),
+                        )
+                        row = c.fetchone()
+                        if not row:
+                            continue
+                        orig_raw = (
+                            row["projection_payload"]
+                            if isinstance(row["projection_payload"], str)
+                            else json.dumps(row["projection_payload"], separators=(",", ":"))
+                        )
+                        preview_compacted = json.dumps(
+                            compact_projection_payload(
+                                row["projection_payload"],
+                                {"schema": MARKER, "archive": "0" * 64 + ".json.gz", "sha256": "0" * 64},
+                            ),
+                            separators=(",", ":"),
+                        )
+                        if len(preview_compacted.encode("utf-8")) >= len(orig_raw.encode("utf-8")):
+                            continue
+                        result["projection_candidates"] += 1
+                        if not execute:
+                            result["projections_bytes_saved"] += len(orig_raw.encode("utf-8")) - len(preview_compacted.encode("utf-8"))
+                            continue
+                        receipt = archive_row(archive_dir, "incident_projections", row)
+                        compacted_str = json.dumps(
+                            compact_projection_payload(row["projection_payload"], receipt),
+                            separators=(",", ":"),
+                        )
+                        c.execute(
+                            "UPDATE incident_projections SET projection_payload=%s WHERE incident_id=%s",
+                            (compacted_str, inc_id),
+                        )
+                        result["projections_compacted"] += 1
+                        result["projections_bytes_saved"] += len(orig_raw.encode("utf-8")) - len(compacted_str.encode("utf-8"))
+                connection.commit()
+            result["projection_after"] = p_after
+
         with connection.cursor() as c:
+            try:
+                c.execute("SET SESSION information_schema_stats_expiry=0")
+            except Exception:
+                pass
             c.execute("SELECT table_name, data_length+index_length AS allocated_bytes, data_free "
                       "FROM information_schema.tables WHERE table_schema=DATABASE() "
                       "ORDER BY data_length+index_length DESC LIMIT 8")
@@ -245,6 +530,10 @@ def main():
     parser.add_argument("--max-batches", type=int, default=50)
     parser.add_argument("--archive-dir", default="backend/retention-archives")
     parser.add_argument("--interval-seconds", type=int, default=86400)
+    parser.add_argument("--compact-alerts", action="store_true")
+    parser.add_argument("--compact-projections", action="store_true")
+    parser.add_argument("--alert-days", type=int, default=14)
+    parser.add_argument("--projection-days", type=int, default=14)
     args = parser.parse_args()
     if args.restore_archive and args.daemon:
         parser.error("Restore cannot run as a daemon")
@@ -272,8 +561,20 @@ def main():
                 report = Path(args.archive_dir) / "last-run.json"
                 previous = json.loads(report.read_text()) if report.exists() else {}
                 after = previous.get("outbox_after", "") if args.execute and not previous.get("dry_run", True) else ""
-                result = run(connection, args.archive_dir, execute=args.execute, outbox_after=after, max_batches=args.max_batches,
-                             snapshot_after=previous.get("snapshot_after") if args.execute and not previous.get("dry_run", True) else None)
+                result = run(
+                    connection,
+                    args.archive_dir,
+                    execute=args.execute,
+                    outbox_after=after,
+                    max_batches=args.max_batches,
+                    snapshot_after=previous.get("snapshot_after") if args.execute and not previous.get("dry_run", True) else None,
+                    compact_alerts=args.compact_alerts,
+                    compact_projections=args.compact_projections,
+                    alert_days=args.alert_days,
+                    projection_days=args.projection_days,
+                    alert_after=previous.get("alert_after", "") if args.execute and not previous.get("dry_run", True) else "",
+                    projection_after=previous.get("projection_after", "") if args.execute and not previous.get("dry_run", True) else "",
+                )
             finally:
                 connection.close()
             if result.get("skipped"):

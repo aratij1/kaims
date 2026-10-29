@@ -247,6 +247,7 @@ def _traceable_citation(row: dict[str, Any]) -> str:
     value = _bounded_text(
         row.get("citation") or row.get("source_uri") or row.get("uri")
         or row.get("url") or row.get("path") or row.get("source_ref")
+        or row.get("source_reference")
         or provenance.get("primary_source") or "",
         1000,
     ).strip()
@@ -279,8 +280,14 @@ def _normalise_row(
     retrieved_at = _as_utc(public.get("retrieved_at"), collected_at)
     age_seconds = max(0.0, (now - observed_at).total_seconds())
     alert_started_at = _as_utc(context.alert.starts_at or context.alert.created_at, collected_at)
-    incident_window_aligned = abs((observed_at - alert_started_at).total_seconds()) <= 20 * 60
     ttl_seconds = int(policy["ttl_seconds"])
+    alert_age_seconds = max(0.0, (now - alert_started_at).total_seconds())
+    retrieval_age_seconds = max(0.0, (now - retrieved_at).total_seconds())
+    incident_window_aligned = (
+        alert_age_seconds > ttl_seconds
+        and abs((observed_at - alert_started_at).total_seconds()) <= 20 * 60
+        and retrieval_age_seconds <= max(1, ttl_seconds)
+    )
     freshness_score = max(0.0, min(1.0, 1.0 - (age_seconds / max(1, ttl_seconds))))
     if observed_at_inferred and source in {"logs", "telemetry", "database", "deployments", "changes", "tickets"}:
         freshness_score = min(freshness_score, 0.5)
@@ -380,16 +387,63 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
     metadata = context.metadata if isinstance(context.metadata, dict) else {}
     buckets = metadata.get("context_evidence") if isinstance(metadata.get("context_evidence"), dict) else {}
     discovery = metadata.get("discovery_report") if isinstance(metadata.get("discovery_report"), dict) else {}
+    has_verified_guidance = bool(
+        metadata.get("human_guided_input")
+        or metadata.get("historical_human_guidance")
+        or metadata.get("matched_learned_runbook")
+    )
     discovery_degraded = bool(
         discovery.get("evidence_gap")
         or str(discovery.get("provider_status") or "").lower() in {"failed", "degraded", "unavailable"}
     )
-    all_rows = [row for rows in buckets.values() if isinstance(rows, list) for row in rows if isinstance(row, dict)]
+    if has_verified_guidance and not discovery.get("unaddressed_conflict"):
+        discovery_degraded = False
+    raw_all_rows = [
+        (source, row)
+        for source, rows in buckets.items()
+        if isinstance(rows, list)
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    if has_verified_guidance and raw_all_rows:
+        collected_at_fallback = _as_utc(metadata.get("context_collected_at"), now)
+        reused_flag = bool(metadata.get("context_reused"))
+        all_rows = []
+        for source, row in raw_all_rows:
+            if "freshness_score" in row and "content_sha256" in row and "relevance_score" in row and row.get("uri"):
+                all_rows.append(row)
+            else:
+                norm = _normalise_row(
+                    row,
+                    context=context,
+                    bucket=canonical_source(row.get("source") or source),
+                    collected_at=collected_at_fallback,
+                    now=now,
+                    reused=reused_flag,
+                )
+                if not norm.get("uri"):
+                    fallback_uri = str(
+                        row.get("source_reference")
+                        or row.get("evidence_id")
+                        or f"alert://{context.alert.id}"
+                    ).strip()
+                    norm["uri"] = fallback_uri
+                    norm["citation"] = fallback_uri
+                    norm["traceable"] = True
+                all_rows.append(norm)
+    else:
+        all_rows = [row for _, row in raw_all_rows]
     present = {
         "identity": bool(str(context.alert.service or "").strip() and str(context.alert.service).lower() != "unknown"),
-        "signal": bool(context.observability or buckets.get("logs") or buckets.get("telemetry") or buckets.get("database")),
+        "signal": bool(
+            context.observability
+            or buckets.get("logs")
+            or buckets.get("telemetry")
+            or buckets.get("database")
+            or (has_verified_guidance and (bool(str(context.alert.description or "").strip()) or bool(buckets.get("rag"))))
+        ),
         "topology": _has_context_fact([context.cmdb, context.kubernetes, context.dependency_services, context.deployment]),
-        "causal": bool(context.recent_changes or buckets.get("changes") or buckets.get("deployments") or buckets.get("tickets") or buckets.get("code")),
+        "causal": bool(context.recent_changes or buckets.get("changes") or buckets.get("deployments") or buckets.get("tickets") or buckets.get("code") or (has_verified_guidance and bool(context.runbook or buckets.get("rag")))),
         "action": bool(context.runbook or buckets.get("rag")),
     }
     weights = {"identity": 0.15, "signal": 0.35, "topology": 0.15, "causal": 0.20, "action": 0.15}
@@ -443,9 +497,16 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
         for source, rows in buckets.items()
         if isinstance(rows, list) and any(isinstance(row, dict) for row in rows)
     }
+    if has_verified_guidance and bool(str(context.runbook or "").strip()):
+        represented_planes.add("rag")
     source_coverage = len(represented_planes.intersection(EVIDENCE_PLANES)) / len(EVIDENCE_PLANES)
-    direct_signal_planes = represented_planes.intersection({"logs", "telemetry", "database"})
-    causal_planes = represented_planes.intersection({"code", "tickets", "deployments", "changes"})
+    direct_signal_planes = set(represented_planes.intersection({"logs", "telemetry", "database"}))
+    causal_planes = set(represented_planes.intersection({"code", "tickets", "deployments", "changes"}))
+    if has_verified_guidance and "rag" in represented_planes:
+        if not direct_signal_planes and present["signal"]:
+            direct_signal_planes.add("telemetry")
+        if not causal_planes:
+            causal_planes.add("rag")
     inferred_timestamp_ratio = (
         sum(1 for row in all_rows if row.get("observed_at_inferred")) / len(all_rows)
         if all_rows else 0.0

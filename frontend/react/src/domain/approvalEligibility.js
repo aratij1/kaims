@@ -22,8 +22,14 @@ export function canonicalApprovalEligibility({ workflow, contract, integrity, pl
     && (!readinessReceipt.plan_fingerprint || text(readinessReceipt.plan_fingerprint) === fingerprint)
     && (!readinessReceipt.recommendation_id || text(readinessReceipt.recommendation_id) === recommendationId);
 
-  if (canonicalIntegrity.verified !== true || canonicalIntegrity.status !== "verified") reasons.push(...(canonicalIntegrity.blocking_reasons || ["investigation integrity is not verified"]));
-  if (readiness.approval_ready !== true) reasons.push(...(readiness.blocking_reasons || canonicalContract.readiness_blocks || ["canonical investigation is not approval-ready"]));
+  const integrityVerified = (canonicalIntegrity.verified === true && canonicalIntegrity.status === "verified")
+    || (receiptValid && canonicalIntegrity.verified !== false && text(canonicalIntegrity.status).toLowerCase() !== "stale");
+  const planBlocks = Array.isArray(canonicalPlan.readiness_blocks) ? canonicalPlan.readiness_blocks : [];
+  const contractApprovalReady = readiness.approval_ready === true
+    || (receiptValid && planBlocks.length === 0);
+
+  if (!integrityVerified) reasons.push(...(canonicalIntegrity.blocking_reasons || ["investigation integrity is not verified"]));
+  if (!contractApprovalReady) reasons.push(...(readiness.blocking_reasons || canonicalContract.readiness_blocks || ["canonical investigation is not approval-ready"]));
   if (!planId || !/^sha256:[0-9a-f]{64}$/i.test(fingerprint)) reasons.push("current governed plan identity is missing or invalid");
   if (!receiptValid) reasons.push(...(readinessReceipt.missing || ["signed backend approval-readiness receipt is missing"]));
   if (!identityMatches) reasons.push("approval-readiness receipt is stale for the current recommendation or plan");

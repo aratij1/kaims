@@ -15,6 +15,8 @@ RESOLUTION_EVENTS = "resolution-events"
 APPROVAL_EVENTS = "approval-events"
 REMEDIATION_EVENTS = "remediation-events"
 CLOSURE_EVENTS = "closure-events"
+INCIDENT_LIFECYCLE_EVENTS = "incident-lifecycle-events"
+HUMAN_EVIDENCE_ASSIGNMENT_EVENTS = "human-evidence-assignment-events"
 LEARNING_EVENTS = "learning-events"
 APPLICATION_ONBOARD_REQUESTED = "application.onboard.requested"
 APPLICATION_DISCOVERY_COMPLETED = "application.discovery.completed"
@@ -71,6 +73,7 @@ ALL_TOPICS = [
     APPROVAL_EVENTS,
     REMEDIATION_EVENTS,
     CLOSURE_EVENTS,
+    INCIDENT_LIFECYCLE_EVENTS,
     LEARNING_EVENTS,
     APPLICATION_ONBOARD_REQUESTED,
     APPLICATION_DISCOVERY_COMPLETED,

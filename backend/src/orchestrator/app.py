@@ -3,15 +3,21 @@ from __future__ import annotations
 import asyncio
 import os
 
+from datetime import datetime, timezone
+from uuid import UUID
+
 from common.config import get_settings
+from common.database import IncidentProjectionRecord
 from common.event_publishers import build_event_consumer, build_orchestration_envelope, selected_event_bus_provider
 from common.repository import IncidentRepository
 from common.logging import get_logger
 from common.models import Alert, Incident
+from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
-from common.topics import ENRICHED_ALERTS, ORCHESTRATION_EVENTS
+from common.topics import ENRICHED_ALERTS, INCIDENT_LIFECYCLE_EVENTS, ORCHESTRATION_EVENTS
 from fastapi import FastAPI, HTTPException
+from sqlalchemy import select
 from orchestrator.message_bus import publish_orchestration_event
 from orchestrator import OrchestratorAgent
 
@@ -34,6 +40,65 @@ async def _persist_orchestration_event(app: FastAPI, envelope: dict) -> None:
         repo = IncidentRepository(session)
         await repo.save_incident_event(envelope)
         await session.commit()
+
+
+async def record_orchestrator_lifecycle_transition(app: FastAPI, payload: dict) -> None:
+    tenant_id = str(payload.get("tenant_id") or "default").strip()
+    incident_id_str = str(payload.get("incident_id") or "").strip()
+    new_state = str(payload.get("new_state") or "").strip().upper()
+    version = int(payload.get("version") or 0)
+    failure_code = payload.get("failure_code")
+    reason = payload.get("reason")
+    if not incident_id_str or not new_state:
+        return
+    try:
+        incident_uuid = UUID(incident_id_str)
+    except ValueError:
+        return
+
+    session_factory = getattr(app.state, "session_factory", None)
+    if session_factory is None:
+        return
+
+    async with session_factory() as session:
+        projection = await session.scalar(
+            select(IncidentProjectionRecord)
+            .where(
+                IncidentProjectionRecord.tenant_id == tenant_id,
+                IncidentProjectionRecord.incident_id == incident_uuid,
+            )
+            .with_for_update()
+        )
+        if projection is not None:
+            current_ver = int(projection.lifecycle_version or 1)
+            if version >= current_ver:
+                projection.lifecycle_state = new_state
+                projection.lifecycle_version = version
+                if failure_code:
+                    projection.lifecycle_failure_code = str(failure_code)
+                    projection.lifecycle_failure_reason = str(reason or "")
+
+                state_to_status = {
+                    "DETECTED": "open",
+                    "REQUIREMENTS_IDENTIFIED": "investigating",
+                    "COLLECTING": "collecting",
+                    "CONTEXT_READY": "investigating",
+                    "INVESTIGATING": "investigating",
+                    "WAITING_FOR_HUMAN": "waiting_for_human",
+                    "RCA_READY": "rca_ready",
+                    "AWAITING_APPROVAL": "awaiting_approval",
+                    "PLAN_READY": "approved",
+                    "EXECUTING": "remediating",
+                    "VALIDATING": "validating",
+                    "CLOSED": "closed",
+                    "FAILED": "failed",
+                    "DEAD_LETTER": "failed",
+                }
+                mapped_status = state_to_status.get(new_state)
+                if mapped_status:
+                    projection.status = mapped_status
+                projection.updated_at = datetime.now(timezone.utc)
+                await session.commit()
 
 
 def _build_ingress_consumers() -> list[tuple[str, object, object]]:
@@ -111,6 +176,11 @@ async def startup(app: FastAPI) -> None:
     for source, consumer, consume_forever in _build_ingress_consumers():
         task = asyncio.create_task(consume_forever(consumer, handle), name=f"orchestrator-{source}-consumer")
         tasks.append(task)
+
+    lifecycle_consumer = RabbitMQConsumer(settings, INCIDENT_LIFECYCLE_EVENTS)
+    async def handle_lifecycle(payload: dict) -> None:
+        await record_orchestrator_lifecycle_transition(app, payload)
+    tasks.append(asyncio.create_task(consume_rabbitmq_forever(lifecycle_consumer, handle_lifecycle), name="orchestrator-lifecycle"))
 
 
 async def shutdown(app: FastAPI) -> None:

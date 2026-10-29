@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { capLatestAlertsPerSource, dedupeAndConsolidateAlertRows, ensureMinimumAlertsBySource, filterAlertsForMonitor, filterRowsForMonitor, shouldRetainAlertSelection, resolveCanonicalAlertForRow } from "./appHelpers.jsx";
+import { uniqueMonitorApplications } from "./app/legacyShellHelpers.js";
+import { availableApplication } from "./domain/applicationSelection";
+import { hasPendingDecision } from "./domain/pendingDecision";
+import { belongsToInboxView } from "./routes/incidents/IncidentsRoute";
 
 describe("alert stream and inbox identity", () => {
   it("does not merge different Alertmanager fingerprints sharing name, service, and time", () => {
@@ -54,6 +58,87 @@ describe("alert stream and inbox identity", () => {
     expect(filterRowsForMonitor([production, testRun], "real-usecases")).toEqual([production]);
     expect(filterRowsForMonitor([production, testRun], "test-usecases")).toEqual([testRun]);
   });
+
+  it("retains built-in KaiMS and Telemetry workspaces even when applications API returns only payment-gateway", () => {
+    const options = uniqueMonitorApplications(["payment-gateway"]);
+    expect(options).toEqual(["All Applications", "KaiMS", "Telemetry", "payment-gateway"]);
+    expect(availableApplication("All Applications", options)).toBe("All Applications");
+    expect(availableApplication("KaiMS", options)).toBe("KaiMS");
+    expect(availableApplication("Telemetry", options)).toBe("Telemetry");
+  });
+
+  it("includes canary-audit-service and unknown services in All Applications unscoped view while keeping KaiMS scoped", () => {
+    const canary = {
+      id: "57f188cc-4bcf-47cc-a57f-f77103f7bb1f",
+      name: "CanaryAlertQueryRunbookVerification",
+      service: "canary-audit-service",
+      severity: "warning",
+      environment: "verification",
+      labels: { service: "canary-audit-service", severity: "high" },
+    };
+    const coreAlert = {
+      id: "core-1",
+      name: "DiskSpaceLow",
+      service: "node-exporter",
+      labels: { service: "node-exporter" },
+    };
+    const paymentAlert = {
+      id: "pay-1",
+      name: "PaymentLatencySpike",
+      service: "payments",
+      application: "payment-gateway",
+      labels: { service: "payments", application: "payment-gateway" },
+    };
+    const rows = [canary, coreAlert, paymentAlert];
+
+    // All Applications unscoped view includes all production rows (including canary-audit-service)
+    expect(filterAlertsForMonitor(rows, "All Applications").map((r) => r.id)).toEqual(["57f188cc-4bcf-47cc-a57f-f77103f7bb1f", "core-1", "pay-1"]);
+
+    // KaiMS-only view retains only KaiMS core services, excluding canary-audit-service
+    expect(filterAlertsForMonitor(rows, "KaiMS").map((r) => r.id)).toEqual(["core-1"]);
+
+    // Known application view retains only that specific application
+    expect(filterAlertsForMonitor(rows, "payment-gateway").map((r) => r.id)).toEqual(["pay-1"]);
+  });
+
+  it("keeps real opentelemetry-demo and node-exporter alerts in KaiMS and Telemetry alerts in Telemetry", () => {
+    const otelSiteAlert = {
+      id: "otel-real",
+      name: "ExternalApplicationUnavailable",
+      service: "opentelemetry-demo",
+      project_name: "KaiOps",
+      environment: "prod",
+      labels: { synthetic: "false", event_mode: "real", project_name: "KaiOps" },
+    };
+    const diskAlert = {
+      id: "disk-low",
+      name: "DiskSpaceLow",
+      service: "node-exporter",
+      environment: "prod",
+      labels: { alertname: "DiskSpaceLow", service: "node-exporter" },
+    };
+    const telemetryAlert = {
+      id: "telemetry-unavail",
+      name: "TelemetryApplicationUnavailable",
+      service: "frontend-proxy",
+      application: "Telemetry",
+      environment: "demo",
+      labels: { alertname: "TelemetryApplicationUnavailable", application: "Telemetry", monitoring_scope: "demo" },
+    };
+    const syntheticHttpbin = {
+      id: "httpbin-sim",
+      name: "HTTPProbeSuccessRateLow",
+      service: "httpbin-failure-lab",
+      application: "httpbin-failure-lab",
+      environment: "public-internet",
+      labels: { synthetic: "true", event_mode: "simulation" },
+    };
+
+    const allRows = [otelSiteAlert, diskAlert, telemetryAlert, syntheticHttpbin];
+    expect(filterAlertsForMonitor(allRows, "KaiMS").map((r) => r.id)).toEqual(["otel-real", "disk-low"]);
+    expect(filterAlertsForMonitor(allRows, "Telemetry").map((r) => r.id)).toEqual(["telemetry-unavail"]);
+  });
+
 
   it("scopes service-derived projects to that exact service in alerts and incidents", () => {
     const rabbit = { title: "RobotShopServiceDown", service: "robot-shop-rabbitmq", environment: "prod" };
@@ -255,5 +340,21 @@ describe("resolveCanonicalAlertForRow", () => {
     const sourceRow = { id: routeAlertId, alert_id: routeAlertId, file: routeAlertId };
     const result = resolveCanonicalAlertForRow(sourceRow, [canonicalAlertRow]);
     expect(result.status).toBe("unresolved");
+  });
+});
+
+
+describe("pending decision and inbox view reconciliation", () => {
+  it("recognizes pending decisions and needs_me inbox rows when lifecycle_state is AWAITING_APPROVAL even if legacy status is investigating", () => {
+    const row = {
+      id: "00a3dd0a-42d4-4382-8293-0d909e7b56b0",
+      incident_id: "00a3dd0a-42d4-4382-8293-0d909e7b56b0",
+      status: "investigating",
+      lifecycle_state: "AWAITING_APPROVAL",
+      severity: "critical",
+    };
+    expect(hasPendingDecision(row)).toBe(true);
+    expect(belongsToInboxView(row as any, "needs_me")).toBe(true);
+    expect(belongsToInboxView(row as any, "kai_handling")).toBe(false);
   });
 });

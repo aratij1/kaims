@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { Link } from "react-router-dom";
 import { CheckCircle2, RefreshCw, ShieldCheck, TicketCheck } from "lucide-react";
 
@@ -7,6 +8,11 @@ import { formatIstTimestamp as formatTime } from "../../utils/presentation";
 
 export default function ClosedIncidentsRoute() {
   const { closed } = useRouteRuntime();
+
+  useEffect(() => {
+    closed.refresh();
+  }, []);
+
   const jiraSynced = closed.rows.filter((row) => Boolean(row.ticket_id)).length;
   const automated = closed.rows.filter((row) => String(row.execution_mode || "").toLowerCase().includes("auto")).length;
 

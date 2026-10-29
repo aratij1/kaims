@@ -1274,3 +1274,276 @@ async def test_workspace_activity_can_read_current_requirements_without_replayin
         assert [item["requirement_id"] for item in active["jobs"]] == [str(current.requirement_id)]
         assert [item["requirement_id"] for item in active["human_requests"]] == [str(current.requirement_id)]
         assert await repo.list_context_enrichment_activity(tenant_id="tenant-a", incident_id=key, requirement_ids=[]) == {"jobs": [], "human_requests": []}
+
+
+@pytest.mark.asyncio
+async def test_missing_runbook_creates_pending_human_request_and_transitions_to_waiting_for_human(sqlite_session_factory):
+    from common.database import IncidentRecord
+    incident_id, alert_id = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    req = build_evidence_requirements(
+        tenant_id="tenant-a",
+        incident_id=incident_id,
+        rca_version=1,
+        missing_evidence=[
+            {
+                "category": "runbook",
+                "question": "Provide runbook and remediation steps for billing-api.",
+                "reason": "No approved runbook was retrieved for billing-api.",
+                "collection_mode": "human_required",
+                "candidate_connectors": [],
+            }
+        ],
+        now=now,
+    )[0]
+    assert req.collection_mode == "human_required"
+    assert req.candidate_connectors == []
+
+    async with sqlite_session_factory() as session:
+        session.add(
+            IncidentRecord(
+                id=incident_id,
+                tenant_id="tenant-a",
+                title="billing-api unknown error",
+                severity="high",
+                status="investigating",
+                service="billing-api",
+                environment="prod",
+                payload={"alert_ids": [str(alert_id)], "timeline": []},
+            )
+        )
+        session.add(
+            IncidentProjectionRecord(
+                incident_id=incident_id,
+                tenant_id="tenant-a",
+                service="billing-api",
+                environment="prod",
+                severity="high",
+                status="investigating",
+                lifecycle_state="INVESTIGATING",
+                projection_payload={"incident": {"id": str(incident_id), "status": "investigating"}},
+            )
+        )
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements([req])
+        assignment = await repo.resolve_human_evidence_responder(tenant_id="tenant-a", incident_id=incident_id)
+        assert assignment is not None
+        assert assignment["source"] == "tenant_fallback"
+        human_req = await repo.create_human_evidence_request(
+            tenant_id="tenant-a",
+            incident_id=incident_id,
+            requirement_id=req.requirement_id,
+            expected_responder=assignment["identity"],
+            assignment_source=assignment["source"],
+            due_at=now + timedelta(hours=1),
+            acceptable_format="Verified runbook observation",
+            evidence_already_checked=[],
+            hypothesis_impact=req.reason,
+            automatic_fallback=True,
+        )
+        await session.commit()
+        assert human_req is not None
+        assert human_req.status == "pending"
+        inc = await session.get(IncidentRecord, incident_id)
+        proj = await session.get(IncidentProjectionRecord, incident_id)
+        assert inc.status == "waiting_for_human"
+        assert inc.payload["alert_ids"] == [str(alert_id)]
+        assert proj.status == "waiting_for_human"
+
+
+@pytest.mark.asyncio
+async def test_human_input_without_existing_request_auto_creates_maps_categories_and_creates_governed_runbook_draft(
+    sqlite_session_factory,
+):
+    from common.database import (
+        CanonicalEvidenceRecord,
+        IncidentRecord,
+        KnowledgeRagDraftRecord,
+        RunbookVersionRecord,
+    )
+    from common.repository import IncidentRepository
+    from context_agent.connectors import VectorDBConnector
+
+    incident_id, alert_id = uuid4(), uuid4()
+    now = datetime.now(UTC)
+    snapshot_id, analysis_id, recommendation_id = uuid4(), uuid4(), uuid4()
+    reqs = build_evidence_requirements(
+        tenant_id="tenant-a",
+        incident_id=incident_id,
+        rca_version=1,
+        missing_evidence=[
+            {
+                "category": "runbook",
+                "question": "Provide runbook and remediation steps for ledger-sync.",
+                "collection_mode": "human_required",
+                "candidate_connectors": [],
+            },
+            {
+                "category": "metrics",
+                "question": "Provide CPU saturation metric observation for ledger-sync.",
+            },
+        ],
+        now=now,
+    )
+    runbook_req, metrics_req = reqs[0], reqs[1]
+
+    async with sqlite_session_factory() as session:
+        session.add(
+            IncidentRecord(
+                id=incident_id,
+                tenant_id="tenant-a",
+                title="ledger-sync stale cursor",
+                severity="critical",
+                status="waiting_for_human",
+                service="ledger-sync",
+                environment="prod",
+                payload={"alert_ids": [str(alert_id)], "timeline": []},
+            )
+        )
+        session.add(
+            ContextSnapshotRecord(
+                snapshot_id=snapshot_id,
+                tenant_id="tenant-a",
+                incident_id=str(incident_id),
+                source_incident_id=str(incident_id),
+                alert_signature="alert-signature",
+                subject_fingerprint="s" * 64,
+                context_fingerprint="c" * 64,
+                snapshot_stage="final",
+                snapshot_version=1,
+                evidence_ids=["metric-1"],
+                evidence_checksums={"metric-1": "m" * 64},
+                contract_version="kaiops.context.v2",
+                quality_score=0.5,
+                reusable=False,
+                source_manifest={},
+                payload={"metadata": {}},
+                collected_at=now,
+                expires_at=now + timedelta(hours=1),
+            )
+        )
+        session.add(
+            IncidentInvestigationBindingRecord(
+                tenant_id="tenant-a",
+                project_id="project-a",
+                incident_id=incident_id,
+                alert_id=alert_id,
+                analysis_request_id=analysis_id,
+                context_snapshot_id=snapshot_id,
+                context_fingerprint="c" * 64,
+                recommendation_id=recommendation_id,
+                rca_version=1,
+                status="grounded",
+                created_at=now,
+                expires_at=now + timedelta(hours=1),
+            )
+        )
+        repo = ContextEnrichmentRepository(session)
+        await repo.upsert_context_evidence_requirements(reqs)
+        await session.commit()
+
+        # Submit human response directly WITHOUT a pre-existing HumanEvidenceRequestRecord (verifies no 404)
+        submission = {
+            "response": "Cursor checkpoint table locked due to stale worker lease.",
+            "responder_id": "sre-operator@example.com",
+            "responded_at": (now + timedelta(minutes=2)).isoformat(),
+            "observed_symptoms": "ledger-sync lag > 900s; stale lease on checkpoint row.",
+            "root_cause": "Stale worker lease in ledger_checkpoints table blocking cursor advancement.",
+            "business_impact": "Settlement ledger updates delayed by 15 minutes for enterprise tenants.",
+            "remediation_steps": "1. Inspect stale leases\n2. Run `kubectl rollout restart deployment/ledger-sync -n prod`",
+            "create_runbook_draft": True,
+        }
+        result = await repo.record_human_evidence_response(
+            tenant_id="tenant-a",
+            incident_id=incident_id,
+            requirement_id=runbook_req.requirement_id,
+            response=submission,
+        )
+        # Submit duplicate response to verify idempotency / retry safety
+        duplicate = await repo.record_human_evidence_response(
+            tenant_id="tenant-a",
+            incident_id=incident_id,
+            requirement_id=runbook_req.requirement_id,
+            response=submission,
+        )
+        assert duplicate["evidence_id"] == result["evidence_id"]
+        assert result["knowledge_draft_id"] is not None
+
+        # Submit metrics category response to verify category mapping (metrics -> metrics, runbook -> knowledge)
+        metrics_result = await repo.record_human_evidence_response(
+            tenant_id="tenant-a",
+            incident_id=incident_id,
+            requirement_id=metrics_req.requirement_id,
+            response={
+                "response": "CPU utilization was 94% on ledger-sync pod-0.",
+                "responder_id": "sre-operator@example.com",
+                "responded_at": (now + timedelta(minutes=4)).isoformat(),
+            },
+        )
+        await session.commit()
+
+        runbook_ev = await session.get(CanonicalEvidenceRecord, result["evidence_id"])
+        metrics_ev = await session.get(CanonicalEvidenceRecord, metrics_result["evidence_id"])
+        assert runbook_ev.category == "knowledge"
+        assert runbook_ev.service == "ledger-sync"
+        assert metrics_ev.category == "metrics"
+
+        inc = await session.get(IncidentRecord, incident_id)
+        assert inc.status == "investigating"
+
+        # Verify governed runbook draft is initially in 'draft' status (not auto-approved)
+        draft = await session.get(KnowledgeRagDraftRecord, UUID(result["knowledge_draft_id"]))
+        assert draft is not None
+        assert draft.status == "draft"
+        assert draft.document_kind == "runbook"
+
+        assert repo._knowledge_draft_payload(draft)["draft_id"] == str(draft.draft_id)
+
+        inc_repo = IncidentRepository(session)
+        from common.database import GovernedRagDocumentRecord
+        reviewed = await inc_repo.review_knowledge_rag_draft(
+            tenant_id="tenant-a",
+            draft_id=draft.draft_id,
+            expected_row_version=draft.row_version,
+            title=draft.title,
+            content=draft.content,
+            review_notes="Verified runbook steps for ledger-sync stale cursor.",
+            reviewed_by="lead-sre@example.com",
+        )
+        assert reviewed is not None
+        assert reviewed["status"] == "reviewed"
+        approved = await inc_repo.approve_knowledge_rag_draft(
+            tenant_id="tenant-a",
+            draft_id=draft.draft_id,
+            expected_row_version=reviewed["row_version"],
+            approved_by="release-owner@example.com",
+        )
+        await session.commit()
+        assert approved is not None
+        approved_draft, approved_payload = approved
+        assert approved_draft["status"] == "approved_pending_index"
+        doc_row = await session.get(GovernedRagDocumentRecord, UUID(approved_payload["document_id"]))
+        assert doc_row is not None
+
+        # Verify RunbookVersionRecord is now approved
+        rb_rows = (
+            await session.execute(
+                select(RunbookVersionRecord).where(
+                    RunbookVersionRecord.tenant_id == "tenant-a",
+                )
+            )
+        ).scalars().all()
+        assert any(r.approval_status == "approved" for r in rb_rows)
+
+        # Verify VectorDBConnector indexes the approved governed document and retrieves it for a similar alert
+        connector = VectorDBConnector()
+        indexed = await connector.index_governed_document(doc_row)
+        assert indexed["indexed"] == 1
+        hits = connector.search(
+            "ledger-sync stale cursor checkpoint lease",
+            tenant_id="tenant-a",
+            service="ledger-sync",
+            preferred_kind="runbook",
+        )
+        assert len(hits) >= 1
+        assert "ledger-sync" in hits[0]["content"]

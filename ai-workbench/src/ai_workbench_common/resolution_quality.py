@@ -207,6 +207,8 @@ def remediation_quality_gate(
         or (environment.lower() in {"prod", "production"} and approval not in {"false", "none", "automatic"})
     )
     return {
+        "passed": not blockers,
+        "blocking_reasons": list(blockers),
         "trusted_for_auto_execution": not blockers and not mandatory and rca_confidence >= 0.85,
         "requires_human_review": bool(blockers) or mandatory,
         "mandatory_approval": mandatory,

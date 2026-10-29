@@ -13,6 +13,8 @@ from common.repository import IncidentRepository
 from common.service import create_app
 from common.topics import (
     CLOSURE_EVENTS,
+    INCIDENT_LIFECYCLE_EVENTS,
+    HUMAN_EVIDENCE_ASSIGNMENT_EVENTS,
     APPLICATION_DASHBOARD_CREATED,
     APPLICATION_DISCOVERY_COMPLETED,
     APPLICATION_METRICS_VALIDATED,
@@ -90,6 +92,56 @@ async def record_closure_event(app: FastAPI, payload: dict) -> None:
             await session.commit()
 
 
+async def record_lifecycle_event(app: FastAPI, payload: dict) -> None:
+    tenant = str(payload.get("tenant_id") or "default").strip()
+    incident_id = str(payload.get("incident_id") or "")
+    transition_id = str(payload.get("transition_id") or "")
+    new_state = str(payload.get("new_state") or "")
+    previous_state = str(payload.get("previous_state") or "")
+    if not tenant or not transition_id:
+        return
+    audit_id = uuid5(NAMESPACE_URL, f"lifecycle-audit:{tenant}:{transition_id}")
+    async with app.state.session_factory() as session:
+        if await session.get(AuditLogRecord, audit_id) is None:
+            session.add(AuditLogRecord(
+                id=audit_id, tenant_id=tenant, actor=str(payload.get("actor") or "orchestrator"),
+                action="incident.lifecycle.transitioned", resource_type="incident",
+                resource_id=incident_id,
+                payload={
+                    "transition_id": transition_id,
+                    "previous_state": previous_state,
+                    "new_state": new_state,
+                    "version": payload.get("version"),
+                    "reason": payload.get("reason"),
+                    "failure_code": payload.get("failure_code"),
+                    "delivery_verified": True,
+                },
+            ))
+            await session.commit()
+
+
+async def record_human_assignment_event(app: FastAPI, payload: dict) -> None:
+    tenant = str(payload.get("tenant_id") or "default").strip()
+    incident_id = str(payload.get("incident_id") or "")
+    event_id = str(payload.get("event_id") or "")
+    status = str(payload.get("status") or "assignment_blocked").strip().lower()
+    if not tenant or not event_id:
+        return
+    audit_id = uuid5(NAMESPACE_URL, f"human-assignment-audit:{tenant}:{event_id}")
+    async with app.state.session_factory() as session:
+        if await session.get(AuditLogRecord, audit_id) is None:
+            session.add(AuditLogRecord(
+                id=audit_id,
+                tenant_id=tenant,
+                actor="evidence-routing",
+                action=f"human_evidence.{status}",
+                resource_type="incident",
+                resource_id=incident_id,
+                payload=payload,
+            ))
+            await session.commit()
+
+
 def _resolve_identity(payload: dict) -> tuple[UUID | None, str]:
     application_id = payload.get("application_id") or payload.get("id")
     if application_id:
@@ -109,6 +161,14 @@ async def startup(app: FastAPI) -> None:
     async def handle_closure(payload: dict) -> None:
         await record_closure_event(app, payload)
     tasks.append(asyncio.create_task(consume_rabbitmq_forever(closure_consumer, handle_closure), name="audit-closure"))
+    lifecycle_consumer = RabbitMQConsumer(settings, INCIDENT_LIFECYCLE_EVENTS)
+    async def handle_lifecycle(payload: dict) -> None:
+        await record_lifecycle_event(app, payload)
+    tasks.append(asyncio.create_task(consume_rabbitmq_forever(lifecycle_consumer, handle_lifecycle), name="audit-lifecycle"))
+    human_assignment_consumer = RabbitMQConsumer(settings, HUMAN_EVIDENCE_ASSIGNMENT_EVENTS)
+    async def handle_human_assignment(payload: dict) -> None:
+        await record_human_assignment_event(app, payload)
+    tasks.append(asyncio.create_task(consume_rabbitmq_forever(human_assignment_consumer, handle_human_assignment), name="audit-human-assignment"))
     async def handle_factory(event_type: str):
         async def handle(payload: dict) -> None:
             started = perf_counter()

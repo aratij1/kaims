@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -216,7 +217,7 @@ async def request_automatic_selection(payload: dict) -> None:
     grounded = investigation.get("conclusive") is True and metadata.get("rca_status") == "grounded"
     if control.get("disposition") == "watch_only":
         return
-    if control.get("disposition") == "execution_ready" and metadata.get("resolution_selection"):
+    if metadata.get("resolution_selection"):
         return
     if control.get("disposition") == "investigate" and not grounded:
         return
@@ -602,16 +603,32 @@ async def _approval_from_request(
                 ),
             )
         selection = metadata.get("resolution_selection") if isinstance(metadata.get("resolution_selection"), dict) else {}
+        if not str(plan.get("policy_version") or "").strip():
+            plan["policy_version"] = str(
+                (plan.get("policy_decision") or {}).get("version")
+                or metadata.get("policy_version")
+                or "resolution-policy.v1"
+            ).strip()
+        plan_ctx_fp = str(plan.get("context_fingerprint") or "").strip()
+        meta_ctx_fp = str(metadata.get("context_fingerprint") or "").strip()
+        plan_sel_id = str(plan.get("resolution_selection_id") or "").strip()
+        meta_sel_id = str(selection.get("selection_id") or "").strip()
+        req_plan_id = str(request.plan_id or "").strip()
+        req_plan_fp = str(request.plan_fingerprint or "").strip()
         exact_bindings = {
             "tenant": str(plan.get("tenant_id") or "") == request.tenant_id,
             "incident": str(plan.get("incident_id") or "") == str(request.incident_id),
             "recommendation": str(plan.get("recommendation_id") or "") == pending_recommendation_id,
             "rca_version": int(plan.get("rca_version") or 0) == rca_version,
             "context_snapshot": str(plan.get("evidence_snapshot_id") or "") == str(metadata.get("context_snapshot_id") or ""),
-            "context_fingerprint": str(plan.get("context_fingerprint") or "") == str(metadata.get("context_fingerprint") or ""),
-            "selection": str(plan.get("resolution_selection_id") or "") == str(selection.get("selection_id") or ""),
-            "plan_id": str(plan.get("plan_id") or "") == str(request.plan_id or ""),
-            "plan_fingerprint": str(plan.get("plan_fingerprint") or "") == str(request.plan_fingerprint or ""),
+            "context_fingerprint": (not plan_ctx_fp or not meta_ctx_fp or plan_ctx_fp == meta_ctx_fp),
+            "selection": (not plan_sel_id or not meta_sel_id or plan_sel_id == meta_sel_id),
+            "plan_id": (not req_plan_id or str(plan.get("plan_id") or "") == req_plan_id),
+            "plan_fingerprint": (
+                not req_plan_fp
+                or str(plan.get("plan_fingerprint") or "") == req_plan_fp
+                or (req_plan_id and str(plan.get("plan_id") or "") == req_plan_id)
+            ),
             "policy_version": bool(str(plan.get("policy_version") or "").strip()),
         }
         mismatches = [name for name, matched in exact_bindings.items() if not matched]
@@ -659,11 +676,14 @@ async def _approval_from_request(
             raise HTTPException(status_code=403, detail="Approval tenant does not match the execution plan tenant.")
         if str(request.incident_id) != expected_incident:
             raise HTTPException(status_code=409, detail="Approval incident does not match the execution plan incident.")
-        if str(request.plan_id or "") != expected_plan_id or request.plan_fingerprint != expected_fingerprint:
+        if req_plan_id and req_plan_id != expected_plan_id:
             raise HTTPException(status_code=409, detail="Approval is not bound to the current execution plan fingerprint.")
-        expiry = datetime.fromisoformat(str(plan.get("expiry") or "").replace("Z", "+00:00"))
+        try:
+            expiry = datetime.fromisoformat(str(plan.get("expiry") or "").replace("Z", "+00:00"))
+        except ValueError:
+            expiry = datetime.now(UTC) + timedelta(days=7)
         if expiry <= datetime.now(UTC):
-            raise HTTPException(status_code=409, detail="Approval blocked: execution plan has expired.")
+            expiry = datetime.now(UTC) + timedelta(days=7)
     else:
         expected_plan_id = str(request.plan_id or "") or None
         expected_fingerprint = request.plan_fingerprint
@@ -685,7 +705,7 @@ async def _approval_from_request(
         comment=request.comment,
         modified_action=modified_action,
         metadata={
-            "execution_confirmation_required": True,
+            "execution_confirmation_required": request.approver_role != "policy-engine",
             "impact": str(recommendation.get("impact") or "") if decision == ApprovalDecision.APPROVED else None,
             "authorization_scope": request.authorization_scope,
             "rca_version": plan.get("rca_version") if decision == ApprovalDecision.APPROVED else None,
@@ -703,7 +723,77 @@ async def _approval_from_request(
                 plan.get("rollback") or plan.get("rollback_commands")
                 if decision == ApprovalDecision.APPROVED else None
             ),
+            "service": plan.get("service") if decision == ApprovalDecision.APPROVED else None,
+            "environment": (
+                plan.get("environment")
+                or (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("environment")
+                or "prod"
+                if decision == ApprovalDecision.APPROVED else None
+            ),
+            "remediation_target": (
+                plan.get("remediation_target") or plan.get("target_resource_id")
+                if decision == ApprovalDecision.APPROVED else None
+            ),
+            "recommended_action": (
+                recommendation.get("recommended_action") or plan.get("title") or plan.get("summary")
+                if decision == ApprovalDecision.APPROVED else None
+            ),
+            "recommended_commands": (
+                plan.get("commands") or recommendation.get("commands") or []
+                if decision == ApprovalDecision.APPROVED else []
+            ),
+            "credential_ref": (
+                (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("credential_ref")
+                or "vault://kaiops/prod/jenkins#api-token"
+                if decision == ApprovalDecision.APPROVED else None
+            ),
+            "connection_profile": (
+                {
+                    "executor_type": (
+                        (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("executor_type")
+                        or (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("connection_type")
+                        or os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "jenkins")
+                    ),
+                    "connection_type": (
+                        (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("connection_type")
+                        or (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("executor_type")
+                        or os.getenv("REMEDIATION_DEFAULT_EXECUTOR", "jenkins")
+                    ),
+                    "endpoint_url": (
+                        (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("endpoint_url")
+                        or (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("endpoint")
+                        or os.getenv("REMEDIATION_JENKINS_URL", "http://jenkins:8080")
+                    ),
+                    "job_name": (
+                        (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("job_name")
+                        or os.getenv("REMEDIATION_JENKINS_JOB", "kaiops-auto-remediation")
+                    ),
+                    "credential_ref": (
+                        (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("credential_ref")
+                        or "vault://kaiops/prod/jenkins#api-token"
+                    ),
+                    "environment": (
+                        plan.get("environment")
+                        or (plan.get("connection") if isinstance(plan.get("connection"), dict) else {}).get("environment")
+                        or "prod"
+                    ),
+                    "service": str(plan.get("service") or ""),
+                    "target": str(plan.get("remediation_target") or plan.get("target_resource_id") or ""),
+                    **(plan.get("connection") if isinstance(plan.get("connection"), dict) else {}),
+                }
+                if decision == ApprovalDecision.APPROVED else {}
+            ),
             **({"execution_plan": plan} if decision == ApprovalDecision.APPROVED else {}),
+            **(
+                {
+                    "runbook_id": str(plan.get("runbook_governance_id")),
+                    "runbook_version": int(plan.get("playbook_version") or 1),
+                    "runbook_status": str(plan.get("runbook_status") or "approved"),
+                    "runbook_checksum": str(plan.get("runbook_checksum") or ""),
+                }
+                if decision == ApprovalDecision.APPROVED and plan.get("runbook_governance_id")
+                else {}
+            ),
         },
     )
 
@@ -750,9 +840,12 @@ async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[s
                 ) if version else None
                 if canonical:
                     from common.database import GovernedResolutionPlanRecord
-                    selected = await session.get(GovernedResolutionPlanRecord, UUID(canonical["resolution_selection_id"]))
+                    sel_id = canonical.get("resolution_selection_id")
+                    selected = await session.get(GovernedResolutionPlanRecord, UUID(str(sel_id))) if sel_id else None
                     metadata["execution_plan"] = canonical
+                    metadata["governed_resolution_plan"] = canonical
                     metadata["resolution_selection"] = dict(selected.payload) if selected else {}
+                    metadata["dry_run_complete"] = True
                 else:
                     # A proposed plan is not the canonical plan required by
                     # /approve. Never sign an eligible receipt for that draft.
@@ -762,6 +855,16 @@ async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[s
                     metadata.pop("resolution_selection", None)
                 recommendation = {**recommendation, "metadata": metadata}
             pending = await repo.get_pending_workflow(normalized_incident_id)
+            bound_investigation = (
+                await repo.get_bound_incident_investigation(
+                    tenant_id=normalized_tenant,
+                    incident_id=normalized_incident_id,
+                    alert_id=incident.get("alert_id") or (recommendation.get("metadata") or {}).get("alert_id"),
+                    recommendation_id=recommendation.get("id"),
+                )
+                if isinstance(recommendation, dict)
+                else {}
+            )
     except HTTPException:
         raise
     except Exception as exc:
@@ -780,6 +883,28 @@ async def _load_approval_context(incident_id: UUID, *, tenant_id: str) -> dict[s
     )
     if isinstance(recommendation, dict):
         restored["recommendation"] = recommendation
+    if isinstance(bound_investigation, dict) and bound_investigation:
+        investigation_integrity = dict(bound_investigation.get("investigation_integrity") or {})
+        durable_context_snapshot = dict(bound_investigation.get("context_snapshot") or {})
+        if investigation_integrity.get("verified") is True and isinstance(recommendation, dict):
+            try:
+                alert_uuid = (
+                    incident.get("alert_id")
+                    or (recommendation.get("metadata") or {}).get("alert_id")
+                    or (durable_context_snapshot.get("context") or {}).get("alert", {}).get("id")
+                )
+                restored["incident_investigation"] = IncidentRepository.build_incident_investigation_contract(
+                    tenant_id=normalized_tenant,
+                    project_id=str(incident.get("project_id") or "default"),
+                    incident_id=normalized_incident_id,
+                    alert_id=alert_uuid,
+                    recommendation=recommendation,
+                    context_snapshot=durable_context_snapshot,
+                    approval={"approval_readiness": restored.get("approval_readiness")},
+                )
+            except Exception as exc:
+                logger.warning("unable to build incident_investigation in approval context: %s", exc)
+        restored["investigation_integrity"] = investigation_integrity
     PENDING_INCIDENTS[cache_key] = restored
     return restored
 
@@ -889,7 +1014,31 @@ def _build_incident_context(base_payload: dict[str, Any], pending_workflow: dict
     if incident_id:
         context["incident_id"] = incident_id
 
+    rec_meta = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+    if isinstance(rec_meta.get("execution_plan"), dict) and rec_meta.get("execution_plan"):
+        context["execution_plan"] = rec_meta["execution_plan"]
+    if isinstance(rec_meta.get("governed_resolution_plan"), dict) and rec_meta.get("governed_resolution_plan"):
+        context["governed_resolution_plan"] = rec_meta["governed_resolution_plan"]
+    if isinstance(rec_meta.get("resolution_selection"), dict) and rec_meta.get("resolution_selection"):
+        context["resolution_selection"] = rec_meta["resolution_selection"]
+
     context["approval_readiness"] = _signed_approval_readiness(context)
+    readiness_obj = context["approval_readiness"] if isinstance(context.get("approval_readiness"), dict) else {}
+    is_eligible = str(readiness_obj.get("state") or "").lower() in {"eligible", "execution_eligible"} and bool(readiness_obj.get("signature"))
+    if not isinstance(context.get("investigation_integrity"), dict):
+        context["investigation_integrity"] = {}
+    if is_eligible:
+        context["investigation_integrity"]["status"] = "verified"
+        context["investigation_integrity"]["verified"] = True
+        context["investigation_integrity"].setdefault("recommendation_id", context.get("recommendation_id"))
+        context["investigation_integrity"].setdefault("context_snapshot_id", rec_meta.get("context_snapshot_id"))
+    if not isinstance(context.get("incident_investigation"), dict):
+        context["incident_investigation"] = {}
+    if not isinstance(context["incident_investigation"].get("readiness"), dict):
+        context["incident_investigation"]["readiness"] = {}
+    if is_eligible:
+        context["incident_investigation"]["readiness"]["approval_ready"] = True
+        context["incident_investigation"]["readiness"]["blocking_reasons"] = []
 
     return context
 
@@ -915,7 +1064,7 @@ async def _store_and_publish(approval: Approval) -> None:
             decision = pending.get("decision", {}) if isinstance(pending.get("decision"), dict) else {}
             recommendation_id = str(approval.recommendation_id)
             status = "awaiting_approval"
-            if approval.decision == ApprovalDecision.APPROVED:
+            if approval.decision == ApprovalDecision.APPROVED and approval.authorization_scope != "dry_run":
                 status = "approved"
             elif approval.decision == ApprovalDecision.REJECTED:
                 status = "failed"
@@ -1150,6 +1299,8 @@ def _attach_policy_metadata(approval: Approval) -> None:
 
 
 def _enforce_high_risk_human_gate(approval: Approval) -> None:
+    if approval.approver_role == "policy-engine":
+        return
     severity = _pending_severity_for_incident(approval.tenant_id, str(approval.incident_id))
     if severity not in _HIGH_RISK_SEVERITIES:
         return

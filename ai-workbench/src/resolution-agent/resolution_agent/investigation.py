@@ -742,7 +742,10 @@ class IterativeInvestigator:
         required = {"logs", "telemetry"}
         if any(token in text for token in ("deploy", "release", "config", "change")):
             required.add("changes")
-        if any(token in text for token in ("latency", "timeout", "availability", "down", "error", "5xx")):
+        # Traces are queried broadly when available, but do not block resolution
+        # if other valid evidence (telemetry, logs, topology, changes, runbooks)
+        # provides sufficient diagnostic grounding.
+        if any(token in text for token in ("distributed trace", "trace id", "trace_id", "jaeger", "span")):
             required.add("traces")
         quality = context.metadata.get("context_quality") if isinstance(context.metadata, dict) else {}
         diagnostic_gaps = quality.get("diagnostic_gaps") if isinstance(quality, dict) else []
@@ -809,7 +812,7 @@ class IterativeInvestigator:
         planned = [source for tool in guidance for source, registered in self.SOURCE_TOOL.items() if registered == tool]
         priority = list(dict.fromkeys([*planned, *priority]))
         required = self._required_sources(context, hypotheses)
-        priority = [source for source in priority if source in required]
+        priority = [source for source in priority if source in required or source in planned]
         # An unavailable/empty source must not consume the entire investigation
         # budget. Query every required evidence plane once before issuing a
         # bounded refinement query to any one tool.

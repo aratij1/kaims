@@ -8,6 +8,7 @@ x-bounded-logging: &bounded-logging
 services:
   prometheus:
     image: prom/prometheus:v2.54.1
+    mem_limit: ${PROMETHEUS_MEMORY_LIMIT:-1g}
     restart: always
     logging: *bounded-logging
     command:
@@ -45,6 +46,7 @@ services:
       start_period: 30s
   alertmanager:
     image: prom/alertmanager:v0.27.0
+    mem_limit: ${ALERTMANAGER_MEMORY_LIMIT:-256m}
     restart: always
     logging: *bounded-logging
     command:
@@ -74,6 +76,7 @@ services:
       start_period: 30s
   blackbox-exporter:
     image: prom/blackbox-exporter:v0.25.0
+    mem_limit: ${BLACKBOX_EXPORTER_MEMORY_LIMIT:-128m}
     restart: always
     logging: *bounded-logging
     command:
@@ -101,6 +104,7 @@ services:
       start_period: 30s
   telemetry-prometheus:
     image: quay.io/prometheus/prometheus:v3.13.1
+    mem_limit: ${TELEMETRY_PROMETHEUS_MEMORY_LIMIT:-1g}
     restart: always
     logging: *bounded-logging
     command:

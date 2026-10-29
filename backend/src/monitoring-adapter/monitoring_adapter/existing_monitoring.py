@@ -357,6 +357,13 @@ def hash_secrets(payload: dict[str, Any]) -> dict[str, Any]:
     return hashed
 
 
+def verify_webhook_token(token: str | None, token_hash: str | None) -> bool:
+    if not token or not token_hash:
+        return False
+    candidate_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(candidate_hash, str(token_hash))
+
+
 def verify_hmac_signature(secret: str, body: str, signature: str | None) -> bool:
     if not secret:
         return True

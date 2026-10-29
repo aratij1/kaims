@@ -159,7 +159,12 @@ class RabbitMQProducer:
                 timeout=_PUBLISH_TIMEOUT_SECONDS,
             )
         except Exception:
-            self._publish_breaker.record_failure()
+            import sys
+            exc = sys.exc_info()[1]
+            if isinstance(exc, aio_pika.exceptions.DeliveryError) or "no_route" in str(exc).lower():
+                self._publish_breaker.record_success()
+            else:
+                self._publish_breaker.record_failure()
             raise
         else:
             self._publish_breaker.record_success()

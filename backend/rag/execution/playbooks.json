@@ -100,6 +100,7 @@
       "risk_class": "medium",
       "name": "KaiOps high latency triage and safe scaling",
       "match": {
+        "allow_unlisted_services": true,
         "alert_ids": [],
         "services": [
           "api-gateway",
@@ -115,8 +116,10 @@
         "alert_keywords": [
           "highrequestlatency",
           "kaiopshighlatencyp95",
+          "kaiopshighlatencyp99",
           "latency",
           "p95",
+          "p99",
           "slow",
           "slo"
         ]
@@ -151,14 +154,6 @@
           "approval_gate": true,
           "commands": [
             "scale_service_workers"
-          ]
-        },
-        {
-          "name": "Rollback deployment if correlated with release",
-          "type": "remediation",
-          "approval_gate": true,
-          "commands": [
-            "rollback_service_deployment"
           ]
         },
         {

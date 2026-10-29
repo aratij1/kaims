@@ -180,7 +180,7 @@ x-service-env: &service-env
   CLOSURE_RECONCILIATION_MODE: ${CLOSURE_RECONCILIATION_MODE:-apply}
   CLOSURE_RECONCILIATION_BATCH_SIZE: ${CLOSURE_RECONCILIATION_BATCH_SIZE:-100}
   CLOSURE_RECONCILIATION_INTERVAL_SECONDS: ${CLOSURE_RECONCILIATION_INTERVAL_SECONDS:-15}
-  OUTBOX_SNAPSHOT_REFERENCES_ENABLED: ${OUTBOX_SNAPSHOT_REFERENCES_ENABLED:-false}
+  OUTBOX_SNAPSHOT_REFERENCES_ENABLED: ${OUTBOX_SNAPSHOT_REFERENCES_ENABLED:-true}
   RESOLUTION_OUTBOX_BATCH_SIZE: ${RESOLUTION_OUTBOX_BATCH_SIZE:-100}
   RESOLUTION_OUTBOX_POLL_SECONDS: ${RESOLUTION_OUTBOX_POLL_SECONDS:-5}
   RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS: ${RESOLUTION_OUTBOX_INITIAL_DELAY_SECONDS:-60}
@@ -253,6 +253,10 @@ x-service-env: &service-env
   NOTIFICATION_MIN_ALERT_SEVERITY: ${NOTIFICATION_MIN_ALERT_SEVERITY:-high}
   AZURE_MONITOR_CONNECTION_STRING: ${AZURE_MONITOR_CONNECTION_STRING:-}
 
+x-bounded-logging: &bounded-logging
+  driver: json-file
+  options: {max-size: "10m", max-file: "3"}
+
 x-service-build: &service-build
   context: .
   dockerfile: deploy/docker/Dockerfile.service
@@ -264,6 +268,8 @@ x-service-build: &service-build
 services:
   mysql:
     image: mysql:8.4
+    mem_limit: ${MYSQL_MEMORY_LIMIT:-2g}
+    logging: *bounded-logging
     restart: unless-stopped
     # Raised from the image default so per-service DB_POOL_SIZE/DB_MAX_OVERFLOW
     # increases (needed for a 10k-alert burst) don't exhaust connections across
@@ -320,6 +326,8 @@ services:
     build: *service-build
     restart: "no"
     environment: { <<: *service-env, SERVICE_NAME: migrations }
+    mem_limit: ${MIGRATIONS_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     command: ["python", "scripts/apply-migrations.py"]
     working_dir: /app
     depends_on:
@@ -327,6 +335,8 @@ services:
 
   temporal:
     image: temporalio/auto-setup:1.27.2
+    mem_limit: ${TEMPORAL_MEMORY_LIMIT:-768m}
+    logging: *bounded-logging
     restart: unless-stopped
     environment:
       DB: mysql8
@@ -350,6 +360,8 @@ services:
     # reserve memory for a second workflow UI. Start with --profile admin-tools.
     profiles: ["admin-tools", "full"]
     image: temporalio/ui:2.34.0
+    mem_limit: ${TEMPORAL_UI_MEMORY_LIMIT:-256m}
+    logging: *bounded-logging
     restart: unless-stopped
     environment:
       TEMPORAL_ADDRESS: temporal:7233
@@ -360,6 +372,9 @@ services:
 
   redis:
     image: redis:7
+    mem_limit: ${REDIS_MEMORY_LIMIT:-256m}
+    command: ["redis-server", "--maxmemory", "${REDIS_MAXMEMORY:-128mb}", "--maxmemory-policy", "noeviction"]
+    logging: *bounded-logging
     restart: unless-stopped
     # Keep the container address stable while avoiding collisions with other
     # local projects that commonly publish Redis on the default host port.
@@ -375,6 +390,8 @@ services:
   zookeeper:
     profiles: ["kafka"]
     image: confluentinc/cp-zookeeper:7.7.1
+    mem_limit: ${ZOOKEEPER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     restart: unless-stopped
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
@@ -385,6 +402,8 @@ services:
   kafka:
     profiles: ["kafka"]
     image: confluentinc/cp-kafka:7.7.1
+    mem_limit: ${KAFKA_MEMORY_LIMIT:-1g}
+    logging: *bounded-logging
     restart: unless-stopped
     depends_on: [zookeeper]
     ports: ["9092:9092"]
@@ -406,6 +425,7 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management
+    logging: *bounded-logging
     # Core dependency: recover after Docker Desktop/WSL restarts even if a
     # previous diagnostic session explicitly stopped the container.
     restart: always
@@ -433,6 +453,8 @@ services:
 
   mysql-exporter:
     image: prom/mysqld-exporter:v0.16.0
+    mem_limit: ${EXPORTER_MEMORY_LIMIT:-128m}
+    logging: *bounded-logging
     restart: unless-stopped
     # Uses a dedicated low-privilege monitoring user (PROCESS, REPLICATION
     # CLIENT only) instead of the app's MYSQL_USER — that user has ALL
@@ -451,6 +473,8 @@ services:
 
   node-exporter:
     image: prom/node-exporter:v1.8.1
+    mem_limit: ${EXPORTER_MEMORY_LIMIT:-128m}
+    logging: *bounded-logging
     restart: unless-stopped
     command:
       - --path.procfs=/host/proc
@@ -466,6 +490,8 @@ services:
   kafka-exporter:
     profiles: ["kafka"]
     image: danielqsj/kafka-exporter:v1.7.0
+    mem_limit: ${EXPORTER_MEMORY_LIMIT:-128m}
+    logging: *bounded-logging
     restart: unless-stopped
     command:
       - --kafka.server=kafka:9092
@@ -477,6 +503,8 @@ services:
     profiles:
       - fault-lab
     build: ./fault-lab
+    mem_limit: ${FAULT_LAB_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     restart: unless-stopped
     # Produces the bounded application symptoms (HTTP errors, JSON logs, breached
     # Prometheus metrics) for the 50 KaiOps incident scenarios. Prometheus scrapes
@@ -519,6 +547,8 @@ services:
   # /badger/key: permission denied".
   jaeger-init:
     image: busybox:1.36
+    mem_limit: 128m
+    logging: *bounded-logging
     restart: "no"
     volumes:
       - jaeger-data:/badger
@@ -526,6 +556,8 @@ services:
 
   jaeger:
     image: jaegertracing/all-in-one:1.62.0
+    mem_limit: ${JAEGER_MEMORY_LIMIT:-3g}
+    logging: *bounded-logging
     restart: unless-stopped
     depends_on:
       jaeger-init:
@@ -544,6 +576,8 @@ services:
       BADGER_DIRECTORY_VALUE: /badger/data
       BADGER_DIRECTORY_KEY: /badger/key
       BADGER_SPAN_STORE_TTL: ${JAEGER_TRACE_RETENTION:-168h0m0s}
+      GOMEMLIMIT: ${JAEGER_GOMEMLIMIT:-768MiB}
+      COLLECTOR_QUEUE_SIZE_MEMORY: "64"
     ports:
       - "16686:16686"
     volumes:
@@ -552,6 +586,8 @@ services:
   grafana:
     profiles: ["observability", "full"]
     image: grafana/grafana:11.2.2
+    mem_limit: ${GRAFANA_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     restart: unless-stopped
     ports: ["3000:3000"]
     environment:
@@ -569,6 +605,8 @@ services:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
     build: *service-build
     # Reap connector/subprocess children and forward stop signals cleanly.
+    mem_limit: ${MONITORING_ADAPTER_MEMORY_LIMIT:-1g}
+    logging: *bounded-logging
     init: true
     restart: unless-stopped
     environment:
@@ -612,6 +650,8 @@ services:
   monitoring-ingestion-worker:
     image: ${MONITORING_ADAPTER_IMAGE:-kaiops_pubsub-monitoring-adapter:latest}
     # Reap child processes from connector probes and file watchers so Docker
+    mem_limit: ${MONITORING_WORKER_MEMORY_LIMIT:-768m}
+    logging: *bounded-logging
     # can stop/recreate this long-running worker cleanly.
     init: true
     restart: unless-stopped
@@ -654,6 +694,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: application-onboarding }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/application-onboarding
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     # Bare container port -- application-onboarding is scale_service-eligible.
     # docker compose port application-onboarding 8000
     ports: ["8000"]
@@ -667,6 +709,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: cloud-operations }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/cloud-operations
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8027:8000"]
     depends_on:
       rabbitmq: { condition: service_healthy }
@@ -678,6 +722,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: connector-hub }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/connector-hub
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8028:8000"]
     depends_on:
       migrations: { condition: service_completed_successfully }
@@ -697,6 +743,8 @@ services:
       DISCOVERY_LOG_PATH: /app/fault-lab/runtime/application.log
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/discovery-service
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8012:8000"]
     volumes:
       - ./fault-lab:/app/fault-lab:ro
@@ -711,6 +759,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: metrics-validation-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/metrics-validation-agent
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8013:8000"]
     depends_on:
       discovery-service: { condition: service_started }
@@ -723,6 +773,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: rule-generation-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/rule-generation-agent
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8014:8000"]
     depends_on:
       metrics-validation-agent: { condition: service_started }
@@ -735,6 +787,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: prometheus-config-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/prometheus-config-service
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8015:8000"]
     volumes:
       - ./backend/rag:/app/rag
@@ -749,6 +803,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: validation-agent }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/validation-agent
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8016:8000"]
     depends_on:
       prometheus-config-service: { condition: service_started }
@@ -761,6 +817,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: dashboard-generator }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/dashboard-generator
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8017:8000"]
     depends_on:
       validation-agent: { condition: service_started }
@@ -773,6 +831,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: audit-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/audit-service
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8018:8000"]
     depends_on:
       rabbitmq: { condition: service_healthy }
@@ -787,6 +847,8 @@ services:
       SERVICE_INTERNAL_TOKEN: ${SERVICE_INTERNAL_TOKEN:-kaiops-local-service-token-change-me}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/api-gateway
+    mem_limit: ${API_GATEWAY_MEMORY_LIMIT:-768m}
+    logging: *bounded-logging
     # Bare container port, not a fixed mapping -- api-gateway is in the
     # scale_service allowlist and two replicas cannot share one host port.
     # docker compose port api-gateway 8000
@@ -840,6 +902,8 @@ services:
       # consumers already support this safely) over just raising this value.
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/alert-intelligence
+    mem_limit: ${ALERT_INTELLIGENCE_MEMORY_LIMIT:-768m}
+    logging: *bounded-logging
     # Bare container port -- alert-intelligence is scale_service-eligible.
     # docker compose port alert-intelligence 8000
     ports: ["8000"]
@@ -854,6 +918,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: orchestrator }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/orchestrator
+    mem_limit: ${ORCHESTRATOR_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     # Bare container port -- orchestrator is scale_service-eligible.
     # docker compose port orchestrator 8000
     ports: ["8000"]
@@ -875,6 +941,7 @@ services:
     pids_limit: 256
     mem_limit: ${CONTEXT_AGENT_MEMORY_LIMIT:-1536m}
     cpus: ${CONTEXT_AGENT_CPU_LIMIT:-1.50}
+    logging: *bounded-logging
     environment:
       <<: *service-env
       SERVICE_NAME: context-agent
@@ -958,6 +1025,8 @@ services:
       DOCKER_LOG_DISCOVERY_HOST: docker-socket-proxy:2375
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/discovery-mcp
+    mem_limit: ${DISCOVERY_MCP_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     # Bare container port -- discovery-mcp is scale_service-eligible.
     # docker compose port discovery-mcp 8000
     ports: ["8000"]
@@ -979,6 +1048,8 @@ services:
   # the governed Jenkins allowlist can restart an explicitly named container.
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:0.2.0
+    mem_limit: ${DOCKER_SOCKET_PROXY_MEMORY_LIMIT:-128m}
+    logging: *bounded-logging
     restart: unless-stopped
     environment:
       CONTAINERS: 1
@@ -1006,6 +1077,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: model-router }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/model-router
+    mem_limit: ${MODEL_ROUTER_MEMORY_LIMIT:-768m}
+    logging: *bounded-logging
     # Bare container port -- model-router is scale_service-eligible.
     # docker compose port model-router 8000
     ports: ["8000"]
@@ -1026,6 +1099,7 @@ services:
     pids_limit: 256
     mem_limit: ${RESOLUTION_AGENT_MEMORY_LIMIT:-1536m}
     cpus: ${RESOLUTION_AGENT_CPU_LIMIT:-1.50}
+    logging: *bounded-logging
     environment:
       <<: *service-env
       SERVICE_NAME: resolution-agent
@@ -1116,6 +1190,8 @@ services:
       RESOLUTION_AUTO_EXECUTION_ENABLED: ${RESOLUTION_AUTO_EXECUTION_ENABLED:-false}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/approval-service
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     expose: ["8000"]
     depends_on:
       rabbitmq: { condition: service_healthy }
@@ -1127,6 +1203,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: notification-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/notification-service
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8019:8000"]
     depends_on:
       rabbitmq: { condition: service_healthy }
@@ -1138,6 +1216,8 @@ services:
     environment: { <<: *service-env, SERVICE_NAME: evaluation-service }
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/ai-workbench/src/evaluation-service
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8020:8000"]
     depends_on:
       rabbitmq: { condition: service_healthy }
@@ -1156,6 +1236,8 @@ services:
       REMEDIATION_INTERNAL_TOKEN: ${REMEDIATION_INTERNAL_TOKEN:-kaiops-local-temporal-remediation}
       AI_LAYER_REQUEST_TIMEOUT_SECONDS: "1500"
     command: ["python", "-m", "temporal_pilot.worker"]
+    mem_limit: ${TEMPORAL_WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     working_dir: /app
     depends_on:
       mysql: { condition: service_healthy }
@@ -1187,6 +1269,8 @@ services:
       REMEDIATION_COMPOSE_PROJECT: ${REMEDIATION_COMPOSE_PROJECT:-${COMPOSE_PROJECT_NAME:-kaiops_azure}}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/remediation-engine
+    mem_limit: ${REMEDIATION_ENGINE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     # Bare container port -- remediation-engine is scale_service-eligible.
     # docker compose port remediation-engine 8000
     ports: ["8000"]
@@ -1211,9 +1295,11 @@ services:
     environment:
       JENKINS_BOOTSTRAP_USERNAME: ${JENKINS_USERNAME:-kaiops}
       JENKINS_BOOTSTRAP_PASSWORD: ${JENKINS_API_TOKEN:-kaiops-local-token}
-      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+      JAVA_OPTS: ${JENKINS_JAVA_OPTS:--Xms128m -Xmx512m -Djenkins.install.runSetupWizard=false}
       DOCKER_HOST: tcp://docker-socket-proxy:2375
     ports: ["${JENKINS_HOST_PORT:-8083}:8080"]
+    mem_limit: ${JENKINS_MEMORY_LIMIT:-1g}
+    logging: *bounded-logging
     volumes:
       - jenkins-data:/var/jenkins_home
       - ./deploy/jenkins/Jenkinsfile.auto-remediation:/opt/kaiops/Jenkinsfile.auto-remediation:ro
@@ -1241,6 +1327,8 @@ services:
       SERVICE_INTERNAL_TOKEN: ${SERVICE_INTERNAL_TOKEN:-kaiops-local-service-token-change-me}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/closure-service
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     # Bare container port -- closure-service is scale_service-eligible.
     # docker compose port closure-service 8000
     ports: ["8000"]
@@ -1257,6 +1345,8 @@ services:
       KNOWLEDGE_DEVELOPMENT_INTERVAL_SECONDS: ${KNOWLEDGE_DEVELOPMENT_INTERVAL_SECONDS:-21600}
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
     working_dir: /app/backend/src/knowledge-development-worker
+    mem_limit: ${WORKER_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     ports: ["8022:8000"]
     depends_on:
       mysql: { condition: service_healthy }
@@ -1272,6 +1362,8 @@ services:
     # Docker Desktop's IPv6 localhost forwarder can accept connections without
     # forwarding them. Bind IPv4 explicitly so Windows falls back from ::1.
     ports: ["${UI_BIND_ADDRESS:-127.0.0.1}:${UI_HOST_PORT:-80}:80"]
+    mem_limit: ${UI_MEMORY_LIMIT:-128m}
+    logging: *bounded-logging
     restart: unless-stopped
     # The static UI must remain available while backend services recover. Its
     # nginx proxy reports backend failures without preventing the UI/login page
@@ -1280,6 +1372,8 @@ services:
   ui-dev:
     profiles: ["ui-dev"]
     image: node:20-alpine
+    mem_limit: ${UI_DEV_MEMORY_LIMIT:-1g}
+    logging: *bounded-logging
     working_dir: /app
     command: ["sh", "-lc", "if [ ! -x node_modules/.bin/vite ]; then npm ci --prefer-offline --no-audit --no-fund; fi; npm run dev"]
     environment:
@@ -1307,11 +1401,15 @@ services:
   # project's own redis/mysql/etc.
   ob-redis-cart:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: redis:alpine
     restart: unless-stopped
 
   ob-currencyservice:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -1320,6 +1418,8 @@ services:
 
   ob-productcatalogservice:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/productcatalogservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -1328,6 +1428,8 @@ services:
 
   ob-paymentservice:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -1336,6 +1438,8 @@ services:
 
   ob-shippingservice:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/shippingservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -1344,6 +1448,8 @@ services:
 
   ob-emailservice:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/emailservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -1352,6 +1458,8 @@ services:
 
   ob-adservice:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/adservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -1359,6 +1467,8 @@ services:
 
   ob-cartservice:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/cartservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -1368,6 +1478,8 @@ services:
 
   ob-recommendationservice:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/recommendationservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -1379,6 +1491,8 @@ services:
 
   ob-checkoutservice:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/checkoutservice:v0.10.6
     restart: unless-stopped
     environment:
@@ -1399,6 +1513,8 @@ services:
 
   ob-frontend:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend:v0.10.6
     restart: unless-stopped
     ports:
@@ -1427,6 +1543,8 @@ services:
 
   ob-loadgenerator:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/loadgenerator:v0.10.6
     restart: unless-stopped
     environment:
@@ -1441,6 +1559,8 @@ services:
   # app-level /metrics endpoint anywhere.
   ob-cadvisor:
     profiles: ["demo-online-boutique"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     restart: unless-stopped
     ports:
@@ -1472,6 +1592,8 @@ services:
   # network, not the default one.
   rs-mongodb:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-mongodb:2.1.0
     restart: unless-stopped
     networks:
@@ -1480,6 +1602,8 @@ services:
 
   rs-redis:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: redis:6.2-alpine
     restart: unless-stopped
     networks:
@@ -1488,6 +1612,8 @@ services:
 
   rs-rabbitmq:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: rabbitmq:3.8-management-alpine
     restart: unless-stopped
     networks:
@@ -1496,6 +1622,8 @@ services:
 
   rs-mysql:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-mysql-db:2.1.0
     restart: unless-stopped
     cap_add:
@@ -1506,6 +1634,8 @@ services:
 
   rs-catalogue:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-catalogue:2.1.0
     restart: unless-stopped
     networks:
@@ -1516,6 +1646,8 @@ services:
 
   rs-user:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-user:2.1.0
     restart: unless-stopped
     networks:
@@ -1527,6 +1659,8 @@ services:
 
   rs-cart:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-cart:2.1.0
     restart: unless-stopped
     networks:
@@ -1538,6 +1672,8 @@ services:
 
   rs-shipping:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-shipping:2.1.0
     restart: unless-stopped
     networks:
@@ -1548,6 +1684,8 @@ services:
 
   rs-ratings:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-ratings:2.1.0
     restart: unless-stopped
     environment:
@@ -1560,6 +1698,8 @@ services:
 
   rs-payment:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-payment:2.1.0
     restart: unless-stopped
     networks:
@@ -1571,6 +1711,8 @@ services:
 
   rs-dispatch:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-dispatch:2.1.0
     restart: unless-stopped
     networks:
@@ -1581,6 +1723,8 @@ services:
 
   rs-web:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: robotshop/rs-web:2.1.0
     restart: unless-stopped
     ports:
@@ -1600,6 +1744,8 @@ services:
   # with a minimal locustfile instead, same effect: continuous real traffic.
   rs-load-gen:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: locustio/locust:2.32.4
     restart: unless-stopped
     volumes:
@@ -1615,6 +1761,8 @@ services:
   # is not on robot-shop-net) can scrape them.
   rs-mysqld-exporter:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: prom/mysqld-exporter:v0.19.0
     restart: unless-stopped
     # v0.19.0 dropped DATA_SOURCE_NAME env var support in favor of a
@@ -1632,6 +1780,8 @@ services:
 
   rs-redis-exporter:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: oliver006/redis_exporter:v1.88.0
     restart: unless-stopped
     environment:
@@ -1644,6 +1794,8 @@ services:
 
   rs-rabbitmq-exporter:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: kbudde/rabbitmq-exporter:1.0.0
     restart: unless-stopped
     environment:
@@ -1659,6 +1811,8 @@ services:
 
   rs-mongodb-exporter:
     profiles: ["demo-robot-shop"]
+    mem_limit: ${DEMO_SERVICE_MEMORY_LIMIT:-512m}
+    logging: *bounded-logging
     image: percona/mongodb_exporter:0.51.0
     restart: unless-stopped
     command:

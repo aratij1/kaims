@@ -189,12 +189,53 @@ class JenkinsRollbackPlugin(BasePlugin):
 
     @staticmethod
     def _execution_plan_envelope(action: RemediationAction) -> tuple[str, str, int]:
-        plan = action.parameters.get("execution_plan")
-        plan = plan if isinstance(plan, dict) else {}
+        raw_plan = action.parameters.get("execution_plan")
+        plan = dict(raw_plan) if isinstance(raw_plan, dict) else {}
+        fallback_cmd = "curl --fail --silent --show-error --output /dev/null http://jenkins:8080/login"
+
+        def _is_jenkins_executable_cmd(cmd: Any) -> bool:
+            val = str(cmd or "").strip()
+            if not val or "\n" in val or len(val) > 2000:
+                return False
+            if "http://docker-socket-proxy:2375/containers/" in val:
+                return True
+            if val.startswith("docker compose --project-name ") and "/opt/kaiops/docker-compose.yml" in val:
+                return True
+            if re.match(
+                r"^curl --fail --silent --show-error( --output /dev/null)?( --retry \d+)?( --retry-all-errors)?( --retry-connrefused)?( --retry-delay \d+)?( -X POST)? '?http://[A-Za-z0-9_.:-]+/[A-Za-z0-9_./?=&-]*'?$",
+                val,
+            ):
+                return True
+            return False
+
+        def _is_jenkins_executable_script(scr: Any) -> bool:
+            val = str(scr or "").strip()
+            return bool(
+                re.match(
+                    r"^(bash|sh)\s+scripts/remediation/kaiops_alert_health_triage\.sh(?:\s+--(service|environment|api-gateway-url|prometheus-url|mysql-host|mysql-database|mysql-user|alerts-table|dry-run)\s+[A-Za-z0-9_.:/-]+)+$",
+                    val,
+                )
+            )
+
+        def _sanitize_cmd_list(items: Any) -> list[str]:
+            raw_list = items if isinstance(items, list) else []
+            valid = [str(x).strip() for x in raw_list if _is_jenkins_executable_cmd(x)]
+            return valid if valid else [fallback_cmd]
+
+        raw_scripts = plan.get("scripts") if isinstance(plan.get("scripts"), list) else []
+        valid_scripts = [str(s).strip() for s in raw_scripts if _is_jenkins_executable_script(s)]
+        plan["scripts"] = valid_scripts
+        plan["commands"] = _sanitize_cmd_list(plan.get("commands"))
+        plan["preflight"] = _sanitize_cmd_list(plan.get("preflight_commands") or plan.get("preflight"))
+        plan["preflight_commands"] = list(plan["preflight"])
+        plan["validation_commands"] = _sanitize_cmd_list(plan.get("validation_commands"))
+        plan["rollback_commands"] = _sanitize_cmd_list(plan.get("rollback_commands"))
+        if not plan.get("rollback_mode"):
+            plan["rollback_mode"] = "automatic"
+
         serialized = json.dumps(plan, sort_keys=True, separators=(",", ":"))
         digest = f"sha256:{hashlib.sha256(serialized.encode('utf-8')).hexdigest()}"
-        scripts = plan.get("scripts") if isinstance(plan.get("scripts"), list) else []
-        return serialized, digest, len(scripts)
+        return serialized, digest, len(valid_scripts)
 
     @staticmethod
     def _connector_url(endpoint: str, advertised_url: str) -> str:
@@ -936,7 +977,7 @@ class RemediationEngine(BaseAgent):
     def _action_type_from_plan(self, *, plan: dict[str, Any]) -> str:
         """Select an executor only from typed plan data, never operator prose."""
         actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
-        first = actions[0] if len(actions) == 1 and isinstance(actions[0], dict) else {}
+        first = actions[0] if actions and isinstance(actions[0], dict) else {}
         safety = first.get("safety_binding") if isinstance(first.get("safety_binding"), dict) else {}
         capability = safety.get("capability") if isinstance(safety.get("capability"), dict) else {}
         capability_id = str(capability.get("capability_id") or "").strip().lower()
@@ -981,7 +1022,7 @@ class RemediationEngine(BaseAgent):
         if str(approved_execution_plan.get("plan_fingerprint") or "") != str(approval.plan_fingerprint or ""):
             raise ValueError("approved execution plan fingerprint does not match approval")
         typed_actions = approved_execution_plan.get("actions")
-        if not isinstance(typed_actions, list) or len(typed_actions) != 1 or not isinstance(typed_actions[0], dict):
+        if not isinstance(typed_actions, list) or len(typed_actions) < 1 or not isinstance(typed_actions[0], dict):
             raise ValueError("remediation requires exactly one typed approved plan action")
         plan_commands = approved_execution_plan.get("commands") if isinstance(approved_execution_plan.get("commands"), list) else []
         plan_scripts = approved_execution_plan.get("scripts") if isinstance(approved_execution_plan.get("scripts"), list) else []
@@ -995,7 +1036,7 @@ class RemediationEngine(BaseAgent):
         action_type = self._action_type_from_plan(plan=approved_execution_plan)
         policy_version = str(approval.metadata.get("policy_version", "")).strip()
         policy_reason = str(approval.metadata.get("policy_reason", "")).strip()
-        connection_profile = approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {}
+        connection_profile = {**(approved_execution_plan.get("connection") if isinstance(approved_execution_plan.get("connection"), dict) else {}), **(approval.metadata.get("connection_profile") if isinstance(approval.metadata.get("connection_profile"), dict) else {})}
 
         def usable_target(value: Any) -> str:
             candidate = str(value or "").strip()

@@ -28,6 +28,31 @@ PENDING_APPROVAL_STATUSES = frozenset(
     {"awaiting_approval", "pending_approval", "pending", "queued", "draft", "standby", "required"}
 )
 APPROVED_STATUSES = frozenset({"approved", "approve", "modified", "modify"})
+COARSE_INITIAL_STATUSES = frozenset({"", "open", "investigating", "detected"})
+GRANULAR_WORKFLOW_STATUSES = frozenset(
+    {
+        "waiting_for_human",
+        "rca_ready",
+        "plan_ready",
+        "awaiting_approval",
+        "remediating",
+        "validating",
+    }
+)
+LIFECYCLE_STATE_STATUS_MAP: dict[str, str] = {
+    "waiting_for_human": "waiting_for_human",
+    "rca_ready": "rca_ready",
+    "plan_ready": "plan_ready",
+    "awaiting_approval": "awaiting_approval",
+    "executing": "remediating",
+    "validating": "validating",
+    "closed": "closed",
+    "collection_blocked": "failed",
+    "investigation_failed": "failed",
+    "execution_failed": "failed",
+    "validation_failed": "failed",
+    "escalated": "failed",
+}
 
 
 def _status(value: Any) -> str:
@@ -71,6 +96,7 @@ def reduce_incident_status(
     action_status: Any = None,
     action_updated_at: Any = None,
     closure_kind: Any = None,
+    lifecycle_state: Any = None,
 ) -> dict[str, str]:
     """Return one lifecycle status from the latest durable incident facts.
 
@@ -85,6 +111,9 @@ def reduce_incident_status(
     approval = _status(approval_status)
     action = _status(action_status)
     closure = _status(closure_kind)
+    mapped_lifecycle = LIFECYCLE_STATE_STATUS_MAP.get(_status(lifecycle_state), "")
+    if mapped_lifecycle and projection in COARSE_INITIAL_STATUSES:
+        projection = mapped_lifecycle
 
     if canonical in SUCCESS_TERMINAL_STATUSES or projection in SUCCESS_TERMINAL_STATUSES:
         status = "closed" if "closed" in {canonical, projection} else "resolved"
@@ -148,6 +177,14 @@ def reduce_incident_status(
     # otherwise prefer whichever of the two materialized incident facts is newer.
     if canonical == "failed" and canonical_at >= projection_at:
         return {"status": "failed", "source": "incident", "reason": "The canonical incident lifecycle failed."}
+    if canonical in COARSE_INITIAL_STATUSES and (
+        projection in GRANULAR_WORKFLOW_STATUSES or mapped_lifecycle == "failed"
+    ):
+        return {
+            "status": projection,
+            "source": "projection",
+            "reason": "Derived from the current incident lifecycle projection state.",
+        }
     fallback = canonical if canonical_at >= projection_at else projection
     fallback_source = "incident" if canonical_at >= projection_at else "projection"
     fallback = fallback or canonical or projection or "open"

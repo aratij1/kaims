@@ -65,7 +65,7 @@ def retrieval_allowed(metadata: RagGovernanceMetadata | dict[str, Any], tenant_i
         governed = (
             metadata
             if isinstance(metadata, RagGovernanceMetadata)
-            else RagGovernanceMetadata.model_validate(metadata)
+            else RagGovernanceMetadata.model_validate(metadata_from_headers(metadata))
         )
     except (TypeError, ValueError):
         return False

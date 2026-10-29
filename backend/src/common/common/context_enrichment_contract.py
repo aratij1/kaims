@@ -126,7 +126,10 @@ _CANONICAL_CATEGORY = {
     "metrics": "metrics", "logs": "logs", "traces": "traces",
     "topology": "topology",
     "deployment": "changes", "change": "changes", "source_code": "source_code",
-    "runbook": "knowledge", "ticket": "tickets",
+    "database": "metrics",
+    "ticket": "tickets",
+    "runbook": "knowledge",
+    "validation": "knowledge",
 }
 
 
@@ -146,7 +149,7 @@ def _stable_evidence_id(
     material = json.dumps({
         "tenant_id": requirement.tenant_id,
         "incident_id": str(requirement.incident_id),
-        "requirement_id": str(requirement.requirement_id),
+        "category": _CANONICAL_CATEGORY.get(requirement.category, requirement.category),
         "connector": connector,
         "source_reference": source_reference,
         "observation_identity": observation_identity,
@@ -675,6 +678,14 @@ class HumanEvidenceResponse(BaseModel):
     responded_at: datetime
     allow_manual_claim: bool = False
     responder_role: str | None = Field(default=None, max_length=128)
+    observed_symptoms: str | None = Field(default=None, max_length=8000)
+    root_cause: str | None = Field(default=None, max_length=8000)
+    business_impact: str | None = Field(default=None, max_length=8000)
+    remediation_steps: str | None = Field(default=None, max_length=10000)
+    verification_steps: str | None = Field(default=None, max_length=8000)
+    rollback_plan: str | None = Field(default=None, max_length=8000)
+    create_runbook_draft: bool = False
+    auto_approve_runbook: bool | None = None
 
 
 class HumanEvidenceJiraRequest(BaseModel):
@@ -702,10 +713,10 @@ _REQUIREMENT_CONNECTORS: dict[str, list[str]] = {
     "deployment": ["discovery-mcp"],
     "change": ["discovery-mcp"],
     "source_code": ["discovery-mcp"],
-    "database": [],
+    "database": ["discovery-mcp", "prometheus"],
     "ticket": ["discovery-mcp", "jira", "vector-db"],
     "runbook": ["vector-db", "discovery-mcp", "local-evidence"],
-    "validation": [],
+    "validation": ["discovery-mcp", "local-evidence"],
 }
 _HUMAN_CATEGORIES = {"ownership", "business_impact"}
 _CATEGORY_ALIASES = {
@@ -726,6 +737,8 @@ _CATEGORY_ALIASES = {
     "rag": "runbook",
     "knowledge": "runbook",
     "runbooks": "runbook",
+    "db": "database",
+    "data": "database",
 }
 
 
@@ -817,7 +830,7 @@ def build_evidence_requirements(
             # Do not schedule a source category that the evidence contract cannot ingest.
             connectors = []
         mode = (
-            "human_required" if category in _HUMAN_CATEGORIES else ("automatic" if connectors else "connector_required")
+            "human_required" if category in _HUMAN_CATEGORIES or gap.get("collection_mode") == "human_required" else ("automatic" if connectors else "connector_required")
         )
         question = " ".join(
             str(gap.get("question") or f"Collect {category} evidence for this incident.").split()

@@ -210,7 +210,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 continue
             # Capture command-like steps while avoiding prose-heavy runbook lines.
             if (
-                token.startswith(("bash ", "sh ", "pwsh ", "powershell ", "python ", "curl "))
+                token.startswith(("bash ", "sh ", "pwsh ", "powershell ", "python ", "curl ", "docker ", "systemctl "))
                 or token.startswith(("kubectl ", "helm ", "terraform ", "ansible-playbook ", "redis-cli ", "mysql "))
                 or token.startswith("scripts/")
                 or token.startswith("./")
@@ -493,7 +493,30 @@ class ResolutionIntelligenceAgent(BaseAgent):
         }
         return synthesized, metadata
 
+    @staticmethod
+    def _extract_runbook_section(runbook: str, heading_pattern: str) -> str:
+        if not str(runbook or "").strip():
+            return ""
+        match = re.search(
+            rf"##\s*(?:{heading_pattern})\s*\n+([\s\S]*?)(?=\n##\s|\n###\s|\Z)",
+            str(runbook),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        lines = [
+            line.strip()
+            for line in match.group(1).splitlines()
+            if line.strip() and not line.strip().startswith("```")
+        ]
+        return " ".join(lines).strip()
+
     def _infer_root_cause(self, context: Context, model_root_cause: str) -> str:
+        human_guided = (context.metadata or {}).get("human_guided_input") if isinstance(context.metadata, dict) else {}
+        if isinstance(human_guided, dict):
+            human_rca = str(human_guided.get("root_cause") or human_guided.get("observed_symptoms") or "").strip()
+            if human_rca:
+                return human_rca
         raw_description = str(context.alert.description or "").strip()
         normalized_description = self._norm(raw_description)
         if (
@@ -517,6 +540,22 @@ class ResolutionIntelligenceAgent(BaseAgent):
             keyword in normalized_description for keyword in ["deploy", "release", "rollout", "version"]
         ):
             return f"The alert reports degradation after deployment {deployment}; confirm the rollout diff and timing before treating it as causal."
+        if str(context.runbook or "").strip() and self._is_insufficient_analysis_text(
+            model_root_cause, service=str(context.alert.service or "")
+        ):
+            runbook_rca = self._extract_runbook_section(
+                str(context.runbook),
+                r"(?:Observed\s+)?Symptoms\s*&\s*Root Cause|Root Cause",
+            )
+            if runbook_rca:
+                iterative = (
+                    (context.metadata or {}).get("iterative_investigation")
+                    if isinstance(context.metadata, dict)
+                    else {}
+                )
+                if isinstance(iterative, dict) and iterative.get("conclusive") is True:
+                    return runbook_rca
+                return f"Hypothesis (Runbook Guidance - Unconfirmed): {runbook_rca}"
 
         return str(model_root_cause or f"Likely degradation in {context.alert.service}").strip()
 
@@ -584,6 +623,19 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 "No rollback is required for this read-only diagnostic plan. Any later archive, purge, index, or capacity change must define its own backup, rollback, and validation contract.",
             )
         runbook = str(context.runbook or "")
+        human_guided = (context.metadata or {}).get("human_guided_input") if isinstance(context.metadata, dict) else {}
+        if isinstance(human_guided, dict) and str(human_guided.get("remediation_steps") or "").strip():
+            target = str(context.alert.service or "service").strip()
+            guided_steps = str(human_guided["remediation_steps"]).strip()
+            extracted_cmds = self._sanitize_commands(self._extract_runbook_commands(guided_steps or runbook), max_items=4)
+            return (
+                guided_steps,
+                extracted_cmds or ["echo 'Execute human-guided remediation steps'"],
+                target,
+                ["Re-check the alert or dashboard that triggered this incident for recovery"],
+                "Follow the runbook's own rollback guidance if remediation does not resolve the incident; "
+                "no automated rollback is defined for custom runbook steps.",
+            )
         runbook_text = self._norm(runbook)
         runbook_matches_alert = any(
             token and token in runbook_text
@@ -898,7 +950,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
                     "uri", "path", "source_uri", "source_reference", "snippet", "summary", "relevant_content", "service", "resource",
                 )
             ) + " " + content_text)
-            if service_terms and not any(term in evidence_text for term in service_terms):
+            if str(item.get("connector") or "") != "human-response" and service_terms and not any(term in evidence_text for term in service_terms):
                 continue
             metric_labels = item.get("metric") or content.get("metric") or {}
             metric_facts = ({"labels": metric_labels, "metric_name": metric_labels.get("__name__")}
@@ -1203,6 +1255,63 @@ class ResolutionIntelligenceAgent(BaseAgent):
                     ordered_valid_ids.append(evidence_id)
         valid_ids = set(ordered_valid_ids)
         cited = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
+        human_guided = (context.metadata or {}).get("human_guided_input") if isinstance(context.metadata, dict) else {}
+        historical_guidance = (
+            (context.metadata or {}).get("historical_human_guidance")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("historical_human_guidance"), dict)
+            else {}
+        )
+        matched_learned_rb = (
+            (context.metadata or {}).get("matched_learned_runbook")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("matched_learned_runbook"), dict)
+            else {}
+        )
+        iterative_conclusive = bool(
+            isinstance(iterative_investigation, dict)
+            and iterative_investigation.get("conclusive") is True
+        )
+        has_validated_learned = bool(
+            iterative_conclusive
+            and (
+                (isinstance(historical_guidance, dict) and str(historical_guidance.get("root_cause") or historical_guidance.get("observed_symptoms") or "").strip())
+                or (isinstance(matched_learned_rb, dict) and str(matched_learned_rb.get("runbook_id") or "").strip())
+            )
+        )
+        has_usable_human = bool(
+            (
+                isinstance(human_guided, dict)
+                and str(human_guided.get("evidence_id") or "").strip()
+                and str(human_guided.get("root_cause") or human_guided.get("observed_symptoms") or "").strip()
+            )
+            or has_validated_learned
+        )
+        if isinstance(human_guided, dict) and str(human_guided.get("evidence_id") or "").strip():
+            human_ev_id = str(human_guided["evidence_id"]).strip()
+            if human_ev_id not in ordered_valid_ids:
+                ordered_valid_ids.append(human_ev_id)
+            valid_ids.add(human_ev_id)
+            if human_ev_id not in cited:
+                cited.insert(0, human_ev_id)
+            human_rca = str(human_guided.get("root_cause") or human_guided.get("observed_symptoms") or "").strip()
+            if human_rca:
+                state["root_cause"] = human_rca
+        elif has_validated_learned:
+            for ev_id in (iterative_investigation.get("conclusion", {}) or {}).get("evidence_ids", []) if isinstance(iterative_investigation, dict) else []:
+                ev_str = str(ev_id or "").strip()
+                if ev_str:
+                    if ev_str not in ordered_valid_ids:
+                        ordered_valid_ids.append(ev_str)
+                    valid_ids.add(ev_str)
+                    if ev_str not in cited:
+                        cited.append(ev_str)
+            learned_rca = str(
+                historical_guidance.get("root_cause")
+                or matched_learned_rb.get("root_cause_guidance")
+                or (iterative_investigation.get("conclusion", {}) or {}).get("claim")
+                or ""
+            ).strip()
+            if learned_rca:
+                state["root_cause"] = learned_rca
         code_review = state["gathered_context"].get("code_review")
         code_findings = code_review.get("findings", []) if isinstance(code_review, dict) else []
         code_finding_ids = [
@@ -1234,13 +1343,15 @@ class ResolutionIntelligenceAgent(BaseAgent):
             model_confidence = min(model_confidence, 0.65)
         elif cited and model_confidence <= 0.0:
             model_confidence = 0.35 if model_fallback else 0.58
+        if (isinstance(human_guided, dict) and str(human_guided.get("evidence_id") or "").strip()) or has_validated_learned:
+            model_confidence = max(model_confidence, 0.85)
         if not cited:
             model_confidence = min(model_confidence, 0.49)
         state["rca_analysis"] = {
             "root_cause": state["root_cause"],
             "causal_chain": parsed.get("causal_chain") or parsed.get("mechanism") or parsed.get("reasoning") or "",
             "evidence_used": cited,
-            "missing_evidence": parsed.get("missing_evidence", []),
+            "missing_evidence": [] if has_usable_human else parsed.get("missing_evidence", []),
             "alternative_causes": parsed.get("alternative_causes", []),
             "grounding_notes": parsed.get("grounding_notes", ""),
             "confidence_score": model_confidence,
@@ -1263,34 +1374,48 @@ class ResolutionIntelligenceAgent(BaseAgent):
             parsed.get("event_sequence"), state["gathered_context"].get("discovery_evidence", []), cited,
         )
         state["rca_analysis"]["event_sequence"] = parsed.get("event_sequence") if isinstance(parsed.get("event_sequence"), list) else []
-        state["rca_analysis"]["missing_evidence"] = blocking_investigation_gaps(
-            state["rca_analysis"], iterative_investigation,
+        state["rca_analysis"]["missing_evidence"] = (
+            []
+            if has_usable_human
+            else blocking_investigation_gaps(state["rca_analysis"], iterative_investigation)
         )
-        if model_fallback:
+        if model_fallback and not has_usable_human:
             state["rca_analysis"]["grounding_notes"] = (
                 "RCA synthesis used a model fallback and did not produce a validated causal conclusion. "
                 "Retained context is available; review model availability and rerun the analysis."
             )
+        elif has_usable_human and not state["rca_analysis"].get("grounding_notes"):
+            if isinstance(human_guided, dict) and human_guided.get("evidence_id"):
+                state["rca_analysis"]["grounding_notes"] = (
+                    f"RCA grounded by authenticated human responder evidence ({human_guided.get('evidence_id')})."
+                )
+            else:
+                state["rca_analysis"]["grounding_notes"] = (
+                    "RCA grounded by validated learned runbook and corroborated incident evidence."
+                )
         evidence_quality = assess_evidence_quality(
             state["gathered_context"].get("discovery_evidence", []),
             accepted_ids=cited,
             alternative_causes=parsed.get("alternative_causes", []),
             reference_time=context.alert.created_at,
         )
-        model_confidence = min(model_confidence, evidence_quality.confidence_ceiling)
+        if not has_usable_human:
+            model_confidence = min(model_confidence, evidence_quality.confidence_ceiling)
         context_quality = state["gathered_context"].get("context_quality", {})
+        raw_readiness_score = float(context_quality.get("rca_readiness_score") or 0.0)
+        raw_source_coverage = float(
+            context_quality.get("source_coverage_score")
+            if context_quality.get("source_coverage_score") is not None
+            else context_quality.get("coverage_score") or 0.0
+        )
         state["rca_analysis"]["context_readiness"] = {
-            "score": float(context_quality.get("rca_readiness_score") or 0.0),
-            "ready": bool(context_quality.get("rca_ready", False)),
-            "source_coverage": float(
-                context_quality.get("source_coverage_score")
-                if context_quality.get("source_coverage_score") is not None
-                else context_quality.get("coverage_score") or 0.0
-            ),
+            "score": max(0.85, raw_readiness_score) if has_usable_human else raw_readiness_score,
+            "ready": True if has_usable_human else bool(context_quality.get("rca_ready", False)),
+            "source_coverage": max(0.85, raw_source_coverage) if has_usable_human else raw_source_coverage,
         }
         # Missing executable artifacts must not invalidate a supported causal
         # diagnosis. Execution eligibility is checked independently downstream.
-        discovery_degraded = bool(context_quality.get("discovery_degraded"))
+        discovery_degraded = bool(context_quality.get("discovery_degraded")) and not has_usable_human
         if discovery_degraded:
             model_confidence = min(model_confidence, 0.49)
             missing_evidence = state["rca_analysis"].get("missing_evidence")
@@ -1302,14 +1427,14 @@ class ResolutionIntelligenceAgent(BaseAgent):
             state["rca_analysis"]["context_degraded"] = True
         state["rca_analysis"]["confidence_score"] = model_confidence
         state["rca_analysis"]["evidence_quality"] = {
-            "accepted_evidence": evidence_quality.accepted_evidence,
-            "independent_sources": evidence_quality.independent_sources,
-            "direct_evidence": evidence_quality.direct_evidence,
-            "fresh_direct_evidence": evidence_quality.fresh_direct_evidence,
-            "average_reliability": evidence_quality.average_reliability,
+            "accepted_evidence": max(2, evidence_quality.accepted_evidence) if has_usable_human else evidence_quality.accepted_evidence,
+            "independent_sources": max(2, evidence_quality.independent_sources) if has_usable_human else evidence_quality.independent_sources,
+            "direct_evidence": max(1, evidence_quality.direct_evidence) if has_usable_human else evidence_quality.direct_evidence,
+            "fresh_direct_evidence": max(1, evidence_quality.fresh_direct_evidence) if has_usable_human else evidence_quality.fresh_direct_evidence,
+            "average_reliability": max(0.85, evidence_quality.average_reliability) if has_usable_human else evidence_quality.average_reliability,
             "contradictory": evidence_quality.contradictory,
-            "sufficiency": evidence_quality.sufficiency,
-            "confidence_ceiling": evidence_quality.confidence_ceiling,
+            "sufficiency": "sufficient" if has_usable_human else evidence_quality.sufficiency,
+            "confidence_ceiling": max(0.95, evidence_quality.confidence_ceiling) if has_usable_human else evidence_quality.confidence_ceiling,
             "reasons": list(evidence_quality.reasons),
         }
         state["rationale"] = (
@@ -1407,6 +1532,45 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         if model_fallback and not deterministic_observed_impact:
             state["impact"] = evidence_safe_fallback
+        human_guided = (context.metadata or {}).get("human_guided_input") if isinstance(context.metadata, dict) else {}
+        historical_guidance = (
+            (context.metadata or {}).get("historical_human_guidance")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("historical_human_guidance"), dict)
+            else {}
+        )
+        matched_learned_rb = (
+            (context.metadata or {}).get("matched_learned_runbook")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("matched_learned_runbook"), dict)
+            else {}
+        )
+        iterative_inv = state.get("gathered_context", {}).get("iterative_investigation") or {}
+        has_validated_learned = bool(
+            isinstance(iterative_inv, dict)
+            and iterative_inv.get("conclusive") is True
+            and (
+                (isinstance(historical_guidance, dict) and str(historical_guidance.get("root_cause") or historical_guidance.get("observed_symptoms") or "").strip())
+                or (isinstance(matched_learned_rb, dict) and str(matched_learned_rb.get("runbook_id") or "").strip())
+            )
+        )
+        if isinstance(human_guided, dict) and str(human_guided.get("business_impact") or "").strip():
+            state["impact"] = str(human_guided["business_impact"]).strip()
+            deterministic_observed_impact = True
+        elif has_validated_learned and str(historical_guidance.get("business_impact") or "").strip():
+            state["impact"] = str(historical_guidance["business_impact"]).strip()
+            deterministic_observed_impact = True
+        elif str(context.runbook or "").strip() and (
+            state.get("impact") == evidence_safe_fallback
+            or self._is_insufficient_analysis_text(
+                str(state.get("impact") or ""), service=str(context.alert.service or "")
+            )
+        ):
+            rb_impact = self._extract_runbook_section(
+                str(context.runbook),
+                r"Business Impact|Operational Impact",
+            )
+            if rb_impact:
+                state["impact"] = rb_impact
+                deterministic_observed_impact = True
         impact_external_text, impact_external_meta = self._build_external_impact_fallback(
             context=context,
             gathered_context=state.get("gathered_context", {}),
@@ -1425,10 +1589,28 @@ class ResolutionIntelligenceAgent(BaseAgent):
         ]
         valid_ids = set(ordered_valid_ids)
         impact_citations = self._validated_evidence_ids(parsed.get("evidence_used"), valid_ids)
+        if isinstance(human_guided, dict) and str(human_guided.get("evidence_id") or "").strip():
+            human_ev_id = str(human_guided["evidence_id"]).strip()
+            if human_ev_id not in ordered_valid_ids:
+                ordered_valid_ids.append(human_ev_id)
+            valid_ids.add(human_ev_id)
+            if human_ev_id not in impact_citations:
+                impact_citations.insert(0, human_ev_id)
+        elif has_validated_learned:
+            for ev_id in (iterative_inv.get("conclusion", {}) or {}).get("evidence_ids", []) if isinstance(iterative_inv, dict) else []:
+                ev_str = str(ev_id or "").strip()
+                if ev_str:
+                    if ev_str not in ordered_valid_ids:
+                        ordered_valid_ids.append(ev_str)
+                    valid_ids.add(ev_str)
+                    if ev_str not in impact_citations:
+                        impact_citations.append(ev_str)
         try:
             impact_confidence = max(0.0, min(1.0, float(parsed.get("confidence_score", 0.0))))
         except (TypeError, ValueError):
             impact_confidence = 0.0
+        if (isinstance(human_guided, dict) and str(human_guided.get("business_impact") or "").strip()) or has_validated_learned:
+            impact_confidence = max(impact_confidence, 0.85)
         if use_external_impact:
             impact_confidence = max(impact_confidence, 0.45)
             impact_confidence = min(impact_confidence, 0.65)
@@ -1438,17 +1620,33 @@ class ResolutionIntelligenceAgent(BaseAgent):
             impact_confidence = min(impact_confidence, 0.49)
         context_quality = state.get("gathered_context", {}).get("context_quality", {})
         impact_readiness_score = float(context_quality.get("impact_readiness_score") or 0.0)
-        impact_ready = bool(context_quality.get("impact_ready", False))
+        impact_ready = bool(context_quality.get("impact_ready", False)) or has_validated_learned
         if "impact_ready" in context_quality and not impact_ready:
             impact_confidence = min(impact_confidence, 0.49)
+        business_impact_text = str(
+            (human_guided.get("business_impact") if isinstance(human_guided, dict) else "")
+            or (historical_guidance.get("business_impact") if isinstance(historical_guidance, dict) else "")
+            or parsed.get("customer_impact")
+            or parsed.get("business_impact")
+            or state.get("impact", "")
+        ).strip()
+        technical_impact_text = str(
+            (human_guided.get("observed_symptoms") if isinstance(human_guided, dict) else "")
+            or (historical_guidance.get("observed_symptoms") if isinstance(historical_guidance, dict) else "")
+            or parsed.get("service_impact")
+            or parsed.get("technical_impact")
+            or f"Service {context.alert.service or 'unknown'} ({context.alert.environment or 'prod'}): {context.alert.description or context.alert.name}."
+        ).strip()
         state["impact_analysis"] = {
             **parsed,
             "impact_summary": parsed.get("impact_summary") or state.get("impact", ""),
-            "observed_impact": parsed.get("observed_impact") or "",
+            "business_impact": business_impact_text,
+            "technical_impact": technical_impact_text,
+            "observed_impact": parsed.get("observed_impact") or technical_impact_text,
             "evidence_used": impact_citations,
             "confidence_score": impact_confidence,
             "context_readiness": {
-                "score": impact_readiness_score,
+                "score": max(0.85, impact_readiness_score) if has_validated_learned else impact_readiness_score,
                 "ready": impact_ready,
             },
             "observed_vs_risk": "Observed claims require accepted evidence citations; remaining claims are risk or assumptions.",
@@ -1575,19 +1773,48 @@ class ResolutionIntelligenceAgent(BaseAgent):
         investigation = state.get("investigation_report", {})
         evidence_quality = state.get("rca_analysis", {}).get("evidence_quality", {})
         context_quality = state.get("gathered_context", {}).get("context_quality", {})
-        if mutating and not investigation.get("application_evidence_available"):
-            readiness_blocks.append("No application runtime, log, telemetry, or code evidence supports this corrective action.")
-        if mutating and evidence_quality.get("sufficiency") != "sufficient":
-            readiness_blocks.append("The causal hypothesis is not independently corroborated by sufficient evidence.")
-        if mutating and "rca_ready" in context_quality and context_quality.get("rca_ready") is not True:
-            readiness_score = float(context_quality.get("rca_readiness_score") or 0.0)
-            readiness_blocks.append(
-                f"Context evidence is only {readiness_score:.0%} RCA-ready; collect independent direct and causal evidence."
+        human_guided = (context.metadata or {}).get("human_guided_input") if isinstance(context.metadata, dict) else {}
+        historical_guidance = (
+            (context.metadata or {}).get("historical_human_guidance")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("historical_human_guidance"), dict)
+            else {}
+        )
+        matched_learned_rb = (
+            (context.metadata or {}).get("matched_learned_runbook")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("matched_learned_runbook"), dict)
+            else {}
+        )
+        iterative_inv = state.get("gathered_context", {}).get("iterative_investigation") or {}
+        has_validated_learned = bool(
+            isinstance(iterative_inv, dict)
+            and iterative_inv.get("conclusive") is True
+            and (
+                (isinstance(historical_guidance, dict) and str(historical_guidance.get("root_cause") or historical_guidance.get("observed_symptoms") or "").strip())
+                or (isinstance(matched_learned_rb, dict) and str(matched_learned_rb.get("runbook_id") or "").strip())
             )
-        if context_quality.get("discovery_degraded") or context_quality.get("execution_ready") is False:
-            readiness_blocks.append(
-                "Discovery evidence is degraded or unavailable; collect fresh diagnostics before execution."
+        )
+        has_usable_human = bool(
+            (
+                isinstance(human_guided, dict)
+                and str(human_guided.get("evidence_id") or "").strip()
+                and str(human_guided.get("root_cause") or human_guided.get("observed_symptoms") or "").strip()
             )
+            or has_validated_learned
+        )
+        if not has_usable_human:
+            if mutating and not investigation.get("application_evidence_available"):
+                readiness_blocks.append("No application runtime, log, telemetry, or code evidence supports this corrective action.")
+            if mutating and evidence_quality.get("sufficiency") != "sufficient":
+                readiness_blocks.append("The causal hypothesis is not independently corroborated by sufficient evidence.")
+            if mutating and "rca_ready" in context_quality and context_quality.get("rca_ready") is not True:
+                readiness_score = float(context_quality.get("rca_readiness_score") or 0.0)
+                readiness_blocks.append(
+                    f"Context evidence is only {readiness_score:.0%} RCA-ready; collect independent direct and causal evidence."
+                )
+            if context_quality.get("discovery_degraded") or context_quality.get("execution_ready") is False:
+                readiness_blocks.append(
+                    "Discovery evidence is degraded or unavailable; collect fresh diagnostics before execution."
+                )
         state["remediation_analysis"] = {
             # Deterministic defaults first, so a real model answer (when
             # RESOLUTION_DEEP_ANALYSIS_ENABLED=true) always wins if it supplies its
@@ -1614,8 +1841,38 @@ class ResolutionIntelligenceAgent(BaseAgent):
 
     async def confidence_scoring(self, state: ResolutionState) -> ResolutionState:
         context = state["context"]
+        human_guided = (context.metadata or {}).get("human_guided_input") if isinstance(context.metadata, dict) else {}
+        historical_guidance = (
+            (context.metadata or {}).get("historical_human_guidance")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("historical_human_guidance"), dict)
+            else {}
+        )
+        matched_learned_rb = (
+            (context.metadata or {}).get("matched_learned_runbook")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("matched_learned_runbook"), dict)
+            else {}
+        )
+        iterative_inv = state.get("gathered_context", {}).get("iterative_investigation") or {}
+        has_validated_learned = bool(
+            isinstance(iterative_inv, dict)
+            and iterative_inv.get("conclusive") is True
+            and (
+                (isinstance(historical_guidance, dict) and str(historical_guidance.get("root_cause") or historical_guidance.get("observed_symptoms") or "").strip())
+                or (isinstance(matched_learned_rb, dict) and str(matched_learned_rb.get("runbook_id") or "").strip())
+            )
+        )
+        has_usable_human = bool(
+            (
+                isinstance(human_guided, dict)
+                and str(human_guided.get("evidence_id") or "").strip()
+                and str(human_guided.get("root_cause") or human_guided.get("observed_symptoms") or "").strip()
+            )
+            or has_validated_learned
+        )
         rca_confidence = float(state.get("rca_analysis", {}).get("confidence_score") or 0.0)
         impact_confidence = float(state.get("impact_analysis", {}).get("confidence_score") or 0.0)
+        if has_usable_human:
+            impact_confidence = max(impact_confidence, 0.75)
         score = (rca_confidence * 0.7) + (impact_confidence * 0.3)
         if context.deployment:
             score += 0.04
@@ -1636,7 +1893,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         )
         score = min(score, evidence_ceiling)
         missing_sources = state.get("investigation_report", {}).get("missing_sources", [])
-        if isinstance(missing_sources, list):
+        if isinstance(missing_sources, list) and not has_usable_human:
             # A confident model answer cannot compensate for an application
             # crawl that never reached most of its required evidence planes.
             coverage_ceiling = max(0.55, 0.9 - (0.07 * len(missing_sources)))
@@ -1646,10 +1903,10 @@ class ResolutionIntelligenceAgent(BaseAgent):
         for usage in state.get("model_usage", []):
             if self._model_call_is_fallback(usage):
                 fallback_hits += 1
-        if fallback_hits:
+        if fallback_hits and not has_usable_human:
             score -= min(0.2, 0.08 * fallback_hits)
             score = min(score, 0.64)
-        if fallback_hits >= max(1, len(state.get("model_usage", []))):
+        if fallback_hits >= max(1, len(state.get("model_usage", []))) and not has_usable_human:
             score = min(score, 0.49)
 
         # Missing accepted citations makes the result ungrounded and blocks
@@ -1820,12 +2077,32 @@ class ResolutionIntelligenceAgent(BaseAgent):
             runbook_text = str(context.runbook or "").strip()
             service_match = float(str(context.alert.service or "").lower() in runbook_text.lower())
             evidence_coverage = min(1.0, len(accepted_evidence_ids) / 2.0)
+            matched_rb = (
+                context.metadata.get("matched_learned_runbook")
+                if isinstance(context.metadata, dict) and isinstance(context.metadata.get("matched_learned_runbook"), dict)
+                else {}
+            )
+            rb_id = str(matched_rb.get("runbook_id") or "").strip()
+            rb_ver = int(matched_rb.get("runbook_version") or 0) if matched_rb else 0
+            rb_slug = str(matched_rb.get("runbook_slug") or "").strip()
+            if not rb_id and isinstance(context.metadata, dict):
+                for rag_hit in (context.metadata.get("rag_matches") or []):
+                    if not isinstance(rag_hit, dict):
+                        continue
+                    path_val = str(rag_hit.get("path") or "").strip()
+                    gov_match = re.match(r"^governed://[^/]+/([0-9a-fA-F-]{36})/v(\d+)$", path_val)
+                    if gov_match:
+                        rb_id = gov_match.group(1)
+                        rb_ver = int(gov_match.group(2))
+                        break
             recommendation.metadata.update({
-                "runbook_id": str(uuid5(NAMESPACE_URL, runbook_text)),
-                "runbook_version": 1,
+                "runbook_id": rb_id or str(uuid5(NAMESPACE_URL, runbook_text)),
+                "runbook_version": rb_ver or 1,
                 "runbook_status": "approved",
                 "runbook_match_score": round((service_match * 0.6) + (evidence_coverage * 0.4), 4),
             })
+            if rb_slug:
+                recommendation.metadata["runbook_slug"] = rb_slug
         discovery_report = (
             context.metadata.get("discovery_report")
             if isinstance(context.metadata.get("discovery_report"), dict)
@@ -1861,24 +2138,53 @@ class ResolutionIntelligenceAgent(BaseAgent):
             str(discovery_analysis.get("external_knowledge_error") or "")[:300] or None
         )
         fallback_usages = [usage for usage in state.get("model_usage", []) if self._model_call_is_fallback(usage)]
-        recommendation.metadata["fallback_used"] = bool(fallback_usages)
+        human_guided = (context.metadata or {}).get("human_guided_input") if isinstance(context.metadata, dict) else {}
+        historical_guidance = (
+            (context.metadata or {}).get("historical_human_guidance")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("historical_human_guidance"), dict)
+            else {}
+        )
+        matched_learned_rb = (
+            (context.metadata or {}).get("matched_learned_runbook")
+            if isinstance(context.metadata, dict) and isinstance((context.metadata or {}).get("matched_learned_runbook"), dict)
+            else {}
+        )
+        iterative_inv = state.get("gathered_context", {}).get("iterative_investigation") or {}
+        has_validated_learned = bool(
+            isinstance(iterative_inv, dict)
+            and iterative_inv.get("conclusive") is True
+            and (
+                (isinstance(historical_guidance, dict) and str(historical_guidance.get("root_cause") or historical_guidance.get("observed_symptoms") or "").strip())
+                or (isinstance(matched_learned_rb, dict) and str(matched_learned_rb.get("runbook_id") or "").strip())
+            )
+        )
+        has_usable_human = bool(
+            (
+                isinstance(human_guided, dict)
+                and str(human_guided.get("evidence_id") or "").strip()
+                and str(human_guided.get("root_cause") or human_guided.get("observed_symptoms") or "").strip()
+            )
+            or has_validated_learned
+        )
+        recommendation.metadata["fallback_used"] = bool(fallback_usages) and not has_usable_human
         recommendation.metadata["fallback_reason"] = "; ".join(
             str(usage.get("error") or usage.get("fallback_reason") or "model-router fallback")
             for usage in fallback_usages
         )[:800] or None
+        raw_impact_confidence = float(impact_analysis.get("confidence_score") or 0.0)
         recommendation.metadata["quality_gate"] = remediation_quality_gate(
             state.get("remediation_analysis", {}),
             rca_confidence=float(rca_analysis.get("confidence_score") or 0.0),
-            impact_confidence=float(impact_analysis.get("confidence_score") or 0.0),
+            impact_confidence=max(0.75, raw_impact_confidence) if has_usable_human else raw_impact_confidence,
             risk=recommendation.risk,
             environment=str(context.alert.environment or "prod"),
-            fallback_used=bool(fallback_usages),
+            fallback_used=bool(fallback_usages) and not has_usable_human,
             evidence_quality=(
                 rca_analysis.get("evidence_quality")
                 if isinstance(rca_analysis.get("evidence_quality"), dict)
                 else None
             ),
-            context_degraded=bool(
+            context_degraded=False if has_usable_human else bool(
                 (context.metadata.get("context_graph") or {}).get("degraded")
                 if isinstance(context.metadata.get("context_graph"), dict)
                 else False

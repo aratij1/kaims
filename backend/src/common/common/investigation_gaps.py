@@ -6,7 +6,11 @@ def investigation_gaps(analysis: dict, report: dict) -> list:
     result = report.get("rca_result") or {}
     def items(value):
         return value if isinstance(value, list) else [value] if value else []
-    values = [*items(analysis.get("missing_evidence")), *items(report.get("missing_sources")), *items(result.get("missing_evidence"))]
+    conclusive = bool(isinstance(report, dict) and report.get("conclusive") is True)
+    if conclusive:
+        return []
+    analysis_missing = items(analysis.get("missing_evidence"))
+    values = [*analysis_missing, *items(report.get("missing_sources")), *items(result.get("missing_evidence"))]
     gaps, seen = [], set()
     for value in values:
         value = dict(value) if isinstance(value, dict) else str(value).strip()
@@ -21,7 +25,11 @@ def investigation_gaps(analysis: dict, report: dict) -> list:
 
 def blocking_investigation_gaps(analysis: dict, report: dict) -> list:
     gaps = investigation_gaps(analysis, report)
-    if not analysis.get("evidence_used"):
+    conclusion = report.get("conclusion") if isinstance(report, dict) and isinstance(report.get("conclusion"), dict) else {}
+    has_citations = bool(analysis.get("evidence_used")) or bool(
+        isinstance(report, dict) and report.get("conclusive") is True and conclusion.get("evidence_ids")
+    )
+    if not has_citations:
         gaps.append({
             "category": "validation",
             "question": "Review the retained incident evidence and publish an RCA with explicit source citations, or explain why none supports the diagnostic candidate.",

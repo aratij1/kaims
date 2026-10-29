@@ -62,7 +62,7 @@ export function isTestApplicationRecord(row) {
 export function uniqueMonitorApplications(names) {
   const canonicalCore = new Map(CORE_MONITOR_PROJECTS.map((name) => [normalizeMonitorToken(name), name]));
   const unique = new Map();
-  names.forEach((value) => {
+  [...CORE_MONITOR_PROJECTS, ...(Array.isArray(names) ? names : [])].forEach((value) => {
     const name = String(value || "").trim();
     const key = normalizeMonitorToken(name);
     if (!key || [normalizeMonitorToken(REAL_USE_CASE_SCOPE), normalizeMonitorToken(TEST_USE_CASE_SCOPE)].includes(key)) return;
