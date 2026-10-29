@@ -5097,16 +5097,21 @@ async def ingest_generic_provider_alert(provider: str = "prometheus", integratio
 @app.post("/api/v1/alerts/jira")
 async def ingest_jira_webhook(
     payload: dict = ALERT_BODY,
-    background_tasks: BackgroundTasks = None,
+    background_tasks: BackgroundTasks | None = None,
     token: str | None = None,
     x_webhook_token: str | None = Header(default=None),
+    x_jira_webhook_secret: str | None = Header(default=None, alias="X-Jira-Webhook-Secret"),
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Receive authenticated Jira webhooks before the generic provider route."""
     if not JIRA_WEBHOOK_SECRET:
         raise HTTPException(status_code=503, detail="Jira ingestion is not configured (JIRA_WEBHOOK_SECRET unset)")
-    provided_token = str(token or x_webhook_token or "").strip()
-    if not provided_token or provided_token != JIRA_WEBHOOK_SECRET:
+    header_token = x_webhook_token if isinstance(x_webhook_token, str) else (
+        x_jira_webhook_secret if isinstance(x_jira_webhook_secret, str) else None
+    )
+    query_token = token if isinstance(token, str) else None
+    provided_token = str(query_token or header_token or "").strip()
+    if not provided_token or not hmac.compare_digest(provided_token, JIRA_WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="invalid or missing Jira webhook token")
 
     issue = payload.get("issue", {}) if isinstance(payload, dict) else {}
@@ -5115,7 +5120,10 @@ async def ingest_jira_webhook(
     issue_key = str(issue.get("key") or "unknown-issue")
     webhook_event = str(payload.get("webhookEvent") or "").strip()
 
-    background_tasks.add_task(_process_jira_webhook, payload, x_trace_id)
+    if background_tasks is not None and hasattr(background_tasks, "add_task"):
+        background_tasks.add_task(_process_jira_webhook, payload, x_trace_id)
+    else:
+        await _process_jira_webhook(payload, x_trace_id)
     logger.info("received jira webhook event=%s issue=%s", webhook_event, issue_key)
     return {"received": True, "webhookEvent": webhook_event, "ticket_id": issue_key}
 

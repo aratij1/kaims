@@ -1766,7 +1766,13 @@ async def _resolve_context(context: Context) -> Recommendation:
                             human_remediation.append(normalized_line)
                     if human_remediation:
                         recommendation.metadata["manual_remediation_instructions"] = human_remediation
-                        approved_human_cmds = [s for s in human_remediation if is_approved_remediation_command(s)]
+                        normalized_human_cmds = [
+                            re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", s.strip()).strip().strip("`").strip()
+                            for s in human_remediation
+                        ]
+                        approved_human_cmds = [
+                            cmd for cmd in normalized_human_cmds if cmd and is_approved_remediation_command(cmd)
+                        ]
                         if approved_human_cmds:
                             recommendation.commands = list(
                                 dict.fromkeys([*(recommendation.commands or []), *approved_human_cmds])

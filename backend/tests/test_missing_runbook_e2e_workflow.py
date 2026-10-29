@@ -4,9 +4,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-
+from ai_workbench_common.models import Context
 from common.context_enrichment_contract import HumanEvidenceResponse, build_evidence_requirements
 from common.database import (
     Base,
@@ -19,11 +17,12 @@ from common.database import (
     ResolutionOutboxRecord,
     RunbookVersionRecord,
 )
-from ai_workbench_common.models import Context
 from common.models import Alert, AlertSeverity
 from common.repository import ContextEnrichmentRepository, IncidentRepository
 from context_agent.connectors import VectorDBConnector
 from resolution_agent.graph import ResolutionIntelligenceAgent as ResolutionAgent
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 
 def test_human_evidence_response_does_not_opt_into_runbook_draft_creation():

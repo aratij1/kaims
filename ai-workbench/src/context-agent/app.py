@@ -3048,9 +3048,18 @@ async def create_knowledge_rag_draft(request: KnowledgeRagDraftCreateRequest) ->
 
 @app.put("/rag/knowledge-drafts/{draft_id}")
 async def review_knowledge_rag_draft(
-    draft_id: str, request: KnowledgeRagDraftReviewRequest,
+    draft_id: str,
+    request: KnowledgeRagDraftReviewRequest,
+    x_operational_role: str | None = Header(default=None, alias="X-Operational-Role"),
+    x_actor_id: str | None = Header(default=None, alias="X-Actor-Id"),
 ) -> dict[str, Any]:
     tenant = require_tenant_id(request.tenant_scope, source="knowledge draft review")
+    if isinstance(x_operational_role, str) and x_operational_role.strip():
+        if x_operational_role.strip().lower() not in {"admin", "hitl_approver", "operator"}:
+            raise HTTPException(status_code=403, detail="knowledge draft review requires OPERATOR, HITL_APPROVER, or ADMIN role")
+    if isinstance(x_actor_id, str) and x_actor_id.strip():
+        if x_actor_id.strip().casefold() != request.reviewed_by.strip().casefold():
+            raise HTTPException(status_code=403, detail="authenticated actor does not match reviewed_by")
     async with app.state.session_factory() as session:
         draft = await IncidentRepository(session).review_knowledge_rag_draft(
             tenant_id=tenant, draft_id=draft_id,
@@ -3066,9 +3075,18 @@ async def review_knowledge_rag_draft(
 
 @app.post("/rag/knowledge-drafts/{draft_id}/approve")
 async def approve_knowledge_rag_draft(
-    draft_id: str, request: KnowledgeRagDraftApproveRequest,
+    draft_id: str,
+    request: KnowledgeRagDraftApproveRequest,
+    x_operational_role: str | None = Header(default=None, alias="X-Operational-Role"),
+    x_actor_id: str | None = Header(default=None, alias="X-Actor-Id"),
 ) -> dict[str, Any]:
     tenant = require_tenant_id(request.tenant_scope, source="knowledge draft approval")
+    if isinstance(x_operational_role, str) and x_operational_role.strip():
+        if x_operational_role.strip().lower() not in {"admin", "hitl_approver"}:
+            raise HTTPException(status_code=403, detail="knowledge draft approval requires HITL_APPROVER or ADMIN role")
+    if isinstance(x_actor_id, str) and x_actor_id.strip():
+        if x_actor_id.strip().casefold() != request.approved_by.strip().casefold():
+            raise HTTPException(status_code=403, detail="authenticated actor does not match approved_by")
     async with app.state.session_factory() as session:
         try:
             approved = await IncidentRepository(session).approve_knowledge_rag_draft(

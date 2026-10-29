@@ -1967,7 +1967,7 @@ async def _require_persisted_approved_runbook(approval: Approval) -> None:
     if not settings.database_enabled:
         raise PolicyViolation("automatic execution requires durable runbook governance")
     plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
-    is_auto = bool(approval.metadata.get("auto_approved")) or approval.approver_role == "policy-engine"
+    is_auto = bool(approval.metadata.get("auto_approved")) or getattr(approval, "approver_role", None) == "policy-engine"
     runbook_id = str(approval.metadata.get("runbook_id") or plan.get("runbook_governance_id") or "").strip()
     if not runbook_id:
         if not is_auto:
@@ -1979,30 +1979,20 @@ async def _require_persisted_approved_runbook(approval: Approval) -> None:
             runbook_id, version, tenant_id=approval.tenant_id
         )
     if not governance or governance.get("status") != "approved":
-        if not is_auto:
-            return
         raise PolicyViolation("automatic execution blocked: runbook version is not durably approved or is suspended")
     payload = governance.get("payload") if isinstance(governance.get("payload"), dict) else {}
     approved_checksum = str(payload.get("checksum_sha256") or "").strip()
     plan_checksum = str(approval.metadata.get("runbook_checksum") or plan.get("runbook_checksum") or "").strip()
     if not approved_checksum or approved_checksum != plan_checksum:
-        if not is_auto:
-            return
         raise PolicyViolation("automatic execution blocked: runbook checksum does not match durable approval")
     expires_at = str(payload.get("approval_expires_at") or "").strip()
     if not expires_at:
-        if not is_auto:
-            return
         raise PolicyViolation("automatic execution blocked: runbook approval expiry is missing")
     try:
         expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     except ValueError as exc:
-        if not is_auto:
-            return
         raise PolicyViolation("automatic execution blocked: runbook approval expiry is invalid") from exc
     if expiry <= utc_now():
-        if not is_auto:
-            return
         raise PolicyViolation("automatic execution blocked: runbook approval has expired")
 
 
