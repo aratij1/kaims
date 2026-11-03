@@ -20,7 +20,7 @@ from common.repository import ContextEnrichmentRepository
 
 
 def test_database_and_validation_canonical_mappings_and_connectors():
-    """Verify database and validation are recognized canonical categories with active connectors."""
+    """Verify database is collectible while validation stays a manual review gap."""
     assert "database" in _CANONICAL_CATEGORY
     assert _CANONICAL_CATEGORY["database"] == "metrics"
     assert "validation" in _CANONICAL_CATEGORY
@@ -31,8 +31,7 @@ def test_database_and_validation_canonical_mappings_and_connectors():
     assert "discovery-mcp" in _REQUIREMENT_CONNECTORS["database"]
     assert "prometheus" in _REQUIREMENT_CONNECTORS["database"]
 
-    assert len(_REQUIREMENT_CONNECTORS["validation"]) > 0
-    assert "discovery-mcp" in _REQUIREMENT_CONNECTORS["validation"]
+    assert "validation" not in _REQUIREMENT_CONNECTORS
 
     # Verify aliases
     assert _CATEGORY_ALIASES["db"] == "database"
@@ -40,7 +39,7 @@ def test_database_and_validation_canonical_mappings_and_connectors():
 
 
 def test_build_evidence_requirements_with_database_and_validation():
-    """Verify build_evidence_requirements retains connectors and does not strip them to empty."""
+    """Verify validation is not scheduled through an ingest-incompatible connector."""
     incident_id = uuid4()
     now = datetime.now(UTC)
 
@@ -66,9 +65,8 @@ def test_build_evidence_requirements_with_database_and_validation():
     assert "discovery-mcp" in db_req.candidate_connectors
     assert db_req.collection_mode == "automatic"
 
-    assert len(val_req.candidate_connectors) >= 1
-    assert "discovery-mcp" in val_req.candidate_connectors
-    assert val_req.collection_mode == "automatic"
+    assert val_req.candidate_connectors == []
+    assert val_req.collection_mode == "connector_required"
 
     assert len(alias_req.candidate_connectors) >= 1
     assert alias_req.category == "database"

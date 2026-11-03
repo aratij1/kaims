@@ -1,17 +1,13 @@
 from __future__ import annotations
 
-from common.evidence_source_policy import is_alert_artifact
-
-from common.investigation_gaps import blocking_investigation_gaps
-
 import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
-from time import monotonic
 from enum import StrEnum
+from time import monotonic
 from typing import Any, TypedDict
 from uuid import NAMESPACE_URL, uuid5
 
@@ -29,7 +25,13 @@ from ai_workbench_common.prompts import (
 )
 from ai_workbench_common.resolution_quality import assess_evidence_quality, remediation_quality_gate
 from common.config import get_settings
+from common.evidence_source_policy import is_alert_artifact
+from common.investigation_gaps import blocking_investigation_gaps
 from common.models import AlertSeverity, Recommendation
+from common.orchestration.execution_plan import (
+    is_approved_remediation_script,
+    normalize_approved_remediation_command,
+)
 from common.telemetry import AGENT_STAGE_LATENCY
 from langgraph.graph import END, StateGraph
 
@@ -202,10 +204,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
             if commands:
                 return commands
         for line in str(runbook).splitlines():
-            token = line.strip().lstrip("- ").strip().strip("`")
+            token = re.sub(r"^\s*(?:[-*+]\s*|\d+[.)]\s*)", "", line).strip()
             if not token:
                 continue
             token = re.sub(r"^\s*(cmd|command|script|query)\s*:\s*", "", token, flags=re.IGNORECASE).strip()
+            token = normalize_approved_remediation_command(token) or token
             if token.startswith("#"):
                 continue
             # Capture command-like steps while avoiding prose-heavy runbook lines.
@@ -230,7 +233,7 @@ class ResolutionIntelligenceAgent(BaseAgent):
         sanitized: list[str] = []
         seen: set[str] = set()
         for raw in commands:
-            token = str(raw or "").strip().strip("`")
+            token = str(raw or "").strip()
             if not token:
                 continue
             token = re.sub(r"^\s*(cmd|command|script|query)\s*:\s*", "", token, flags=re.IGNORECASE).strip()
@@ -239,6 +242,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
             if token.lower().startswith("preview only"):
                 continue
             if token.lower().startswith("recommended_action"):
+                continue
+            normalized_command = normalize_approved_remediation_command(token)
+            if normalized_command:
+                token = normalized_command
+            elif not is_approved_remediation_script(token):
                 continue
             key = token.lower()
             if key in seen:
@@ -627,7 +635,11 @@ class ResolutionIntelligenceAgent(BaseAgent):
         if isinstance(human_guided, dict) and str(human_guided.get("remediation_steps") or "").strip():
             target = str(context.alert.service or "service").strip()
             guided_steps = str(human_guided["remediation_steps"]).strip()
-            extracted_cmds = self._sanitize_commands(self._extract_runbook_commands(guided_steps or runbook), max_items=4)
+            extracted_cmds = [
+                cmd
+                for cmd in self._sanitize_commands(self._extract_runbook_commands(guided_steps or runbook), max_items=4)
+                if not re.search(r"(?:;|&&|\|\||[|`<>]|\$\()", cmd)
+            ]
             return (
                 guided_steps,
                 extracted_cmds or ["echo 'Execute human-guided remediation steps'"],
@@ -1623,13 +1635,29 @@ class ResolutionIntelligenceAgent(BaseAgent):
         impact_ready = bool(context_quality.get("impact_ready", False)) or has_validated_learned
         if "impact_ready" in context_quality and not impact_ready:
             impact_confidence = min(impact_confidence, 0.49)
-        business_impact_text = str(
-            (human_guided.get("business_impact") if isinstance(human_guided, dict) else "")
-            or (historical_guidance.get("business_impact") if isinstance(historical_guidance, dict) else "")
-            or parsed.get("customer_impact")
-            or parsed.get("business_impact")
-            or state.get("impact", "")
+        human_business_impact = str(
+            human_guided.get("business_impact") if isinstance(human_guided, dict) else ""
         ).strip()
+        learned_business_impact = str(
+            historical_guidance.get("business_impact") if isinstance(historical_guidance, dict) else ""
+        ).strip()
+        model_business_impact = str(
+            parsed.get("customer_impact") or parsed.get("business_impact") or ""
+        ).strip()
+        model_impact_supported = bool(
+            impact_ready and impact_citations and impact_confidence >= 0.55
+        )
+        business_impact_supported = bool(
+            human_business_impact or (has_validated_learned and learned_business_impact) or (
+                model_impact_supported and model_business_impact
+            )
+        )
+        business_impact_text = (
+            human_business_impact
+            or (learned_business_impact if has_validated_learned else "")
+            or (model_business_impact if model_impact_supported else "")
+            or evidence_safe_fallback
+        )
         technical_impact_text = str(
             (human_guided.get("observed_symptoms") if isinstance(human_guided, dict) else "")
             or (historical_guidance.get("observed_symptoms") if isinstance(historical_guidance, dict) else "")
@@ -1637,12 +1665,22 @@ class ResolutionIntelligenceAgent(BaseAgent):
             or parsed.get("technical_impact")
             or f"Service {context.alert.service or 'unknown'} ({context.alert.environment or 'prod'}): {context.alert.description or context.alert.name}."
         ).strip()
+        observed_impact = parsed.get("observed_impact")
+        if (
+            not isinstance(observed_impact, str)
+            or not observed_impact.strip()
+            or not impact_ready
+            or not impact_citations
+            or impact_confidence < 0.55
+        ):
+            observed_impact = ""
         state["impact_analysis"] = {
             **parsed,
             "impact_summary": parsed.get("impact_summary") or state.get("impact", ""),
             "business_impact": business_impact_text,
+            "business_impact_status": "supported" if business_impact_supported else "not_established",
             "technical_impact": technical_impact_text,
-            "observed_impact": parsed.get("observed_impact") or technical_impact_text,
+            "observed_impact": observed_impact,
             "evidence_used": impact_citations,
             "confidence_score": impact_confidence,
             "context_readiness": {
@@ -1806,12 +1844,21 @@ class ResolutionIntelligenceAgent(BaseAgent):
                 readiness_blocks.append("No application runtime, log, telemetry, or code evidence supports this corrective action.")
             if mutating and evidence_quality.get("sufficiency") != "sufficient":
                 readiness_blocks.append("The causal hypothesis is not independently corroborated by sufficient evidence.")
-            if mutating and "rca_ready" in context_quality and context_quality.get("rca_ready") is not True:
+            if (
+                mutating
+                and "rca_ready" in context_quality
+                and context_quality.get("rca_ready") is not True
+                and not (isinstance(iterative_inv, dict) and iterative_inv.get("conclusive") is True)
+            ):
                 readiness_score = float(context_quality.get("rca_readiness_score") or 0.0)
                 readiness_blocks.append(
                     f"Context evidence is only {readiness_score:.0%} RCA-ready; collect independent direct and causal evidence."
                 )
-            if context_quality.get("discovery_degraded") or context_quality.get("execution_ready") is False:
+            if context_quality.get("discovery_degraded") or (
+                context_quality.get("execution_ready") is False
+                and not context_quality.get("rca_ready")
+                and not (isinstance(iterative_inv, dict) and iterative_inv.get("conclusive") is True)
+            ):
                 readiness_blocks.append(
                     "Discovery evidence is degraded or unavailable; collect fresh diagnostics before execution."
                 )

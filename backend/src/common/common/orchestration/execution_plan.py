@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-from hashlib import sha256
 import os
 import re
 from datetime import timedelta
 from functools import lru_cache
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -14,7 +14,6 @@ from uuid import UUID
 from common.config import Settings
 from common.connection_config import connector_catalog_from_connection_config, load_connection_config
 from common.models import Alert
-from common.recovery_observers import load_recovery_observer_registry
 from common.orchestration.execution_plan_contract import (
     ApprovalPolicy,
     ExecutionPlanV2,
@@ -29,7 +28,7 @@ from common.orchestration.safe_remediation import (
     PreflightEvidence,
     SafeRemediationBinding,
 )
-
+from common.recovery_observers import load_recovery_observer_registry
 
 _VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9_./:@,+%=-]+$")
@@ -321,7 +320,8 @@ _APPROVED_COMMAND_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^terraform\s+(?:init|apply)(?:\s+[A-Za-z0-9_./:=-]+)*$"),
     re.compile(r'^mysql\s+-e\s+"CALL mysql\.rds_failover\(\);"$'),
     re.compile(
-        r"^curl (?:--fail|--silent|--show-error|-fsS|-s|-k|--output /dev/null|--retry \d+|--retry-all-errors|--retry-connrefused|--retry-delay \d+|-X (?:GET|POST)|\s+)+'?https?://[A-Za-z0-9_.:-]+(?:/[A-Za-z0-9_./?=&-]*)?'?$"
+        r"^curl (?:--fail|--silent|--show-error|-fsS|-s|-k|--output /dev/null|--retry \d+|--retry-all-errors|--retry-connrefused|--retry-delay \d+|-X (?:GET|POST)|\s+)+"
+        r"'?https?://[A-Za-z0-9_.:-]+(?:/[A-Za-z0-9_./?=&-]*)?'?$"
     ),
 )
 
@@ -338,6 +338,31 @@ def is_approved_remediation_command(command: str) -> bool:
     return any(pattern.fullmatch(candidate) for pattern in _APPROVED_COMMAND_PATTERNS)
 
 
+def normalize_approved_remediation_command(command: str) -> str | None:
+    candidate = str(command or "").strip()
+    candidate = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", candidate).strip()
+    candidate = re.sub(
+        r"^(?:command|cmd|step|remediation|validation|rollback)\s*:\s*",
+        "",
+        candidate,
+        flags=re.IGNORECASE,
+    ).strip()
+    markdown_code_span = re.fullmatch(r"`([^`\r\n]+)`", candidate)
+    if markdown_code_span:
+        candidate = markdown_code_span.group(1).strip()
+    if is_approved_remediation_command(candidate):
+        return candidate
+    inline_cmd = re.search(r"\b(?:command|cmd)\s*:\s*(.+)$", candidate, flags=re.IGNORECASE)
+    if inline_cmd:
+        sub_candidate = inline_cmd.group(1).strip()
+        sub_code_span = re.fullmatch(r"`([^`\r\n]+)`", sub_candidate)
+        if sub_code_span:
+            sub_candidate = sub_code_span.group(1).strip()
+        if is_approved_remediation_command(sub_candidate):
+            return sub_candidate
+    return None
+
+
 def is_approved_remediation_script(command: str) -> bool:
     candidate = str(command or "").strip()
     if not candidate:
@@ -345,14 +370,41 @@ def is_approved_remediation_script(command: str) -> bool:
     return bool(_APPROVED_SCRIPT_PATTERN.fullmatch(candidate))
 
 
+_PROSE_VALIDATION_PATTERN = re.compile(
+    r"^(?:Verify|Confirm|Check|Ensure)\s+[A-Za-z0-9_./:\s,-]+\.?$"
+)
+
+
 def validate_plan_commands_allowlisted(plan: dict[str, Any]) -> list[str]:
     violations: list[str] = []
-    for field_name in ("preflight_commands", "commands", "validation_commands", "rollback_commands"):
+    for field_name in (
+        "preflight",
+        "preflight_commands",
+        "commands",
+        "validation_commands",
+        "rollback",
+        "rollback_commands",
+        "recommended_commands",
+    ):
         items = plan.get(field_name) if isinstance(plan.get(field_name), list) else []
+        has_approved_in_field = (
+            any(is_approved_remediation_command(str(c or "").strip()) for c in items)
+            if field_name == "validation_commands"
+            else False
+        )
         for cmd in items:
             cmd_str = str(cmd or "").strip()
-            if cmd_str and not is_approved_remediation_command(cmd_str):
-                violations.append(f"{field_name}:{cmd_str}")
+            if not cmd_str:
+                continue
+            if is_approved_remediation_command(cmd_str):
+                continue
+            if (
+                field_name == "validation_commands"
+                and has_approved_in_field
+                and bool(_PROSE_VALIDATION_PATTERN.fullmatch(cmd_str))
+            ):
+                continue
+            violations.append(f"{field_name}:{cmd_str}")
     scripts = plan.get("scripts") if isinstance(plan.get("scripts"), list) else []
     for script_cmd in scripts:
         script_str = str(script_cmd or "").strip()
@@ -708,6 +760,9 @@ def resolve_execution_plan(
             "otel-collector", "core1", "core", "kaiops-core1", "kaiops-core",
             "frontend-proxy", "astronomy-shop", "policy-engine", "learning-service",
             "knowledge-development-worker", "notification-service", "itsm-adapter",
+            "rs-ratings", "rs-payment", "rs-catalogue", "rs-cart", "rs-user",
+            "rs-shipping", "rs-web", "rs-dispatch", "rs-mongodb", "rs-mysql",
+            "rs-redis", "rs-rabbitmq",
         }
         from common.orchestration.compose_targets import compose_recovery_target
         external_target = compose_recovery_target(
@@ -812,6 +867,9 @@ def resolve_execution_plan(
             "otel-collector", "core1", "core", "kaiops-core1", "kaiops-core",
             "frontend-proxy", "astronomy-shop", "policy-engine", "learning-service",
             "knowledge-development-worker", "notification-service", "itsm-adapter",
+            "rs-ratings", "rs-payment", "rs-catalogue", "rs-cart", "rs-user",
+            "rs-shipping", "rs-web", "rs-dispatch", "rs-mongodb", "rs-mysql",
+            "rs-redis", "rs-rabbitmq",
         }
         if docker_service in internal_services:
             phase_commands["validation"] = [

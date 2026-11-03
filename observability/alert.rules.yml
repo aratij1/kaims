@@ -458,6 +458,20 @@ groups:
 
   - name: robot-shop
     rules:
+      - alert: RobotShopRatingsUnavailable
+        expr: probe_success{job="robot-shop-ratings"} == 0
+        for: 20s
+        labels:
+          severity: critical
+          source: robot-shop
+          environment: demo
+          monitoring_scope: demo
+          service: rs-ratings
+          application: Robot Shop
+        annotations:
+          summary: "Robot Shop ratings service is unavailable"
+          description: "The HTTP health probe for rs-ratings has failed for more than 20s."
+
       - alert: RobotShopServiceDown
         expr: up{job=~"robot-shop-.*"} == 0
         for: 20s

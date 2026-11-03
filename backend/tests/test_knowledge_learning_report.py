@@ -3,13 +3,23 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from common.continuous_learning import FailurePattern, IncidentEvidence
-from common.database import IncidentEvidenceRecord, KnowledgeRagDraftRecord, LearningAuditRecord, RunbookOutcomeRecord, RunbookVersionRecord
+from common.database import (
+    IncidentEvidenceRecord,
+    KnowledgeRagDraftRecord,
+    LearningAuditRecord,
+    RunbookApprovalRecord,
+    RunbookOutcomeRecord,
+    RunbookVersionRecord,
+)
 from common.models import EvidenceReference
+from common.repository import IncidentRepository
 from sqlalchemy import event, select
+from uuid import uuid4
 
 
 def load_module():
@@ -153,6 +163,91 @@ def test_platform_workspace_is_tenant_wide_scope() -> None:
     assert module._in_application_scope("api-gateway", service="mysql") is False
 
 
+def test_learning_success_requires_closed_independently_validated_recovery() -> None:
+    module = load_module()
+    incident_id = uuid4()
+    action_id = uuid4()
+    report_id = uuid4()
+    observation = {
+        "phase": "post_state",
+        "execution_id": str(action_id),
+        "passed": True,
+        "result_checksum": "sha256:" + "a" * 64,
+    }
+    report_payload = {
+        "closure_status": "closed",
+        "remediation_action_id": str(action_id),
+        "health_restored": True,
+        "alerts_cleared": True,
+        "action_taken": "restarted payment service",
+        "validation": {
+            "independent_checks_passed": True,
+            "all_recovery_checks_passed": True,
+        },
+        "metadata": {
+            "stability_window": {"status": "recovered"},
+            "independent_validation_observations": [observation],
+        },
+    }
+    report = SimpleNamespace(id=report_id, payload=report_payload, root_cause="service process stalled")
+    incident = SimpleNamespace(
+        id=incident_id,
+        status="closed",
+        service="payments",
+        environment="prod",
+        title="Payments unavailable",
+        payload={},
+        ticket_id=None,
+        created_at=None,
+    )
+    action = SimpleNamespace(id=action_id, status="succeeded", payload={}, action_type="restart")
+
+    evidence = module._build_evidence(report, incident, action)
+    assert evidence.resolution_successful is True
+    assert evidence.reviewed is True
+
+    invalid_cases = [
+        ("incident", "status", "failed"),
+        ("report_status", "closure_status", "pending_stability"),
+        ("missing_stability", "stability_window", None),
+        ("pending_stability", "stability_window", {"status": "pending"}),
+        ("failed_stability", "stability_window", {"status": "failed"}),
+        ("missing_validation", "validation", {}),
+        ("missing_observation", "observations", []),
+        ("failed_observation", "observation_passed", False),
+        ("failed_action", "action_status", "failed"),
+    ]
+    for _, case, value in invalid_cases:
+        incident.status = "closed"
+        action.status = "succeeded"
+        report.payload = dict(report_payload)
+        report.payload["metadata"] = {
+            "stability_window": {"status": "recovered"},
+            "independent_validation_observations": [dict(observation)],
+        }
+        if case == "status":
+            incident.status = value
+        elif case == "closure_status":
+            report.payload["closure_status"] = value
+        elif case == "stability_window":
+            if value is None:
+                report.payload["metadata"].pop("stability_window")
+            else:
+                report.payload["metadata"]["stability_window"] = value
+        elif case == "validation":
+            report.payload["validation"] = value
+        elif case == "observations":
+            report.payload["metadata"]["independent_validation_observations"] = value
+        elif case == "observation_passed":
+            report.payload["metadata"]["independent_validation_observations"][0]["passed"] = value
+        elif case == "action_status":
+            action.status = value
+
+        evidence = module._build_evidence(report, incident, action)
+        assert evidence.resolution_successful is not True
+        assert evidence.reviewed is False
+
+
 @pytest.mark.asyncio
 async def test_report_preserves_evidence_metadata_without_loading_raw_documents(sqlite_session_factory) -> None:
     module = load_module()
@@ -212,3 +307,216 @@ def test_catalog_promotion_requires_success_and_complete_recovery_controls() -> 
     assert module._promotion_readiness(content, reviewed_success=True) == []
     assert "a reviewed successful recovery is required" in module._promotion_readiness(content, reviewed_success=False)
     assert "rollback steps are incomplete" in module._promotion_readiness({**content, "rollback_steps": []}, reviewed_success=True)
+
+
+@pytest.mark.asyncio
+async def test_catalog_governance_requires_internal_token_and_distinct_checksum_bound_review(
+    sqlite_session_factory, monkeypatch,
+) -> None:
+    import httpx
+
+    module = load_module()
+    runbook_id = uuid4()
+    content = {"source": "operator_evidence_response", "version": 1}
+    content_sha = module._hash({key: value for key, value in content.items() if key != "version"})
+    monkeypatch.setattr(module.settings, "service_internal_token", "worker-test-secret")
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+    async with sqlite_session_factory() as session:
+        session.add(RunbookVersionRecord(
+            runbook_id=runbook_id,
+            version=1,
+            tenant_id="tenant-a",
+            issue_signature="b" * 64,
+            approval_status="draft",
+            owner="test",
+            risk_level="medium",
+            required_approval="mandatory",
+            content={**content, "content_sha256": content_sha},
+        ))
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=module.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
+        route = f"/catalog/{runbook_id}/versions/1/review"
+        request = {
+            "tenant_id": "tenant-a",
+            "actor": "reviewer@example.test",
+            "decision": "review",
+            "expected_content_sha256": content_sha,
+        }
+        assert (await client.post(route, json=request)).status_code == 403
+        assert (
+            await client.post(
+                route,
+                json=request,
+                headers={"x-kaiops-internal-token": "wrong-secret"},
+            )
+        ).status_code == 403
+        monkeypatch.setattr(module.settings, "service_internal_token", "")
+        assert (await client.post(route, json=request)).status_code == 503
+        monkeypatch.setattr(module.settings, "service_internal_token", "worker-test-secret")
+        headers = {"x-kaiops-internal-token": "worker-test-secret"}
+        reviewed = await client.post(route, json=request, headers=headers)
+        assert reviewed.status_code == 200
+        assert reviewed.json()["status"] == "review_pending"
+
+        same_actor = await client.post(route, json={**request, "decision": "approve"}, headers=headers)
+        assert same_actor.status_code == 409
+        approved = await client.post(
+            route,
+            json={**request, "actor": "approver@example.test", "decision": "approve"},
+            headers=headers,
+        )
+        assert approved.status_code == 200
+        assert approved.json()["status"] == "approved"
+
+    async with sqlite_session_factory() as session:
+        approval = (await session.execute(select(RunbookApprovalRecord))).scalar_one()
+        assert approval.tenant_id == "tenant-a"
+        assert approval.reviewer == "reviewer@example.test"
+        assert approval.approver == "approver@example.test"
+        assert approval.content_sha256 == content_sha
+        repo = IncidentRepository(session)
+        assert await repo.get_approved_runbook_version(
+            tenant_id="tenant-a", runbook_id=str(runbook_id), version=1,
+        ) is not None
+        assert await repo.get_approved_runbook_version(
+            tenant_id="tenant-b", runbook_id=str(runbook_id), version=1,
+        ) is None
+
+
+@pytest.mark.asyncio
+async def test_catalog_governance_fails_closed_for_stale_checksum_missing_review_and_other_tenant(
+    sqlite_session_factory, monkeypatch,
+) -> None:
+    import httpx
+
+    module = load_module()
+    runbook_id = uuid4()
+    content = {"source": "operator_evidence_response", "version": 1}
+    content_sha = module._hash({key: value for key, value in content.items() if key != "version"})
+    monkeypatch.setattr(module.settings, "service_internal_token", "worker-test-secret")
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+    async with sqlite_session_factory() as session:
+        session.add(RunbookVersionRecord(
+            runbook_id=runbook_id,
+            version=1,
+            tenant_id="tenant-a",
+            issue_signature="d" * 64,
+            approval_status="draft",
+            owner="test",
+            risk_level="medium",
+            required_approval="mandatory",
+            content={**content, "content_sha256": content_sha},
+        ))
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=module.app)
+    headers = {"x-kaiops-internal-token": "worker-test-secret"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
+        route = f"/catalog/{runbook_id}/versions/1/review"
+        payload = {
+            "tenant_id": "tenant-a",
+            "actor": "approver@example.test",
+            "decision": "approve",
+            "expected_content_sha256": content_sha,
+        }
+        assert (await client.post(route, json={**payload, "tenant_id": "tenant-b"}, headers=headers)).status_code == 404
+        assert (await client.post(route, json={**payload, "expected_content_sha256": "e" * 64}, headers=headers)).status_code == 409
+        assert (await client.post(route, json=payload, headers=headers)).status_code == 409
+        async with sqlite_session_factory() as session:
+            candidate = await session.get(RunbookVersionRecord, (runbook_id, 1))
+            candidate.content = {**candidate.content, "remediation_steps": ["changed after review"]}
+            await session.commit()
+        assert (await client.post(route, json=payload, headers=headers)).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_legacy_approval_route_delegates_to_shared_review_and_approval_gates(
+    sqlite_session_factory, monkeypatch,
+) -> None:
+    import httpx
+
+    module = load_module()
+    runbook_id = uuid4()
+    content = {"source": "operator_evidence_response", "version": 1}
+    content_sha = module._hash({key: value for key, value in content.items() if key != "version"})
+    monkeypatch.setattr(module.settings, "service_internal_token", "worker-test-secret")
+    monkeypatch.setattr(module.app.state, "session_factory", sqlite_session_factory, raising=False)
+    async with sqlite_session_factory() as session:
+        session.add(RunbookVersionRecord(
+            runbook_id=runbook_id,
+            version=1,
+            tenant_id="tenant-legacy",
+            issue_signature="1" * 64,
+            approval_status="draft",
+            owner="test",
+            risk_level="medium",
+            required_approval="mandatory",
+            content={**content, "content_sha256": content_sha},
+        ))
+        await session.commit()
+
+    transport = httpx.ASGITransport(app=module.app)
+    headers = {"x-kaiops-internal-token": "worker-test-secret"}
+    async with httpx.AsyncClient(transport=transport, base_url="http://worker") as client:
+        route = f"/runbooks/{runbook_id}/approve?version=1"
+        payload = {
+            "tenant_id": "tenant-legacy",
+            "actor": "reviewer@example.test",
+            "decision": "review",
+            "expected_content_sha256": content_sha,
+        }
+        assert (await client.post(route, json=payload, headers=headers)).json()["status"] == "review_pending"
+        approved = await client.post(
+            route,
+            json={**payload, "actor": "approver@example.test", "decision": "approve"},
+            headers=headers,
+        )
+        assert approved.status_code == 200
+        assert approved.json()["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_orphan_legacy_approval_cannot_authorize_a_runbook(sqlite_session_factory) -> None:
+    runbook_id = uuid4()
+    async with sqlite_session_factory() as session:
+        session.add(RunbookVersionRecord(
+            runbook_id=runbook_id,
+            version=1,
+            tenant_id="tenant-a",
+            issue_signature="2" * 64,
+            approval_status="approved",
+            owner="test",
+            risk_level="medium",
+            required_approval="mandatory",
+            content={"content_sha256": "3" * 64},
+        ))
+        session.add(RunbookApprovalRecord(
+            runbook_id=runbook_id,
+            version=1,
+            status="approved",
+            reviewer=None,
+            approver="legacy-approver",
+            approver_role="ADMINISTRATOR",
+            tenant_id=None,
+            content_sha256=None,
+        ))
+        await session.commit()
+        governed = await IncidentRepository(session).get_approved_runbook_version(
+            tenant_id="tenant-a", runbook_id=str(runbook_id), version=1,
+        )
+    assert governed is None
+
+
+def test_runbook_approval_migration_backfills_only_exact_version_tenant_matches() -> None:
+    migration = Path("backend/database/migrations/20261030_runbook_approval_tenant_and_four_eyes.sql")
+    sql = migration.read_text(encoding="utf-8")
+    assert "tenant_id VARCHAR(128) NULL" in sql
+    assert "reviewer VARCHAR(255) NULL" in sql
+    assert "content_sha256 VARCHAR(64) NULL" in sql
+    assert "information_schema.columns" in sql
+    assert "information_schema.statistics" in sql
+    assert "versions.runbook_id = approvals.runbook_id" in sql
+    assert "versions.version = approvals.version" in sql
+    assert "WHERE approvals.tenant_id IS NULL" in sql

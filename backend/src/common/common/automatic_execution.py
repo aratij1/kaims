@@ -4,6 +4,8 @@ from typing import Any
 _DEFAULT_AUTHORIZED_AUTO_TARGETS = frozenset({
     "default/prod/kaiops-monitoring-adapter",
     "default/prod/kaiops-alert-intelligence",
+    "default/prod/rs-ratings",
+    "default/demo/rs-ratings",
 })
 
 

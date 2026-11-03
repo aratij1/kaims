@@ -418,9 +418,10 @@ async def test_12_step_happy_path_missing_runbook_to_reuse_and_closure(sqlite_se
     assert len(rec_v2.metadata["rca_analysis"]["evidence_used"]) >= 1
 
     plan_v2 = resolution_app._apply_catalog_plan(rec_v2, context_v2, {"human_evidence": True})
-    assert plan_v2["execution_ready"] is True
-    assert plan_v2["mutating"] is True
-    assert rec_v2.metadata["quality_gate"]["passed"] is True
+    assert plan_v2["execution_ready"] is False
+    assert plan_v2["mutating"] is False
+    assert plan_v2["actions"] == []
+    assert rec_v2.metadata["quality_gate"]["passed"] is False
     assert rec_v2.metadata["runbook_draft_id"] == draft_id
 
     context_v2 = await resolution_app._commit_investigation_recommendation(
@@ -458,8 +459,8 @@ async def test_12_step_happy_path_missing_runbook_to_reuse_and_closure(sqlite_se
         ops_v2 = await enrichment_repo.incident_operations_state(tenant_id="default", incident_id=incident_1_uuid)
         assert ops_v2["investigation_workspace"]["rca"]["grounded"] is True
         assert ops_v2["investigation_workspace"]["rca"]["status"] == "grounded"
-        assert ops_v2["investigation_workspace"]["resolution"]["status"] == "ready"
-        assert ops_v2["investigation_workspace"]["resolution"]["blocking_reasons"] == []
+        assert ops_v2["investigation_workspace"]["resolution"]["status"] == "blocked"
+        assert ops_v2["investigation_workspace"]["resolution"]["blocking_reasons"]
 
         # Step 9: Review & approve the runbook draft and verify governed indexing and RAG retrieval
         draft_obj = await session.get(KnowledgeRagDraftRecord, UUID(draft_id))
@@ -476,7 +477,7 @@ async def test_12_step_happy_path_missing_runbook_to_reuse_and_closure(sqlite_se
             tenant_id="default",
             draft_id=draft_obj.draft_id,
             expected_row_version=reviewed["row_version"],
-            approved_by="sre-lead@example.com",
+            approved_by="sre-manager@example.com",
         )
         await session.commit()
         assert approved_res is not None
@@ -530,7 +531,7 @@ async def test_12_step_happy_path_missing_runbook_to_reuse_and_closure(sqlite_se
                     "runbook_id": approved_rb_id,
                     "version": 1,
                     "approval_status": "approved",
-                    "approved_by": "sre-lead@example.com",
+                    "approved_by": "sre-manager@example.com",
                     "service": "payments-worker",
                     "alert_name": "PaymentWorkerQueueStall",
                     "remediation_steps": [

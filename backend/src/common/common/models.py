@@ -402,6 +402,8 @@ class Incident(BaseEvent):
     # their ticket provenance or failing the workflow.
     jira_key: str | None = None
     jira_url: str | None = None
+    jira_issue_key: str | None = None
+    jira_issue_url: str | None = None
     jira_link: str | None = None
     jira_status: str | None = None
     closed_at: datetime | None = None

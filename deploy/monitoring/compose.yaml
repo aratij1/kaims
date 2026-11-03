@@ -89,6 +89,7 @@ services:
       kaims:
         aliases:
         - blackbox-exporter
+      robotshop: {}
     extra_hosts:
     - host.docker.internal:host-gateway
     healthcheck:
@@ -148,6 +149,9 @@ networks:
   kaims:
     external: true
     name: kaims_default
+  robotshop:
+    external: true
+    name: kaims-latest_robot-shop-net
   telemetry:
     external: true
     name: opentelemetry-demo

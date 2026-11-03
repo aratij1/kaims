@@ -291,7 +291,14 @@ class ClosureValidationAgent(BaseAgent):
             execution_plan,
             observed_at=observed_at,
         )
-        stability_passed = elapsed_stability_passed and validator_windows_complete
+        collection = action.parameters.get("recovery_observation_collection")
+        collection = collection if isinstance(collection, dict) else {}
+        collection_pending = (
+            collection.get("status") in {"warming_up", "unavailable"}
+            and validation["approved_plan_fingerprint_preserved"]
+            and validation["validation_executable"]
+        )
+        stability_passed = elapsed_stability_passed and validator_windows_complete and not collection_pending
         recovery_checks = {
             "triggering_alert_cleared": "alert_clearance" in passed_kinds,
             "availability_recovered": "availability" in passed_kinds,
@@ -321,14 +328,6 @@ class ClosureValidationAgent(BaseAgent):
                 if isinstance(item, dict) and str(item.get("rollback_action") or "").strip()
             ),
             None,
-        )
-        collection = action.parameters.get("recovery_observation_collection")
-        collection = collection if isinstance(collection, dict) else {}
-        collection_pending = (
-            collection.get("status") in {"warming_up", "unavailable"}
-            and validation["approved_plan_fingerprint_preserved"]
-            and validation["validation_executable"]
-            and not any(item.get("passed") is False for item in observations)
         )
         outcome_decision = decide_outcome_validation(
             execution_id=action.id,

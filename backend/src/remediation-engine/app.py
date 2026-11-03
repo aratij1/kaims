@@ -1,38 +1,51 @@
 from __future__ import annotations
 
 import asyncio
-import logging
-import re
 import hashlib
+import logging
 import os
+import re
 from collections.abc import Awaitable, Callable, Coroutine
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
-from sqlalchemy import select, text
-
 from ai_workbench_common.agent_runtime import PolicyViolation
 from common.config import get_settings
-from common.database import ActionRecord, ApprovalRecord, ExecutionPlanRecord
 from common.continuous_learning import validate_automatic_runbook_use
+from common.database import ActionRecord, ApprovalRecord, ExecutionPlanRecord
 from common.event_publishers import build_agent_event_contract, build_event_envelope, normalize_payload
-from common.kafka import KafkaConsumer, consume_forever as consume_kafka_forever
+from common.kafka import KafkaConsumer
+from common.kafka import consume_forever as consume_kafka_forever
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus, utc_now
-from common.orchestration.execution_plan_contract import canonical_plan_fingerprint, verify_plan_fingerprint
+from common.orchestration.execution_plan import validate_plan_commands_allowlisted
+from common.orchestration.execution_plan_contract import (
+    canonical_plan_fingerprint,
+    require_unexpired_plan_expiry,
+    verify_plan_fingerprint,
+)
 from common.orchestration.safe_remediation import PreflightEvidence
-from common.tenant_identity import require_tenant_id, verify_event_envelope
-from common.resolution_lifecycle import LifecycleActor, ResolutionState, create_lifecycle, decide_resolution_control, extract_lifecycle, transition_lifecycle
-from common.rabbitmq import RabbitMQConsumer, consume_forever as consume_rabbitmq_forever
+from common.rabbitmq import RabbitMQConsumer
+from common.rabbitmq import consume_forever as consume_rabbitmq_forever
 from common.repository import IncidentRepository
+from common.resolution_lifecycle import (
+    LifecycleActor,
+    ResolutionState,
+    create_lifecycle,
+    decide_resolution_control,
+    extract_lifecycle,
+    transition_lifecycle,
+)
 from common.service import create_app
 from common.telemetry import EVENTS_PROCESSED
+from common.tenant_identity import require_tenant_id, verify_event_envelope
 from common.topics import APPROVAL_EVENTS, REMEDIATION_EVENTS, RESOLUTION_EVENTS
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from remediation_engine import RemediationEngine
 from remediation_engine.execution_contract import bind_execution_contract, verify_execution_contract
+from sqlalchemy import select, text
 
 settings = get_settings()
 settings.service_name = "remediation-engine"
@@ -905,78 +918,133 @@ async def complete_persisted_diagnostic(request: DiagnosticCompletionRequest) ->
     return action
 
 
+def _try_uuid(value: Any) -> UUID | None:
+    if isinstance(value, UUID):
+        return value
+    if value is None:
+        return None
+    try:
+        return UUID(str(value))
+    except (ValueError, TypeError):
+        return None
+
+
 async def _hydrate_canonical_approval(approval: Approval, *, require_execution_scope: bool = False) -> Approval:
     if approval.decision == ApprovalDecision.REJECTED:
         return approval
+    incoming_scope_check = str(approval.authorization_scope or (approval.metadata or {}).get("authorization_scope") or "").strip()
+    if require_execution_scope and incoming_scope_check and incoming_scope_check != "execution":
+        raise HTTPException(status_code=403, detail="Dry-run authorization cannot execute a live remediation.")
     session_factory = getattr(app.state, "session_factory", None)
+    if require_execution_scope and session_factory is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Execution blocked: the persisted approval store is unavailable.",
+        )
     plan_record: ExecutionPlanRecord | None = None
     approval_record: ApprovalRecord | None = None
+    aid = _try_uuid(approval.id)
+    inc_uid = _try_uuid(approval.incident_id)
+    rec_uid = _try_uuid(approval.recommendation_id)
+    plan_uid = _try_uuid(approval.plan_id)
     if session_factory is not None:
         async with session_factory() as session:
-            if approval.plan_id is not None:
-                plan_record = await session.get(ExecutionPlanRecord, approval.plan_id)
-            if plan_record is None:
-                plan_record = (
-                    await session.execute(
-                        select(ExecutionPlanRecord)
-                        .where(ExecutionPlanRecord.incident_id == approval.incident_id)
-                        .order_by(ExecutionPlanRecord.created_at.desc())
-                        .limit(1)
+            if aid is not None:
+                approval_record = await session.get(ApprovalRecord, aid)
+            if require_execution_scope:
+                if approval_record is None or approval_record.decision != ApprovalDecision.APPROVED.value:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Execution blocked: the exact approval ID is not a persisted accepted decision.",
                     )
-                ).scalar_one_or_none()
-            approval_record = await session.get(ApprovalRecord, approval.id)
-            if require_execution_scope and (
-                approval_record is None
-                or approval_record.decision != ApprovalDecision.APPROVED.value
-                or str((approval_record.payload or {}).get("authorization_scope") or "execution") != "execution"
-            ):
-                candidates = (
-                    await session.execute(
-                        select(ApprovalRecord)
-                        .where(
-                            ApprovalRecord.incident_id == approval.incident_id,
-                            ApprovalRecord.decision == ApprovalDecision.APPROVED.value,
-                        )
-                        .order_by(ApprovalRecord.created_at.desc())
-                        .limit(10)
+                try:
+                    persisted_approval = Approval.model_validate(approval_record.payload)
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Execution blocked: the persisted approval payload is invalid.",
+                    ) from exc
+                if (
+                    persisted_approval.id != approval_record.id
+                    or persisted_approval.tenant_id != approval_record.tenant_id
+                    or persisted_approval.incident_id != approval_record.incident_id
+                    or persisted_approval.recommendation_id != approval_record.recommendation_id
+                    or persisted_approval.plan_id != approval_record.plan_id
+                    or persisted_approval.plan_fingerprint != approval_record.plan_fingerprint
+                    or persisted_approval.decision != ApprovalDecision.APPROVED
+                    or persisted_approval.authorization_scope != "execution"
+                    or approval_record.approval_expires_at is None
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Execution blocked: persisted approval identity or execution scope is invalid.",
                     )
-                ).scalars().all()
-                exec_candidate = next(
-                    (
-                        row
-                        for row in candidates
-                        if str((row.payload or {}).get("authorization_scope") or "execution") == "execution"
-                    ),
-                    None,
+                persisted_expiry = approval_record.approval_expires_at
+                if persisted_expiry.tzinfo is None:
+                    persisted_expiry = persisted_expiry.replace(tzinfo=UTC)
+                if persisted_expiry <= utc_now():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Execution blocked: the persisted approval has expired.",
+                    )
+                approval = persisted_approval
+                aid = approval.id
+                inc_uid = approval.incident_id
+                rec_uid = approval.recommendation_id
+                plan_uid = approval.plan_id
+
+            if approval_record is not None and approval_record.plan_id is not None:
+                plan_result = await session.execute(
+                    select(ExecutionPlanRecord).where(
+                        ExecutionPlanRecord.id == approval_record.plan_id,
+                        ExecutionPlanRecord.tenant_id == approval_record.tenant_id,
+                        ExecutionPlanRecord.incident_id == approval_record.incident_id,
+                        ExecutionPlanRecord.recommendation_id == approval_record.recommendation_id,
+                        ExecutionPlanRecord.fingerprint == approval_record.plan_fingerprint,
+                    )
                 )
-                approval_record = exec_candidate or (candidates[0] if candidates else approval_record)
-            elif approval_record is None:
-                approval_record = (
-                    await session.execute(
-                        select(ApprovalRecord)
-                        .where(
-                            ApprovalRecord.incident_id == approval.incident_id,
-                            ApprovalRecord.decision == ApprovalDecision.APPROVED.value,
-                        )
-                        .order_by(ApprovalRecord.created_at.desc())
-                        .limit(1)
-                    )
-                ).scalar_one_or_none()
+                plan_record = plan_result.scalar_one_or_none()
+            elif not require_execution_scope and plan_uid is not None:
+                plan_record = await session.get(ExecutionPlanRecord, plan_uid)
 
     incoming_meta = dict(approval.metadata or {})
     incoming_plan = incoming_meta.get("execution_plan") if isinstance(incoming_meta.get("execution_plan"), dict) else {}
     canonical_plan: dict[str, Any] = {}
-    if incoming_plan.get("schema_version") == "kaims.execution-plan.v2" and verify_plan_fingerprint(incoming_plan):
-        canonical_plan = dict(incoming_plan)
-    elif plan_record is not None and isinstance(plan_record.plan_payload, dict):
+    if plan_record is not None and isinstance(plan_record.plan_payload, dict):
         canonical_plan = dict(plan_record.plan_payload)
     elif approval_record is not None and isinstance(approval_record.payload, dict):
         rec_meta = approval_record.payload.get("metadata") if isinstance(approval_record.payload.get("metadata"), dict) else {}
         if isinstance(rec_meta.get("execution_plan"), dict):
             canonical_plan = dict(rec_meta.get("execution_plan"))
+    elif incoming_plan.get("schema_version") == "kaims.execution-plan.v2" and verify_plan_fingerprint(incoming_plan):
+        canonical_plan = dict(incoming_plan)
 
     if not canonical_plan and incoming_plan:
         canonical_plan = dict(incoming_plan)
+    if require_execution_scope:
+        try:
+            plan_expiry = require_unexpired_plan_expiry(canonical_plan)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Execution blocked: {exc}.",
+            ) from exc
+        persisted_expiry = (
+            approval.approval_expires_at
+            or (approval_record.approval_expires_at if approval_record is not None else None)
+        )
+        if persisted_expiry is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Execution blocked: persisted approval expiry is missing.",
+            )
+        if persisted_expiry.tzinfo is None:
+            persisted_expiry = persisted_expiry.replace(tzinfo=UTC)
+        if persisted_expiry > plan_expiry:
+            raise HTTPException(
+                status_code=409,
+                detail="Execution blocked: approval expiry exceeds canonical plan expiry.",
+            )
 
     tenant_id = str(
         canonical_plan.get("tenant_id")
@@ -1018,8 +1086,6 @@ async def _hydrate_canonical_approval(approval: Approval, *, require_execution_s
     expiry = approval.approval_expires_at or (approval_record.approval_expires_at if approval_record is not None else None)
     if expiry is not None and expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=UTC)
-    if expiry is None or expiry <= utc_now():
-        expiry = utc_now() + timedelta(minutes=30)
 
     plan_conn = canonical_plan.get("connection") if isinstance(canonical_plan.get("connection"), dict) else {}
     supplied_prof = incoming_meta.get("connection_profile") if isinstance(incoming_meta.get("connection_profile"), dict) else {}
@@ -1067,7 +1133,10 @@ async def _hydrate_canonical_approval(approval: Approval, *, require_execution_s
         "target": target_val,
     }
 
-    auth_scope = "execution" if require_execution_scope else str(approval.authorization_scope or incoming_meta.get("authorization_scope") or "execution")
+    incoming_scope = str(approval.authorization_scope or incoming_meta.get("authorization_scope") or "").strip()
+    auth_scope = incoming_scope or "execution"
+    if require_execution_scope and auth_scope != "execution":
+        raise HTTPException(status_code=403, detail="Dry-run authorization cannot execute a live remediation.")
     resolved_runbook_id = str(
         incoming_meta.get("runbook_id")
         or canonical_plan.get("runbook_governance_id")
@@ -1085,18 +1154,19 @@ async def _hydrate_canonical_approval(approval: Approval, *, require_execution_s
         or ("approved" if resolved_runbook_id else "")
     ).strip()
 
+    has_canonical_record = plan_record is not None or approval_record is not None
     hydrated_meta = {
         **incoming_meta,
         "authorization_scope": auth_scope,
-        "rca_version": canonical_plan.get("rca_version") or incoming_meta.get("rca_version"),
-        "evidence_snapshot_id": canonical_plan.get("evidence_snapshot_id") or incoming_meta.get("evidence_snapshot_id"),
+        "rca_version": incoming_meta.get("rca_version") or (canonical_plan.get("rca_version") if has_canonical_record else None),
+        "evidence_snapshot_id": incoming_meta.get("evidence_snapshot_id") or (canonical_plan.get("evidence_snapshot_id") if has_canonical_record else None),
         "recommendation_version": str(rec_id_val),
-        "resolution_selection_id": canonical_plan.get("resolution_selection_id") or incoming_meta.get("resolution_selection_id"),
-        "context_fingerprint": canonical_plan.get("context_fingerprint") or incoming_meta.get("context_fingerprint"),
-        "policy_version": canonical_plan.get("policy_version") or incoming_meta.get("policy_version") or "policy-v1",
-        "target_resource_id": canonical_plan.get("target_resource_id") or canonical_plan.get("remediation_target") or target_val,
-        "connector_id": canonical_plan.get("connector_id") or incoming_meta.get("connector_id"),
-        "rollback_plan": canonical_plan.get("rollback") or canonical_plan.get("rollback_commands") or incoming_meta.get("rollback_plan"),
+        "resolution_selection_id": incoming_meta.get("resolution_selection_id") or (canonical_plan.get("resolution_selection_id") if has_canonical_record else None),
+        "context_fingerprint": incoming_meta.get("context_fingerprint") or (canonical_plan.get("context_fingerprint") if has_canonical_record else None),
+        "policy_version": incoming_meta.get("policy_version") or canonical_plan.get("policy_version") or "policy-v1",
+        "target_resource_id": incoming_meta.get("target_resource_id") or ((canonical_plan.get("target_resource_id") or canonical_plan.get("remediation_target") or target_val) if has_canonical_record else None),
+        "connector_id": incoming_meta.get("connector_id") or (canonical_plan.get("connector_id") if has_canonical_record else None),
+        "rollback_plan": incoming_meta.get("rollback_plan") if incoming_meta.get("rollback_plan") is not None else ((canonical_plan.get("rollback") or canonical_plan.get("rollback_commands")) if has_canonical_record else None),
         "service": service_val,
         "environment": env_val,
         "remediation_target": canonical_plan.get("remediation_target") or target_val,
@@ -1116,13 +1186,13 @@ async def _hydrate_canonical_approval(approval: Approval, *, require_execution_s
         **({"execution_plan": canonical_plan} if canonical_plan else {}),
     }
 
-    approval_id_val = approval_record.id if approval_record is not None else approval.id
     hydrated = approval.model_copy(
         update={
-            "id": approval_id_val,
+            "id": aid or approval.id,
+            "incident_id": inc_uid or approval.incident_id,
             "tenant_id": tenant_id,
-            "recommendation_id": rec_id_val,
-            "plan_id": plan_id_val,
+            "recommendation_id": rec_uid or rec_id_val,
+            "plan_id": plan_uid or plan_id_val,
             "plan_fingerprint": plan_fp or approval.plan_fingerprint,
             "approval_expires_at": expiry,
             "authorization_scope": auth_scope,
@@ -1131,28 +1201,13 @@ async def _hydrate_canonical_approval(approval: Approval, *, require_execution_s
         }
     )
 
-    if session_factory is not None and require_execution_scope:
-        async with session_factory() as session:
-            repo = IncidentRepository(session)
-            accepted = await repo.has_accepted_approval_id(
-                hydrated.id,
-                hydrated.incident_id,
-                hydrated.recommendation_id,
-                tenant_id=hydrated.tenant_id,
-                plan_id=hydrated.plan_id,
-                plan_fingerprint=str(hydrated.plan_fingerprint or ""),
-            )
-            if not accepted:
-                await repo.save_approval(hydrated)
-                await session.commit()
-
     return hydrated
 
 
 async def _execute_approval(approval: Approval) -> RemediationAction:
-    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     if approval.authorization_scope != "execution":
         raise HTTPException(status_code=403, detail="Dry-run authorization cannot execute a live remediation.")
+    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     if approval.decision == ApprovalDecision.REJECTED:
         action = RemediationAction(
             tenant_id=approval.tenant_id,
@@ -1325,21 +1380,21 @@ async def _finalize_api_execution(approval: Approval, action: RemediationAction)
 
 @app.post("/execute-direct", response_model=RemediationAction, include_in_schema=False)
 async def execute_approval_direct(approval: Approval, x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
-    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     """Temporal activity target. Idempotency makes activity retries safe."""
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
         raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
+    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     return await _finalize_api_execution(approval, await _execute_approval(approval))
 
 
 @app.post("/dispatch-direct", response_model=RemediationAction, include_in_schema=False)
 async def dispatch_approval_direct(approval: Approval, x_kaiops_internal_token: str = Header(default="")) -> RemediationAction:
-    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     """Temporal-only, idempotent handoff to an asynchronous executor."""
     expected = settings.remediation_internal_token
     if not expected or x_kaiops_internal_token != expected:
         raise HTTPException(status_code=403, detail="Internal remediation activity authentication failed.")
+    approval = await _hydrate_canonical_approval(approval, require_execution_scope=True)
     unsafe_reasons = _unsafe_plan_reasons(approval)
     if unsafe_reasons:
         raise HTTPException(status_code=409, detail=unsafe_reasons[0])
@@ -1667,7 +1722,11 @@ async def execute_approval(approval: Approval) -> RemediationAction:
     client = getattr(app.state, "temporal_client", None)
     if client is None:
         raise HTTPException(status_code=503, detail="Durable remediation orchestration is unavailable.")
-    action_preview = engine.build_action(approval)
+    await _require_persisted_human_approval(approval)
+    try:
+        action_preview = engine.build_action(approval)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     # Reject invalid/self-destructive targets before creating a durable
     # workflow or submitting anything to the external executor.
     _require_live_executor_configuration(action_preview)
@@ -1729,8 +1788,8 @@ async def execute_approval(approval: Approval) -> RemediationAction:
     # Workflow execution failures live in temporalio.exceptions. Importing this
     # from temporalio.client works in neither the pinned SDK nor current SDKs
     # and caused every durable execution request to fail before workflow start.
-    from temporalio.exceptions import WorkflowAlreadyStartedError
     from temporalio.common import WorkflowIDReusePolicy
+    from temporalio.exceptions import WorkflowAlreadyStartedError
 
     try:
         await client.start_workflow(
@@ -1964,14 +2023,14 @@ async def _require_persisted_human_approval(approval: Approval) -> None:
 
 
 async def _require_persisted_approved_runbook(approval: Approval) -> None:
-    if not settings.database_enabled:
-        raise PolicyViolation("automatic execution requires durable runbook governance")
     plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
     is_auto = bool(approval.metadata.get("auto_approved")) or getattr(approval, "approver_role", None) == "policy-engine"
+    if not is_auto:
+        return
+    if not settings.database_enabled:
+        raise PolicyViolation("automatic execution requires durable runbook governance")
     runbook_id = str(approval.metadata.get("runbook_id") or plan.get("runbook_governance_id") or "").strip()
     if not runbook_id:
-        if not is_auto:
-            return
         raise PolicyViolation("automatic execution blocked: governed runbook identity is missing")
     version = int(approval.metadata.get("runbook_version") or plan.get("playbook_version") or 1)
     async with app.state.session_factory() as session:
@@ -1992,6 +2051,8 @@ async def _require_persisted_approved_runbook(approval: Approval) -> None:
         expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     except ValueError as exc:
         raise PolicyViolation("automatic execution blocked: runbook approval expiry is invalid") from exc
+    if expiry.tzinfo is None:
+        raise PolicyViolation("automatic execution blocked: runbook approval expiry must be timezone-aware")
     if expiry <= utc_now():
         raise PolicyViolation("automatic execution blocked: runbook approval has expired")
 
@@ -2119,6 +2180,13 @@ async def _preflight_live_connector(action: RemediationAction) -> dict[str, Any]
 def _unsafe_plan_reasons(approval: Approval) -> list[str]:
     """Fail closed when an edited plan contains destructive shell/database actions."""
     plan = approval.metadata.get("execution_plan") if isinstance(approval.metadata.get("execution_plan"), dict) else {}
+    reasons: list[str] = []
+    policy_plan = {
+        **plan,
+        "recommended_commands": approval.metadata.get("recommended_commands", []),
+    }
+    if validate_plan_commands_allowlisted(policy_plan):
+        reasons.append("Execution blocked: one or more remediation commands are outside the automated allowlist.")
     values = [approval.modified_action or ""]
     for key in ("commands", "scripts", "queries"):
         item = plan.get(key, [])
@@ -2129,7 +2197,11 @@ def _unsafe_plan_reasons(approval: Approval) -> list[str]:
         "database destruction": ("drop database", "drop table", "truncate table"),
         "infrastructure destruction": ("terraform destroy", "kubectl delete namespace"),
     }
-    reasons = [f"Execution blocked: {label} requires a separately reviewed, policy-authorized plan." for label, tokens in markers.items() if any(token in text for token in tokens)]
+    reasons.extend(
+        f"Execution blocked: {label} requires a separately reviewed, policy-authorized plan."
+        for label, tokens in markers.items()
+        if any(token in text for token in tokens)
+    )
     if str(plan.get("schema_version") or "").startswith("kaims.execution-plan."):
         expected_bindings = {
             "rca_version": approval.metadata.get("rca_version"),
@@ -2143,17 +2215,15 @@ def _unsafe_plan_reasons(approval: Approval) -> list[str]:
                     f"Execution blocked: immutable {name.replace('_', ' ')} binding is missing or mismatched."
                 )
         plan_target = str(plan.get("target_resource_id") or plan.get("remediation_target") or "").strip()
-        expected_target = str(approval.metadata.get("target_resource_id") or plan_target or "").strip()
+        expected_target = str(approval.metadata.get("target_resource_id") or "").strip()
         if not expected_target or expected_target != plan_target:
             reasons.append("Execution blocked: approved target resource binding is missing or mismatched.")
         plan_connector = str(plan.get("connector_id") or "").strip()
-        expected_connector = str(approval.metadata.get("connector_id") or plan_connector or "").strip()
+        expected_connector = str(approval.metadata.get("connector_id") or "").strip()
         if not expected_connector or expected_connector != plan_connector:
             reasons.append("Execution blocked: approved connector binding is missing or mismatched.")
         plan_rollback = plan.get("rollback") or plan.get("rollback_commands")
         approved_rollback = approval.metadata.get("rollback_plan")
-        if approved_rollback is None:
-            approved_rollback = plan_rollback
         if approved_rollback != plan_rollback:
             reasons.append("Execution blocked: approved rollback binding is missing or mismatched.")
         if plan.get("execution_ready") is not True:
@@ -2165,6 +2235,10 @@ def _unsafe_plan_reasons(approval: Approval) -> list[str]:
             )
         if not verify_plan_fingerprint(plan):
             reasons.append("Execution blocked: the catalog plan fingerprint is missing or invalid.")
+        try:
+            require_unexpired_plan_expiry(plan)
+        except ValueError as exc:
+            reasons.append(f"Execution blocked: {exc}.")
         if not plan.get("commands"):
             reasons.append("Execution blocked: the catalog plan contains no approved corrective command.")
         if not plan.get("validation_commands"):

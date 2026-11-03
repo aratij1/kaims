@@ -330,7 +330,13 @@ async def test_real_http_collection_persists_pending_then_recovery_after_restart
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-    from common.database import ActionRecord, IncidentProjectionRecord, RcaReportRecord, ResolutionOutboxRecord
+    from common.database import (
+        ActionRecord,
+        IncidentProjectionRecord,
+        RcaReportRecord,
+        ResolutionOutboxRecord,
+        ValidationObservationRecord,
+    )
     from common.models import Incident
     from common.repository import IncidentRepository
     from sqlalchemy import select
@@ -436,6 +442,23 @@ async def test_real_http_collection_persists_pending_then_recovery_after_restart
             assert stored["metadata"]["resolution_lifecycle"]["state"] == "closed"
             reports = (await session.execute(select(RcaReportRecord))).scalars().all()
             assert {report.closure_status for report in reports} == {"pending_stability", "closed"}
+            observations = (
+                await session.execute(select(ValidationObservationRecord))
+            ).scalars().all()
+            expected_checksums = {
+                item["result_checksum"]
+                for item in recovered.metadata["independent_validation_observations"]
+            }
+            assert {item.result_checksum for item in observations} == expected_checksums
+            assert all(
+                item.tenant_id == action.tenant_id
+                and item.incident_id == action.incident_id
+                and item.report_id == recovered.id
+                and item.remediation_action_id == action.id
+                and item.phase == "post_state"
+                and item.passed
+                for item in observations
+            )
             events = (await session.execute(select(ResolutionOutboxRecord))).scalars().all()
             assert {event.payload["resolution_lifecycle"]["state"] for event in events} == {
                 "pending_stability",

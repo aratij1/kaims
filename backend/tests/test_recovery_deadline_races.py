@@ -23,6 +23,7 @@ def load_temporal(name):
 def setup_execution(monkeypatch, status):
     module = load_remediation_app_module()
     approval = Approval(tenant_id="tenant-a", incident_id=uuid4(), recommendation_id=uuid4(),
+                        approval_expires_at=datetime.now(UTC) + timedelta(hours=1),
                         decision=ApprovalDecision.APPROVED, approver="reviewer")
     action = RemediationAction(tenant_id="tenant-a", incident_id=approval.incident_id, approval_id=approval.id,
                               action_type="restart_service", target="frontend-proxy", status=status)
@@ -44,7 +45,13 @@ async def test_delayed_activity_preserves_persisted_terminal_result(monkeypatch,
     result = await getattr(module, endpoint)({"approval": approval.model_dump(mode="json")}, "test-internal")
     assert result.status == status
     module.engine.observe.assert_not_awaited()
-    module._finalize_api_execution.assert_awaited_once_with(approval, action)
+    module._finalize_api_execution.assert_awaited_once()
+    finalized_approval, finalized_action = module._finalize_api_execution.await_args.args
+    assert finalized_approval.id == approval.id
+    assert finalized_approval.tenant_id == approval.tenant_id
+    assert finalized_approval.incident_id == approval.incident_id
+    assert finalized_approval.approval_expires_at is not None
+    assert finalized_action is action
 
 
 @pytest.mark.asyncio

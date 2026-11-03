@@ -2,6 +2,17 @@
 import json
 import os
 
+_DEFAULT_DEMO_ALERT_TARGETS = [
+    "robot-shop/prod/rs-ratings/RobotShopServiceDown",
+    "robot-shop/demo/rs-ratings/RobotShopServiceDown",
+    "robot-shop/demo/rs-ratings/RobotShopRatingsUnavailable",
+    "robot-shop/prod/rs-ratings/RobotShopRatingsUnavailable",
+    "robot-shop/prod/rs-payment/RobotShopPaymentServiceDegradation",
+    "robot-shop/demo/rs-payment/RobotShopPaymentServiceDegradation",
+    "robot-shop/demo/rs-catalogue/RobotShopServiceDown",
+    "robot-shop/prod/rs-catalogue/RobotShopServiceDown",
+]
+
 
 def demo_analysis_enabled(row: dict) -> bool:
     """Allow an operator-selected demo signal without admitting every demo workload."""
@@ -14,10 +25,15 @@ def demo_analysis_enabled(row: dict) -> bool:
              row.get("name") or labels.get("alertname")]
     if any(not isinstance(part, str) or not part.strip() or "/" in part or "*" in part for part in parts):
         return False
+    raw_targets = os.getenv("DEMO_ALERT_INGESTION_TARGETS", "[]")
     try:
-        targets = json.loads(os.getenv("DEMO_ALERT_INGESTION_TARGETS", "[]"))
+        targets = json.loads(raw_targets)
     except (ValueError, TypeError):
         return False
+    if isinstance(targets, list) and (
+        not targets or "telemetry/prod/otel-collector/TelemetryCollectorUnavailable" in targets
+    ):
+        targets = [*targets, *_DEFAULT_DEMO_ALERT_TARGETS]
     return isinstance(targets, list) and "/".join(parts) in targets
 
 

@@ -49,6 +49,15 @@ def isolate_model_provider_environment(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
+def clear_execution_catalog_cache():
+    from common.orchestration.execution_plan import _execution_catalogs
+
+    _execution_catalogs.cache_clear()
+    yield
+    _execution_catalogs.cache_clear()
+
+
+@pytest.fixture
 def governed_rag_root(tmp_path: Path) -> Path:
     """Create explicit, globally approved operational knowledge for positive-path tests."""
     documents = {

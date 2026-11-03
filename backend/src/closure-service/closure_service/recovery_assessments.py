@@ -14,16 +14,32 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4, uuid5
 
 import httpx
+from common.authorization import OperationalRole, role_is_allowed
+from common.database import (
+    ActionRecord,
+    AlertRecord,
+    AuditLogRecord,
+    IncidentLifecycleTransitionRecord,
+    IncidentProjectionRecord,
+    IncidentRecord,
+    RcaReportRecord,
+    ValidationObservationRecord,
+)
+from common.models import RemediationAction, RemediationStatus, ResolutionReport
+from common.recovery_observers import load_recovery_observer_registry
+from common.repository import IncidentRepository
+from common.resolution_lifecycle import (
+    LifecycleActor,
+    LifecycleTransitionError,
+    ResolutionState,
+    create_lifecycle,
+    extract_lifecycle,
+    transition_lifecycle,
+)
 from fastapi import Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 
-from common.authorization import OperationalRole, role_is_allowed
-from common.database import ActionRecord, AlertRecord, AuditLogRecord, IncidentProjectionRecord, IncidentRecord, IncidentLifecycleTransitionRecord, RcaReportRecord, ValidationObservationRecord
-from common.models import RemediationAction, RemediationStatus, ResolutionReport
-from common.recovery_observers import load_recovery_observer_registry
-from common.repository import IncidentRepository
-from common.resolution_lifecycle import LifecycleActor, LifecycleTransitionError, ResolutionState, create_lifecycle, extract_lifecycle, transition_lifecycle
 from closure_service.observations import PrometheusRecoveryObserver
 
 REQUESTED = "recovery.assessment.requested"
@@ -99,7 +115,10 @@ async def context(session, incident, registry):
         "alert_ids": sorted(str(a.id) for a in alerts), "status": incident["status"],
         "recommendation_id": str(projection.recommendation_id) if projection and projection.recommendation_id else None,
         "lifecycle": lifecycle,
-        "projection_lifecycle": {"state": projection.lifecycle_state, "version": projection.lifecycle_version, "status": projection.status} if projection else None,
+        "projection_lifecycle": (
+            {"state": projection.lifecycle_state, "version": projection.lifecycle_version, "status": projection.status}
+            if projection else {"state": "DETECTED", "version": 1, "status": None}
+        ),
         "actions": sorted((str(a.id), a.status, str(a.updated_at)) for a in actions),
         "profile_digest": digest({"profile": profile.model_dump(mode="json"),
             "sources": [registry.source_for(c.spec).model_dump(mode="json") for c in profile.checks]}),
@@ -168,19 +187,39 @@ async def sync_closed_assessment_projection(session, assessment_id):
     ).with_for_update())).scalar_one_or_none()
     if projection is None:
         raise HTTPException(409, "Incident projection is missing")
-    if projection.lifecycle_state == "CLOSED":
+    idempotency_key = f"observed-recovery:{assessment_id}"
+    existing_transition = await session.scalar(select(IncidentLifecycleTransitionRecord).where(
+        IncidentLifecycleTransitionRecord.tenant_id == audit.tenant_id,
+        IncidentLifecycleTransitionRecord.incident_id == incident_id,
+        IncidentLifecycleTransitionRecord.idempotency_key == idempotency_key,
+    ))
+    if existing_transition is not None:
         return
-    if projection.lifecycle_state == "EXECUTING":
+    if projection.lifecycle_state == "CLOSED":
+        prior_projection = (audit.payload.get("binding") or {}).get("projection_lifecycle")
+        if not isinstance(prior_projection, dict):
+            raise HTTPException(409, "Pre-closure lifecycle snapshot is missing")
+        previous = str(prior_projection.get("state") or "").strip().upper()
+        try:
+            previous_version = int(prior_projection["version"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(409, "Pre-closure lifecycle version is invalid") from exc
+        if (not previous or previous == "CLOSED"
+                or int(projection.lifecycle_version or 1) not in {previous_version, previous_version + 1}):
+            raise HTTPException(409, "Closed lifecycle does not match the assessed projection")
+    else:
+        previous = projection.lifecycle_state
+        previous_version = int(projection.lifecycle_version or 1)
+    if previous == "EXECUTING":
         raise HTTPException(409, "Executing lifecycle cannot be superseded by observed recovery")
-    previous = projection.lifecycle_state
     reason = "Recovery independently verified after operator-attested repair; no corrective execution performed."
     transition = IncidentLifecycleTransitionRecord(tenant_id=audit.tenant_id, incident_id=incident_id,
-        sequence_no=projection.lifecycle_version, previous_state=previous, new_state="CLOSED",
-        actor=audit.actor, reason=reason, idempotency_key=f"observed-recovery:{assessment_id}")
+        sequence_no=previous_version, previous_state=previous, new_state="CLOSED",
+        actor=audit.actor, reason=reason, idempotency_key=idempotency_key)
     session.add(transition)
     await session.flush()
     projection.lifecycle_state = "CLOSED"
-    projection.lifecycle_version += 1
+    projection.lifecycle_version = previous_version + 1
     projection.lifecycle_failure_code = None
     projection.lifecycle_failure_reason = None
     payload = {"schema_version": "kaiops.incident-lifecycle.v1", "transition_id": str(transition.transition_id),

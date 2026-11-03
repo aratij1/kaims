@@ -112,6 +112,9 @@ async def test_real_range_contract_closes_atomically_without_corrective_executio
     assert all(s["assessment_id"] == aid and "execution_id" not in s for s in samples)
     retry = await c.client.post(f"{c.base}/{aid}/evaluate", json=c.identity)
     assert retry.json()["report_id"] == str(report.id)
+    async with c.factory() as session:
+        transitions = (await session.execute(select(IncidentLifecycleTransitionRecord))).scalars().all()
+        assert len(transitions) == 1
 
 
 @pytest.mark.asyncio

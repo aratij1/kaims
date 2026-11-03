@@ -9,11 +9,13 @@ from remediation_engine import RemediationEngine
 
 
 def _approved_rollback() -> Approval:
+    expiry = datetime(2099, 1, 1, tzinfo=UTC)
     plan = {
         "schema_version": "kaims.execution-plan.v2",
         "tenant_id": "tenant-a",
         "incident_id": "11111111-1111-1111-1111-111111111111",
         "plan_id": "33333333-3333-3333-3333-333333333333",
+        "expiry": expiry.isoformat(),
         "actions": [{
             "action_id": "rollback_deployment",
             "connector_id": "jenkins",
@@ -49,7 +51,7 @@ def _approved_rollback() -> Approval:
         recommendation_id="22222222-2222-2222-2222-222222222222",
         plan_id=plan["plan_id"],
         plan_fingerprint=plan["plan_fingerprint"],
-        approval_expires_at=datetime(2099, 1, 1, tzinfo=UTC),
+        approval_expires_at=expiry,
         decision=ApprovalDecision.APPROVED,
         approver="sre@example.com",
         comment="Rollback deployment",

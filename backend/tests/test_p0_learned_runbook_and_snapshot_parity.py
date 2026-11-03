@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import importlib.util
-from pathlib import Path
 import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
@@ -20,6 +20,7 @@ for rel in (
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
+import common.outbox_context as outbox_context
 from ai_workbench_common.models import Context
 from common.config import get_settings
 from common.database import (
@@ -30,8 +31,8 @@ from common.database import (
     RunbookRecord,
     RunbookVersionRecord,
 )
-from common.models import Alert, AlertSeverity as Severity, Incident, Recommendation
-import common.outbox_context as outbox_context
+from common.models import Alert, Incident, Recommendation
+from common.models import AlertSeverity as Severity
 from common.outbox_context import (
     CONTEXT_TOPICS,
     REFERENCE_VERSION,
@@ -160,7 +161,7 @@ async def _create_and_approve_knowledge_runbook(
         title=draft["title"],
         content=draft["content"],
         review_notes="Verified remediation and rollback steps.",
-        reviewed_by=approved_by,
+        reviewed_by=f"reviewer-{approved_by}",
     )
     await repo.approve_knowledge_rag_draft(
         tenant_id=tenant_id,
@@ -282,6 +283,7 @@ async def test_p0a_approve_runbook_version_creates_approval_and_parent_runbook(
             runbook_id=str(rb_id),
             version=2,
             approved_by="gov-approver",
+            payload={"reviewed_by": "independent-reviewer"},
         )
         await session.commit()
         assert res["status"] == "approved"
@@ -1275,4 +1277,3 @@ async def test_p0b_context_events_compaction_and_mutation_rejection_preserved(
         # compact_context refuses to emit a mismatched context_ref when checksum != snapshot checksum
         assert "context_ref" not in compacted_after_mutation
         assert compacted_after_mutation["context"] == mutated_ctx
-

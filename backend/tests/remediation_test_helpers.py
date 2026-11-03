@@ -132,6 +132,7 @@ def governed_approval(**kwargs: Any) -> ApprovalModel:
         or incident_id
     )
     connector_id = str(plan.get("connector_id") or "test-connector")
+    plan.setdefault("expiry", datetime(2099, 1, 1, tzinfo=UTC).isoformat())
     plan = {
         **plan,
         "rca_version": str(plan.get("rca_version") or recommendation_id or "rca-test-v1"),

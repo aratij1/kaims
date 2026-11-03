@@ -1,9 +1,12 @@
 import importlib.util
 import sys
 from pathlib import Path
+from uuid import UUID, uuid4
 
 import pytest
+from common.database import ApprovalRecord, IncidentRecord
 from common.orchestration.execution_plan_contract import canonical_plan_fingerprint
+from sqlalchemy import select
 from starlette.requests import Request
 
 
@@ -165,6 +168,7 @@ def test_approval_readiness_is_backend_signed_only_when_every_gate_passes() -> N
         "rollback_commands": ["governed:rollback-deployment"],
         "rollback_mode": "automatic",
         "policy_decision": {"decision": "allow"},
+        "expiry": "2099-01-01T00:00:00+00:00",
     }
     plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
     context = module._build_incident_context({
@@ -347,6 +351,9 @@ async def test_approval_submission_updates_ticket_projection_status(monkeypatch:
         def __init__(self, session):
             self.session = session
 
+        async def conflicting_terminal_approval_decision(self, approval):
+            return None
+
         async def save_approval(self, approval):
             calls.append(("save_approval", str(approval.incident_id)))
 
@@ -409,6 +416,9 @@ async def test_approval_submission_resolves_missing_recommendation_id(monkeypatc
     class _FakeRepo:
         def __init__(self, session):
             self.session = session
+
+        async def conflicting_terminal_approval_decision(self, approval):
+            return None
 
         async def get_latest_recommendation_for_incident(self, requested_incident_id, *, tenant_id=None):
             calls.append(("get_recommendation", str(requested_incident_id)))
@@ -474,11 +484,13 @@ async def test_approval_submission_resolves_missing_recommendation_id(monkeypatc
         ("tenant-b", "33333333-3333-3333-3333-333333333333", None, 404),
         ("tenant-a", "44444444-4444-4444-4444-444444444444", None, 409),
         ("tenant-a", "33333333-3333-3333-3333-333333333333", "sha256:" + "f" * 64, 409),
+        ("tenant-a", "33333333-3333-3333-3333-333333333333", None, 409),
+        ("tenant-a", None, "sha256:" + "a" * 64, 409),
     ],
 )
 async def test_approval_rejects_cross_tenant_or_changed_plan(
     tenant_id: str,
-    plan_id: str,
+    plan_id: str | None,
     fingerprint: str | None,
     status_code: int,
 ) -> None:
@@ -491,7 +503,7 @@ async def test_approval_rejects_cross_tenant_or_changed_plan(
         recommendation_id=recommendation_id,
         tenant_id=tenant_id,
         plan_id=plan_id,
-        plan_fingerprint=fingerprint or plan["plan_fingerprint"],
+        plan_fingerprint=fingerprint,
         approver="l2.engineer",
     )
 
@@ -499,6 +511,57 @@ async def test_approval_rejects_cross_tenant_or_changed_plan(
         await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
 
     assert exc_info.value.status_code == status_code
+
+
+@pytest.mark.asyncio
+async def test_mismatched_fingerprint_does_not_persist_or_publish_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = load_approval_app_module()
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    recommendation_id = "22222222-2222-2222-2222-222222222222"
+    plan = _set_pending_plan(module, incident_id, recommendation_id)
+    persisted = []
+
+    async def record_approval(approval):
+        persisted.append(approval)
+
+    monkeypatch.setattr(module, "_store_and_publish", record_approval)
+    request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        tenant_id="tenant-a",
+        plan_id=plan["plan_id"],
+        plan_fingerprint="sha256:" + "f" * 64,
+        approver="l2.engineer",
+    )
+
+    with pytest.raises(module.HTTPException, match="plan_fingerprint"):
+        await module.approve(request)
+
+    assert persisted == []
+
+
+@pytest.mark.asyncio
+async def test_stale_fingerprint_for_same_plan_id_cannot_approve_changed_command() -> None:
+    module = load_approval_app_module()
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    recommendation_id = "22222222-2222-2222-2222-222222222222"
+    plan = _set_pending_plan(module, incident_id, recommendation_id)
+    reviewed_fingerprint = plan["plan_fingerprint"]
+    plan["commands"] = ["kubectl rollout restart deployment/payments --record=false"]
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        tenant_id="tenant-a",
+        plan_id=plan["plan_id"],
+        plan_fingerprint=reviewed_fingerprint,
+        approver="l2.engineer",
+    )
+
+    with pytest.raises(module.HTTPException, match="plan_fingerprint"):
+        await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
 
 
 @pytest.mark.asyncio
@@ -530,6 +593,121 @@ async def test_approval_rejects_stale_recommendation_and_records_exact_governanc
     assert approval.metadata["target_resource_id"] == plan["target_resource_id"]
     assert approval.metadata["connector_id"] == plan["connector_id"]
     assert approval.metadata["rollback_plan"] == plan["rollback_commands"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expiry", ["2099-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00"])
+async def test_rejection_binds_canonical_plan_even_when_plan_is_expired(expiry: str) -> None:
+    module = load_approval_app_module()
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    recommendation_id = "22222222-2222-2222-2222-222222222222"
+    plan = _set_pending_plan(module, incident_id, recommendation_id)
+    plan["expiry"] = expiry
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        tenant_id="tenant-a",
+        plan_id=plan["plan_id"],
+        plan_fingerprint=plan["plan_fingerprint"],
+        approver="l2.engineer",
+        comment="Reject this exact plan.",
+    )
+
+    approval = await module._approval_from_request(request, module.ApprovalDecision.REJECTED)
+
+    assert approval.decision == module.ApprovalDecision.REJECTED
+    assert str(approval.plan_id) == plan["plan_id"]
+    assert approval.plan_fingerprint == plan["plan_fingerprint"]
+    assert approval.approval_expires_at.isoformat() == expiry
+    assert approval.metadata["decision_plan_binding"]["status"] == "bound"
+
+
+@pytest.mark.asyncio
+async def test_rejection_rejects_stale_plan_fingerprint() -> None:
+    module = load_approval_app_module()
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    recommendation_id = "22222222-2222-2222-2222-222222222222"
+    plan = _set_pending_plan(module, incident_id, recommendation_id)
+    request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        tenant_id="tenant-a",
+        plan_id=plan["plan_id"],
+        plan_fingerprint="sha256:" + "f" * 64,
+        approver="l2.engineer",
+    )
+
+    with pytest.raises(module.HTTPException, match="must match"):
+        await module._approval_from_request(request, module.ApprovalDecision.REJECTED)
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_conflicting_terminal_decisions_for_same_plan(sqlite_session_factory, monkeypatch) -> None:
+    module = load_approval_app_module()
+    incident_id = UUID("11111111-1111-1111-1111-111111111111")
+    recommendation_id = UUID("22222222-2222-2222-2222-222222222222")
+    plan_id = UUID("33333333-3333-3333-3333-333333333333")
+    fingerprint = "sha256:" + "a" * 64
+    async with sqlite_session_factory() as session:
+        session.add(IncidentRecord(
+            id=incident_id,
+            tenant_id="tenant-a",
+            service="payments",
+            environment="prod",
+            severity="high",
+            status="awaiting_approval",
+            title="Payments unavailable",
+            payload={},
+        ))
+        session.add(ApprovalRecord(
+            id=uuid4(),
+            tenant_id="tenant-a",
+            incident_id=incident_id,
+            recommendation_id=recommendation_id,
+            plan_id=plan_id,
+            plan_fingerprint=fingerprint,
+            approval_expires_at=None,
+            approver_role="hitl-reviewer",
+            decision="approved",
+            approver="reviewer-a",
+            payload={},
+        ))
+        await session.commit()
+
+    monkeypatch.setattr(module.settings, "database_enabled", True)
+    module.app.state.session_factory = sqlite_session_factory
+    rejected = module.Approval(
+        tenant_id="tenant-a",
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        plan_id=plan_id,
+        plan_fingerprint=fingerprint,
+        decision=module.ApprovalDecision.REJECTED,
+        approver="reviewer-b",
+    )
+    cache_key = module._pending_key("tenant-a", incident_id)
+    prior_cache_entry = {
+        "recommendation": {"id": str(recommendation_id)},
+        "decision": {"decision": "approved"},
+        "approval": {"decision": "approved", "approver": "reviewer-a"},
+    }
+    module.PENDING_INCIDENTS[cache_key] = prior_cache_entry.copy()
+
+    with pytest.raises(module.HTTPException, match="conflicting terminal decision") as error:
+        await module._store_and_publish(rejected)
+
+    assert error.value.status_code == 409
+    assert module.PENDING_INCIDENTS[cache_key] == prior_cache_entry
+    async with sqlite_session_factory() as session:
+        decisions = (await session.execute(
+            select(ApprovalRecord.decision).where(
+                ApprovalRecord.tenant_id == "tenant-a",
+                ApprovalRecord.incident_id == incident_id,
+                ApprovalRecord.plan_id == plan_id,
+            )
+        )).scalars().all()
+    assert decisions == ["approved"]
 
 
 @pytest.mark.asyncio
@@ -639,6 +817,52 @@ async def test_approval_rejects_expired_plan() -> None:
     with pytest.raises(module.HTTPException, match="expired"):
         await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expiry", [None, "not-a-timestamp"])
+async def test_approval_rejects_missing_or_malformed_plan_expiry(expiry: str | None) -> None:
+    module = load_approval_app_module()
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    recommendation_id = "22222222-2222-2222-2222-222222222222"
+    plan = _set_pending_plan(module, incident_id, recommendation_id)
+    if expiry is None:
+        plan.pop("expiry")
+    else:
+        plan["expiry"] = expiry
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        tenant_id="tenant-a",
+        plan_id=plan["plan_id"],
+        plan_fingerprint=plan["plan_fingerprint"],
+        approver="l2.engineer",
+    )
+
+    with pytest.raises(module.HTTPException, match="expiry is missing or invalid"):
+        await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
+
+
+@pytest.mark.asyncio
+async def test_approval_rejects_naive_plan_expiry() -> None:
+    module = load_approval_app_module()
+    incident_id = "11111111-1111-1111-1111-111111111111"
+    recommendation_id = "22222222-2222-2222-2222-222222222222"
+    plan = _set_pending_plan(module, incident_id, recommendation_id)
+    plan["expiry"] = "2099-01-01T00:00:00"
+    plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
+    request = module.ApprovalRequest(
+        incident_id=incident_id,
+        recommendation_id=recommendation_id,
+        tenant_id="tenant-a",
+        plan_id=plan["plan_id"],
+        plan_fingerprint=plan["plan_fingerprint"],
+        approver="l2.engineer",
+    )
+
+    with pytest.raises(module.HTTPException, match="timezone-aware"):
+        await module._approval_from_request(request, module.ApprovalDecision.APPROVED)
+
 @pytest.mark.asyncio
 async def test_durable_context_does_not_sign_eligible_for_unpersisted_plan(monkeypatch):
     from uuid import UUID
@@ -657,6 +881,8 @@ async def test_durable_context_does_not_sign_eligible_for_unpersisted_plan(monke
             return {'id': incident_id, 'tenant_id': 'tenant-a'}
         async def get_latest_recommendation_for_incident(self, *args, **kwargs):
             return recommendation
+        async def get_bound_incident_investigation(self, *args, **kwargs):
+            return None
         async def get_current_execution_plan_for_incident(self, **kwargs): return None
         async def get_pending_workflow(self, *args): return None
     module.app.state.session_factory = Session

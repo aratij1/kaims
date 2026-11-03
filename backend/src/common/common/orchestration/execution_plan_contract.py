@@ -122,6 +122,13 @@ class ExecutionPlanV2(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    @field_validator("expiry")
+    @classmethod
+    def expiry_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("execution plan expiry must be timezone-aware")
+        return value
+
     schema_version: Literal["kaims.execution-plan.v2"] = SCHEMA_VERSION
     version: Literal["execution-plan-v2"] = "execution-plan-v2"
     plan_id: UUID
@@ -274,3 +281,26 @@ def verify_plan_fingerprint(plan: dict[str, Any]) -> bool:
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def require_unexpired_plan_expiry(
+    plan: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    raw_expiry = plan.get("expiry")
+    if not raw_expiry:
+        raise ValueError("execution plan expiry is missing or invalid")
+    try:
+        expiry = (
+            raw_expiry
+            if isinstance(raw_expiry, datetime)
+            else datetime.fromisoformat(str(raw_expiry).replace("Z", "+00:00"))
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("execution plan expiry is missing or invalid") from exc
+    if expiry.tzinfo is None or expiry.utcoffset() is None:
+        raise ValueError("execution plan expiry must be timezone-aware")
+    if expiry.astimezone(UTC) <= (now or utc_now()):
+        raise ValueError("execution plan has expired")
+    return expiry.astimezone(UTC)

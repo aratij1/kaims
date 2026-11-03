@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import importlib.util
-from pathlib import Path
 import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import event, select
+from fastapi.testclient import TestClient
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,37 +26,32 @@ for rel in (
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-from ai_workbench_common.models import Context
-from closure_service.validation import ClosureValidationAgent
-from common.database import (
-    AuditLogRecord,
+from ai_workbench_common.models import Context  # noqa: E402
+from closure_service.validation import ClosureValidationAgent  # noqa: E402
+from common.database import (  # noqa: E402
     Base,
-    CanonicalEvidenceRecord,
-    ContextEvidenceRequirementRecord,
     ContextSnapshotRecord,
     GovernedRagDocumentRecord,
     HumanEvidenceRequestRecord,
     IncidentProjectionRecord,
     IncidentRecord,
     KnowledgeRagDraftRecord,
-    ResolutionOutboxRecord,
     RunbookVersionRecord,
 )
-from common.models import (
+from common.models import (  # noqa: E402
     Alert,
     AlertSeverity,
-    ApprovalDecision,
     Incident,
     RemediationAction,
     RemediationStatus,
 )
-from common.orchestration.execution_plan_contract import (
+from common.orchestration.execution_plan import resolve_execution_plan  # noqa: E402
+from common.orchestration.execution_plan_contract import (  # noqa: E402
     canonical_plan_fingerprint,
-    resolve_execution_plan,
     verify_plan_fingerprint,
 )
-from common.repository import ContextEnrichmentRepository, IncidentRepository
-from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert
+from common.repository import ContextEnrichmentRepository, IncidentRepository  # noqa: E402
+from monitoring_adapter.landing_pad_normalizer import normalize_landing_pad_alert  # noqa: E402
 
 
 def _load_module(name: str, rel_path: str):
@@ -161,8 +156,12 @@ def _test_observer_profile(service: str = "orders-db", tenant_id: str = "tenant-
 # ============================================================================
 
 
-def test_case_d_jira_webhook_routing_auth_and_generic_provider_isolation(monkeypatch) -> None:
+def test_case_d_jira_webhook_routing_auth_and_generic_provider_isolation(
+    session_factory, monkeypatch
+) -> None:
     monkeypatch.setattr(monitoring_app_module, "JIRA_WEBHOOK_SECRET", "test-jira-secret-999")
+    monitoring_app_module.settings.database_enabled = True
+    monitoring_app_module.app.state.session_factory = session_factory
     processed_events: list[tuple[dict, str | None]] = []
 
     async def _fake_process_jira(payload: dict, trace_id: str | None) -> None:
@@ -184,7 +183,7 @@ def test_case_d_jira_webhook_routing_auth_and_generic_provider_isolation(monkeyp
         },
     }
 
-    # 1. Missing webhook token on POST /api/v1/alerts/jira must return 401 (NOT 202 quarantined from /{provider})
+    # 1. Missing webhook token on POST /api/v1/alerts/jira must return 401 (NOT quarantined from /{provider})
     resp_missing = client.post("/api/v1/alerts/jira", json=jira_payload)
     assert resp_missing.status_code == 401
     assert "Jira webhook token" in resp_missing.json()["detail"]
@@ -222,13 +221,14 @@ def test_case_d_jira_webhook_routing_auth_and_generic_provider_isolation(monkeyp
     assert resp_tickets.json()["ticket_id"] == "OPS-404"
     assert len(processed_events) == 2
 
-    # 5. Unregistered generic provider webhook on POST /api/v1/alerts/{provider} remains quarantined (202)
+    # 5. Unregistered generic provider webhook on POST /api/v1/alerts/{provider} remains quarantined
     resp_generic = client.post(
         "/api/v1/alerts/datadog",
         json={"title": "Datadog synthetic alert", "service": "orders-db"},
     )
-    assert resp_generic.status_code == 202
+    assert resp_generic.status_code == 200
     assert resp_generic.json()["status"] == "quarantined"
+    assert resp_generic.json()["provider"] == "datadog"
 
 
 # ============================================================================
@@ -238,7 +238,7 @@ def test_case_d_jira_webhook_routing_auth_and_generic_provider_isolation(monkeyp
 
 @pytest.mark.asyncio
 async def test_case_a_known_runbook_governed_plan_and_approval_enforcement(
-    session_factory, monkeypatch
+    session_factory, monkeypatch, clear_execution_catalog_cache
 ) -> None:
     tenant_id = "tenant-qual-a"
     service = "orders-db"
@@ -267,7 +267,12 @@ async def test_case_a_known_runbook_governed_plan_and_approval_enforcement(
                 "## Rollback\n"
                 "`kubectl rollout undo deployment/orders-db-replica -n test`\n"
             ),
-            metadata={"service": service, "alert_name": alert_name, "environment": "test"},
+            metadata={
+                "service": service,
+                "alert_name": alert_name,
+                "environment": "test",
+                "approval_expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+            },
         )
         reviewed = await repo.review_knowledge_rag_draft(
             tenant_id=tenant_id,
@@ -311,56 +316,63 @@ async def test_case_a_known_runbook_governed_plan_and_approval_enforcement(
         assert gov["status"] == "approved"
         runbook_checksum = gov["payload"]["checksum_sha256"]
 
-    # Verify missing recovery observer produces manual_only / non-executable plan
-    plan_without_observer = resolve_execution_plan(
-        recommended_action="Restart orders-db-replica deployment",
-        commands=["kubectl rollout restart deployment/orders-db-replica -n test"],
-        scripts=[],
-        queries=[],
-        runbook_text="kubectl rollout restart deployment/orders-db-replica -n test",
+    # Verify missing recovery observer in recovery-observers.json produces non-executable / blocked plan
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv(
+        "RECOVERY_OBSERVER_REGISTRY_PATH",
+        str(ROOT / "backend/config/recovery-observers.json"),
+    )
+    alert_unregistered = Alert(
+        id=uuid4(),
+        tenant_id=tenant_id,
+        source="prometheus",
+        name=alert_name,
+        description="Replica lag > 30s on orders-db",
         service=service,
         environment="test",
-        tenant_id=tenant_id,
-        incident_id=str(uuid4()),
-        rca_version="1",
-        evidence_snapshot_id=str(uuid4()),
-        recommendation_version="1",
-        runbook_governance_id=str(rb_id),
-        playbook_version=1,
-        runbook_checksum=runbook_checksum,
-        observer_registry={"observers": []},
+        severity=AlertSeverity.CRITICAL,
     )
+    plan_without_observer = resolve_execution_plan(
+        alert=alert_unregistered,
+        workflow_name="orders-db-remediation",
+        requires_approval=True,
+        risk_tier="medium",
+        execution_mode="governed",
+        resolution_hints="kubectl rollout restart deployment/orders-db-replica -n test",
+        evidence_basis=["ev-orders-db-1"],
+        incident_id=uuid4(),
+        root_cause="Read replica apply thread stalled",
+        confidence=0.91,
+    )
+    assert plan_without_observer["schema_version"] == "kaims.execution-plan.v2"
     assert plan_without_observer["execution_ready"] is False
     assert verify_plan_fingerprint(plan_without_observer) is True
 
-    # Verify test observer profile produces valid governed v2 execution plan
-    observer_profile = _test_observer_profile(service=service, tenant_id=tenant_id)
+    # Verify registered recovery observer profile produces valid governed v2 execution plan with validators
+    alert_registered = Alert(
+        id=uuid4(),
+        tenant_id="default",
+        source="prometheus",
+        name="KaiOpsServiceDown",
+        description="api-gateway service is down",
+        service="api-gateway",
+        environment="prod",
+        severity=AlertSeverity.CRITICAL,
+    )
     governed_plan = resolve_execution_plan(
-        recommended_action="Restart orders-db-replica deployment",
-        commands=["kubectl rollout restart deployment/orders-db-replica -n test"],
-        scripts=[],
-        queries=[],
-        runbook_text="kubectl rollout restart deployment/orders-db-replica -n test",
-        service=service,
-        environment="test",
-        tenant_id=tenant_id,
-        incident_id=str(uuid4()),
-        rca_version="1",
-        evidence_snapshot_id=str(uuid4()),
-        recommendation_version="1",
-        runbook_governance_id=str(rb_id),
-        playbook_version=1,
-        runbook_checksum=runbook_checksum,
-        connection_profile={
-            "service": service,
-            "environment": "test",
-            "executor_type": "kubernetes",
-            "connector_id": "k8s-test-connector",
-            "credential_ref": "vault://kaiops/test/k8s#token",
-        },
-        observer_registry={"observers": [observer_profile]},
+        alert=alert_registered,
+        workflow_name="api-gateway-remediation",
+        requires_approval=True,
+        risk_tier="medium",
+        execution_mode="governed",
+        resolution_hints="Restart api-gateway service",
+        evidence_basis=["ev-api-gateway-1"],
+        incident_id=uuid4(),
+        root_cause="Container unresponsive",
+        confidence=0.95,
     )
     assert governed_plan["schema_version"] == "kaims.execution-plan.v2"
+    assert len(governed_plan["validators"]) >= 1
     assert verify_plan_fingerprint(governed_plan) is True
 
     # Verify _resolution_requires_approval defaults to True (human approval preserved)
@@ -387,6 +399,88 @@ async def test_case_a_known_runbook_governed_plan_and_approval_enforcement(
     approval_obj.metadata["execution_plan"]["runbook_checksum"] = "sha256:tampered"
     with pytest.raises(remediation_app_module.PolicyViolation, match="checksum"):
         await remediation_app_module._require_persisted_approved_runbook(approval_obj)
+
+    # Verify missing, naive (non-timezone-aware), and expired approval_expires_at are blocked
+    async with session_factory() as session:
+        repo = IncidentRepository(session)
+        rb_missing_exp = uuid4()
+        await repo.approve_runbook_version(
+            runbook_id=str(rb_missing_exp),
+            version=1,
+            approved_by="approver@kaims.local",
+            tenant_id=tenant_id,
+            payload={"checksum_sha256": "sha256:valid-1", "reviewed_by": "independent-reviewer"},
+        )
+        rb_naive_exp = uuid4()
+        await repo.approve_runbook_version(
+            runbook_id=str(rb_naive_exp),
+            version=1,
+            approved_by="approver@kaims.local",
+            tenant_id=tenant_id,
+            payload={
+                "checksum_sha256": "sha256:valid-2",
+                "approval_expires_at": "2099-01-01T00:00:00",
+                "reviewed_by": "independent-reviewer",
+            },
+        )
+        rb_alt_checksum = uuid4()
+        await repo.approve_runbook_version(
+            runbook_id=str(rb_alt_checksum),
+            version=1,
+            approved_by="approver@kaims.local",
+            tenant_id=tenant_id,
+            payload={
+                "checksum": "sha256:alternate-field-only",
+                "approval_expires_at": "2099-01-01T00:00:00+00:00",
+                "reviewed_by": "independent-reviewer",
+            },
+        )
+        await session.commit()
+
+    with pytest.raises(remediation_app_module.PolicyViolation, match="expiry is missing"):
+        await remediation_app_module._require_persisted_approved_runbook(
+            SimpleNamespace(
+                tenant_id=tenant_id,
+                approver_role="HITL_APPROVER",
+                metadata={
+                    "execution_plan": {
+                        "runbook_governance_id": str(rb_missing_exp),
+                        "playbook_version": 1,
+                        "runbook_checksum": "sha256:valid-1",
+                    }
+                },
+            )
+        )
+
+    with pytest.raises(remediation_app_module.PolicyViolation, match="timezone-aware"):
+        await remediation_app_module._require_persisted_approved_runbook(
+            SimpleNamespace(
+                tenant_id=tenant_id,
+                approver_role="HITL_APPROVER",
+                metadata={
+                    "execution_plan": {
+                        "runbook_governance_id": str(rb_naive_exp),
+                        "playbook_version": 1,
+                        "runbook_checksum": "sha256:valid-2",
+                    }
+                },
+            )
+        )
+
+    with pytest.raises(remediation_app_module.PolicyViolation, match="checksum"):
+        await remediation_app_module._require_persisted_approved_runbook(
+            SimpleNamespace(
+                tenant_id=tenant_id,
+                approver_role="HITL_APPROVER",
+                metadata={
+                    "execution_plan": {
+                        "runbook_governance_id": str(rb_alt_checksum),
+                        "playbook_version": 1,
+                        "runbook_checksum": "sha256:alternate-field-only",
+                    }
+                },
+            )
+        )
 
 
 # ============================================================================
@@ -419,9 +513,8 @@ async def test_case_b_unknown_runbook_human_input_draft_review_and_separation_of
         incident_id=incident_id,
         alert=alert,
         runbook="",
-        logs=["ERROR shard 4 settlement cursor lock timeout after 30000ms"],
-        metrics={"cursor_lag_seconds": 940.0},
         metadata={
+            "analysis_request_id": str(uuid4()),
             "context_snapshot_id": str(snapshot_id),
             "context_fingerprint": "b" * 64,
             "context_subject_fingerprint": f"subj-{service}",
@@ -519,7 +612,7 @@ async def test_case_b_unknown_runbook_human_input_draft_review_and_separation_of
         ops_state = await enrichment_repo.incident_operations_state(
             tenant_id=tenant_id, incident_id=incident_id
         )
-        assert ops_state["lifecycle_state"] == "WAITING_FOR_HUMAN"
+        assert ops_state["lifecycle_state"] == "COLLECTING"
         reqs = await enrichment_repo.list_context_evidence_requirements(
             tenant_id=tenant_id, incident_id=incident_id
         )
@@ -536,10 +629,19 @@ async def test_case_b_unknown_runbook_human_input_draft_review_and_separation_of
                 "responder_id": "oncall-1@kaims.local",
                 "responded_at": datetime.now(UTC).isoformat(),
                 "observed_symptoms": "Cursor lock contention on shard 4.",
+                "remediation_steps": "1. `kubectl rollout restart deployment/payment-settlement-worker -n test`",
+                "create_runbook_draft": False,
             },
         )
         assert no_draft_res["knowledge_draft_id"] is None
         assert no_draft_res["runbook_status"] is None
+
+        # Reset the request status to pending so we can test submitting WITH create_runbook_draft=True
+        req_record = await session.get(HumanEvidenceRequestRecord, UUID(str(no_draft_res["request_id"])))
+        assert req_record is not None
+        req_record.status = "pending"
+        req_record.response_payload = {}
+        await session.flush()
 
         # 2. Human response WITH create_runbook_draft=True creates a DRAFT (not auto-approved!)
         draft_res = await enrichment_repo.record_human_evidence_response(
@@ -553,7 +655,15 @@ async def test_case_b_unknown_runbook_human_input_draft_review_and_separation_of
                 "observed_symptoms": "Shard 4 cursor lock held by orphaned worker pod.",
                 "root_cause": "Orphaned worker pod held advisory lock after network partition.",
                 "business_impact": "Settlement batch completion delayed by 15 minutes.",
-                "remediation_steps": "1. `kubectl rollout restart deployment/payment-settlement-worker -n test`",
+                "remediation_steps": (
+                    "1. `kubectl rollout restart deployment/payment-settlement-worker -n test`\n"
+                    "2) `kubectl rollout status deployment/payment-settlement-worker -n test --timeout=120s`\n"
+                    "+ `curl -fsS http://payment-settlement-worker.test.svc/healthz`\n"
+                    "- `kubectl rollout restart deployment/payment-settlement-worker -n test; rm -rf /`\n"
+                    "* `kubectl rollout restart deployment/payment-settlement-worker -n test && id`\n"
+                    "3. `kubectl rollout restart deployment/payment-settlement-worker -n test | cat`\n"
+                    "4. `kubectl rollout restart deployment/$(whoami) -n test`\n"
+                ),
                 "create_runbook_draft": True,
             },
         )
@@ -561,13 +671,37 @@ async def test_case_b_unknown_runbook_human_input_draft_review_and_separation_of
 
         assert draft_res["knowledge_draft_id"] is not None
         assert draft_res["runbook_status"] == "draft"
-        assert draft_res["governed_document_id"] is None
+        assert draft_res.get("governed_document") is None
+        assert draft_res.get("governed_document_id") is None
 
         draft_uuid = UUID(str(draft_res["knowledge_draft_id"]))
         draft_row = await session.get(KnowledgeRagDraftRecord, draft_uuid)
         assert draft_row is not None
         assert draft_row.status == "draft"
         assert draft_row.row_version == 1
+
+        # Verify draft RunbookVersionRecord is persisted as 'draft' (not 'approved') before review/approval
+        draft_rb_id = uuid5(NAMESPACE_URL, f"kaiops:runbook:{tenant_id}:{draft_row.source_ref}")
+        draft_rb_row = await session.get(RunbookVersionRecord, (draft_rb_id, 1))
+        assert draft_rb_row is not None
+        assert draft_rb_row.approval_status == "draft"
+        assert draft_rb_row.content.get("approval_status") == "draft"
+
+        # Verify human-guided remediation command normalization and shell-injection rejection
+        enriched_snap = await session.get(ContextSnapshotRecord, UUID(str(draft_res["context_snapshot_id"])))
+        assert enriched_snap is not None
+        resumed_ctx = Context.model_validate(enriched_snap.payload)
+        resumed_rec = await resolution_app_module._resolve_context(resumed_ctx)
+        assert "kubectl rollout restart deployment/payment-settlement-worker -n test" in resumed_rec.commands
+        assert (
+            "kubectl rollout status deployment/payment-settlement-worker -n test --timeout=120s"
+            in resumed_rec.commands
+        )
+        assert "curl -fsS http://payment-settlement-worker.test.svc/healthz" in resumed_rec.commands
+        assert not any(
+            any(tok in cmd for tok in (";", "&&", "|", "$(", "rm -rf"))
+            for cmd in resumed_rec.commands
+        )
 
         inc_repo = IncidentRepository(session)
         # 3. Direct approval before review is blocked
@@ -579,13 +713,14 @@ async def test_case_b_unknown_runbook_human_input_draft_review_and_separation_of
                 approved_by="approver@kaims.local",
             )
 
-        # 4. Review transitions status to 'reviewed' and increments row_version to 2
+        # 4. Review transitions status to 'reviewed', updates content, and increments row_version to 2
+        reviewed_markdown = draft_row.content + "\n<!-- reviewed by SRE -->\n"
         reviewed = await inc_repo.review_knowledge_rag_draft(
             tenant_id=tenant_id,
             draft_id=draft_uuid,
             expected_row_version=1,
             title=draft_row.title,
-            content=draft_row.content,
+            content=reviewed_markdown,
             review_notes="Verified remediation commands for payment-settlement-worker",
             reviewed_by="sre-reviewer@kaims.local",
         )
@@ -599,7 +734,7 @@ async def test_case_b_unknown_runbook_human_input_draft_review_and_separation_of
             draft_id=draft_uuid,
             expected_row_version=1,
             title=draft_row.title,
-            content=draft_row.content,
+            content=reviewed_markdown,
             review_notes="Stale review",
             reviewed_by="other@kaims.local",
         )
@@ -630,6 +765,10 @@ async def test_case_b_unknown_runbook_human_input_draft_review_and_separation_of
         assert doc_record is not None
         assert doc_record.review_status == "approved"
         assert doc_record.index_status == "pending"
+        approved_rb_row = await session.get(RunbookVersionRecord, (draft_rb_id, 1))
+        assert approved_rb_row is not None
+        assert approved_rb_row.approval_status == "approved"
+        assert approved_rb_row.content.get("checksum_sha256") == doc_record.content_checksum
 
 
 # ============================================================================
@@ -660,12 +799,49 @@ async def test_cases_c1_and_c2_failed_remediation_or_failed_recovery_never_close
     }
     plan["plan_fingerprint"] = canonical_plan_fingerprint(plan)
 
-    jira_calls: list[tuple] = []
+    jira_sync_outcomes: list[dict] = []
+    original_sync = closure_app_module._sync_closure_to_jira
 
     async def _spy_jira_sync(incident_payload, report):
-        jira_calls.append((incident_payload, report))
-        return {"synced": True}
+        res = await original_sync(incident_payload, report)
+        jira_sync_outcomes.append(res)
+        return res
 
+    jira_http_requests: list[tuple[str, str, dict | None]] = []
+
+    class _FakeJiraResponse:
+        status_code = 200
+
+        def __init__(self, data: dict | None = None):
+            self._data = data or {}
+
+        def json(self) -> dict:
+            return self._data
+
+    class _FakeJiraClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url: str, json: dict | None = None, **kwargs):
+            jira_http_requests.append(("POST", url, json))
+            return _FakeJiraResponse({"id": "1001"})
+
+        async def get(self, url: str, **kwargs):
+            jira_http_requests.append(("GET", url, None))
+            return _FakeJiraResponse({"transitions": [{"id": "31", "name": "Done"}]})
+
+    monkeypatch.setenv("JIRA_API_BASE_URL", "https://jira.example.test")
+    monkeypatch.setenv("JIRA_API_EMAIL", "bot@example.test")
+    monkeypatch.setenv("JIRA_API_TOKEN", "dummy-test-token")
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeJiraClient)
     monkeypatch.setattr(closure_app_module, "_sync_closure_to_jira", _spy_jira_sync)
     closure_app_module.settings.database_enabled = True
     closure_app_module.app.state.session_factory = session_factory
@@ -688,9 +864,11 @@ async def test_cases_c1_and_c2_failed_remediation_or_failed_recovery_never_close
                 status="remediating",
                 service=service,
                 environment="test",
+                ticket_id="OPS-C1",
                 payload={
                     "id": str(incident_c1),
                     "status": "remediating",
+                    "ticket_id": "OPS-C1",
                     "metadata": {"jira_issue_key": "OPS-C1"},
                 },
             )
@@ -724,7 +902,10 @@ async def test_cases_c1_and_c2_failed_remediation_or_failed_recovery_never_close
         inc_c1_row = await session.get(IncidentRecord, incident_c1)
         assert inc_c1_row is not None
         assert inc_c1_row.status != "closed"
-    assert jira_calls == []
+    assert len(jira_sync_outcomes) == 1
+    assert jira_sync_outcomes[0]["status"] == "validation_pending"
+    assert jira_sync_outcomes[0]["transitioned"] is False
+    assert not any("/transitions" in url for _, url, _ in jira_http_requests)
 
     # --- Case C2: Remediation SUCCEEDS, but independent recovery checks FAIL ---
     incident_c2 = uuid4()
@@ -738,9 +919,11 @@ async def test_cases_c1_and_c2_failed_remediation_or_failed_recovery_never_close
                 status="remediating",
                 service=service,
                 environment="test",
+                ticket_id="OPS-C2",
                 payload={
                     "id": str(incident_c2),
                     "status": "remediating",
+                    "ticket_id": "OPS-C2",
                     "metadata": {"jira_issue_key": "OPS-C2"},
                 },
             )
@@ -814,7 +997,10 @@ async def test_cases_c1_and_c2_failed_remediation_or_failed_recovery_never_close
         inc_c2_row = await session.get(IncidentRecord, incident_c2)
         assert inc_c2_row is not None
         assert inc_c2_row.status != "closed"
-    assert jira_calls == []
+    assert len(jira_sync_outcomes) == 2
+    assert jira_sync_outcomes[1]["status"] == "validation_pending"
+    assert jira_sync_outcomes[1]["transitioned"] is False
+    assert not any("/transitions" in url for _, url, _ in jira_http_requests)
 
 
 # ============================================================================
@@ -822,54 +1008,47 @@ async def test_cases_c1_and_c2_failed_remediation_or_failed_recovery_never_close
 # ============================================================================
 
 
-def test_cases_e_and_f_log_email_and_landing_pad_ingestion_qualification(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_cases_e_and_f_log_email_and_landing_pad_ingestion_qualification(monkeypatch) -> None:
     published_alerts: list[Alert] = []
 
     async def _capture_alert(alert: Alert) -> None:
         published_alerts.append(alert)
 
     monkeypatch.setattr(monitoring_app_module, "_publish_ingested_alert", _capture_alert)
-    client = TestClient(monitoring_app_module.app)
+    monkeypatch.setattr(monitoring_app_module, "CENTRALIZED_JIRA_ROUTING_ENABLED", False)
+    monkeypatch.setattr(monitoring_app_module, "EMAIL_JIRA_ROUTING_ENABLED", False)
+    monkeypatch.setattr(monitoring_app_module, "OPENSEARCH_LOG_JIRA_ROUTING_ENABLED", False)
+    monkeypatch.setattr(monitoring_app_module, "NONACTIONABLE_ALERT_PUBLISH_ENABLED", True)
 
-    # Case E: Log ingestion via POST /ingest/logs
-    log_resp = client.post(
-        "/ingest/logs",
-        json={
-            "records": [
-                {
-                    "timestamp": datetime.now(UTC).isoformat(),
-                    "service": "orders-db",
-                    "environment": "test",
-                    "level": "ERROR",
-                    "message": "FATAL deadlock detected in replication apply worker",
-                    "tenant_id": "tenant-qual-ef",
-                }
-            ]
-        },
-    )
-    assert log_resp.status_code == 200
-    log_body = log_resp.json()
-    assert log_body["received"] == 1
-    assert log_body["ingested"] == 1
+    # Case E: Log ingestion via _process_log_line (used by file-log & OpenSearch pollers)
+    log_record = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "service": "orders-db",
+        "environment": "test",
+        "level": "ERROR",
+        "line": "FATAL deadlock detected in replication apply worker",
+        "message": "FATAL deadlock detected in replication apply worker",
+        "tenant_id": "tenant-qual-ef",
+        "source_path": "opensearch://logs-orders-db/doc-1",
+    }
+    await monitoring_app_module._process_log_line(log_record)
     assert len(published_alerts) == 1
     assert published_alerts[0].service == "orders-db"
     assert published_alerts[0].severity in {AlertSeverity.HIGH, AlertSeverity.CRITICAL, AlertSeverity.WARNING}
 
-    # Case F1: Email ingestion via POST /ingest/email
-    email_resp = client.post(
-        "/ingest/email",
-        json={
-            "subject": "[CRITICAL] orders-db replication lag alert",
-            "sender": "alerts@monitoring.example.com",
-            "body": "Service: orders-db\nEnvironment: test\nSeverity: critical\nReplication lag is 48s.",
-            "service": "orders-db",
-            "environment": "test",
-            "severity": "critical",
-            "tenant_id": "tenant-qual-ef",
-        },
-    )
-    assert email_resp.status_code == 200
-    assert email_resp.json()["ingested"] is True
+    # Case F1: Email ingestion via _process_polled_email (used by IMAP email poller)
+    email_record = {
+        "message_id": "<alert-orders-db-001@monitoring.example.com>",
+        "subject": "[CRITICAL] orders-db replication lag alert",
+        "sender": "alerts@monitoring.example.com",
+        "body": "Service: orders-db\nEnvironment: test\nSeverity: critical\nReplication lag is 48s.",
+        "service": "orders-db",
+        "environment": "test",
+        "severity": "critical",
+        "tenant_id": "tenant-qual-ef",
+    }
+    await monitoring_app_module._process_polled_email(email_record)
     assert len(published_alerts) == 2
 
     # Case F2: Landing-pad normalization deterministic fingerprint & schema
@@ -882,9 +1061,16 @@ def test_cases_e_and_f_log_email_and_landing_pad_ingestion_qualification(monkeyp
         "description": "Replica lag exceeded 30s threshold",
         "labels": {"tenant_id": "tenant-qual-ef", "cluster": "test-cluster-1"},
     }
-    norm_1 = normalize_landing_pad_alert(raw_lp, file_name="test-lp-01.json")
-    norm_2 = normalize_landing_pad_alert(raw_lp, file_name="test-lp-01.json")
+    from monitoring_adapter.dedup import compute_fingerprint
+
+    norm_1 = normalize_landing_pad_alert(raw_lp, raw_lp)
+    norm_2 = normalize_landing_pad_alert(raw_lp, raw_lp)
     assert norm_1["service"] == "orders-db"
     assert norm_1["severity"] == "critical"
-    assert norm_1["labels"]["fingerprint"] == norm_2["labels"]["fingerprint"]
-    assert len(norm_1["labels"]["fingerprint"]) == 40
+    alert_1 = monitoring_app_module._build_alert_from_payload(norm_1)
+    alert_2 = monitoring_app_module._build_alert_from_payload(norm_2)
+    assert alert_1.service == alert_2.service == "orders-db"
+    fp_1 = compute_fingerprint(norm_1)
+    fp_2 = compute_fingerprint(norm_2)
+    assert fp_1 == fp_2
+    assert len(fp_1) >= 16

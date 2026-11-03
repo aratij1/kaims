@@ -901,6 +901,69 @@ def test_current_dependency_snapshot_is_after_historical_incident_window() -> No
     assert evidence[0]["current_operational_evidence"] is False
 
 
+def test_runtime_stopped_lifecycle_event_corroborates_historical_probe_failure() -> None:
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    context = make_context()
+    stopped_at = context.alert.starts_at + timedelta(minutes=2)
+    hypothesis = {
+        "hypothesis_id": "runtime-stop",
+        "mechanism": "runtime_stopped",
+        "target_service": context.alert.service,
+        "stopped_at": stopped_at.isoformat().replace("+00:00", "Z"),
+        "claim": f"The {context.alert.service} workload stopped, causing its HTTP endpoint to be unavailable.",
+        "source": "mechanism_candidate",
+        "status": "leading",
+        "confidence": 0.6,
+        "supporting_evidence_ids": [],
+        "contradicting_evidence_ids": [],
+        "affected_resource_ids": [],
+        "causal_sequence": [],
+        "confidence_components": {},
+        "falsification_check": {},
+        "next_evidence_requests": [],
+    }
+    topology = {
+        "evidence_id": "TOPOLOGY-STOP",
+        "source_type": "topology",
+        "service": context.alert.service,
+        "incident_window_relation": "after",
+        "current_operational_evidence": False,
+        "freshness_seconds": 0,
+        "reliability_score": 1.0,
+        "metadata": {
+            "service": context.alert.service,
+            "runtime_state": "exited",
+            "runtime_lifecycle": {
+                "Running": False,
+                "FinishedAt": hypothesis["stopped_at"],
+            },
+        },
+    }
+    telemetry = {
+        "evidence_id": "METRIC-PROBE-FAIL",
+        "source_type": "telemetry",
+        "service": context.alert.service,
+        "current_operational_evidence": True,
+        "freshness_seconds": 0,
+        "reliability_score": 1.0,
+        "metadata": {
+            "metric": {"__name__": "probe_success", "service": context.alert.service},
+            "values": [[stopped_at.timestamp() + 1, 0]],
+        },
+    }
+
+    revised = investigator._revise_hypotheses(
+        [hypothesis], [topology, telemetry], context=context,
+    )
+    confirmed = next(item for item in revised if item["mechanism"] == "runtime_stopped")
+
+    assert confirmed["status"] == "confirmed"
+    assert confirmed["independent_sources"] == ["telemetry", "topology"]
+    assert set(confirmed["supporting_evidence_ids"]) == {
+        "TOPOLOGY-STOP", "METRIC-PROBE-FAIL",
+    }
+
+
 def test_unhealthy_dependency_in_incident_window_is_typed_support() -> None:
     investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
     hypothesis = {"claim": "An unhealthy downstream dependency is degrading checkout."}
@@ -1177,6 +1240,40 @@ def test_select_tool_falls_back_to_a_self_check_with_no_discovered_dependency() 
     assert tool_name == "dependency-health.search"
     assert arguments["service"] == "api-gateway"
     assert "related_to" not in arguments
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_tool"),
+    [
+        ("topology", "topology.search"),
+        ("dependency", "dependency-health.search"),
+    ],
+)
+def test_runtime_inventory_queries_do_not_use_application_project_as_compose_project(
+    source: str, expected_tool: str,
+) -> None:
+    context = make_context()
+    context.alert.labels = {"project": "robot-shop"}
+    investigator = IterativeInvestigator(client=FakeDiscoveryClient({}))
+    assert investigator.SOURCE_TOOL[source] == expected_tool
+    counts = {tool: 1 for tool in investigator.SOURCE_TOOL.values()}
+    counts[expected_tool] = 0
+    hypotheses = [
+        {"status": "leading", "confidence": 0.6,
+         "claim": "An unhealthy upstream or downstream dependency is degrading checkout."},
+    ]
+
+    selection = investigator._select_tool(
+        context=context, evidence=[], hypotheses=hypotheses, tool_counts=counts,
+    )
+
+    assert selection is not None
+    tool_name, arguments = selection
+    assert tool_name == expected_tool
+    assert "project" not in arguments
+    assert "application" not in arguments
+    assert arguments["tenant_id"] == context.tenant_id
+    assert arguments["service"] == context.alert.service
 
 
 @pytest.mark.asyncio

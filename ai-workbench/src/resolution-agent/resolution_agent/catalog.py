@@ -286,9 +286,26 @@ def _ranked_matches(
         "contain": 3,
         "rollback": 4,
     }
+    platform_terms = {
+        "kubernetes": {"kubernetes", "k8s"},
+        "linux": {"linux"},
+        "windows": {"windows"},
+        "aws": {"aws", "amazon"},
+        "azure": {"azure"},
+        "gcp": {"gcp", "google cloud"},
+        "database": {"database", "mysql", "postgres", "postgresql"},
+        "network": {"network", "router", "firewall"},
+        "saas": {"saas", "api"},
+        "data-platform": {"data platform", "pipeline", "dataset"},
+    }
+    preferred_platforms = {
+        platform for platform, terms in platform_terms.items()
+        if any(term in corpus for term in terms)
+    }
     ranked.sort(
         key=lambda match: (
             -match[1],
+            0 if RESOLUTION_CATALOG[match[0]]["platform"] in preferred_platforms else 1,
             platform_order.get(RESOLUTION_CATALOG[match[0]]["platform"], 9),
             strategy_order.get(RESOLUTION_CATALOG[match[0]]["strategy"], 9),
             risk_order.get(RESOLUTION_CATALOG[match[0]]["risk"], 9),
@@ -366,6 +383,13 @@ def _extract_markdown_runbook_fields(markdown: str, service: str = "") -> dict[s
             if ":" in fm_line:
                 key, value = fm_line.split(":", 1)
                 frontmatter[key.strip().lower()] = value.strip().strip("'\"`")
+    else:
+        lead_match = re.match(r"\A((?:[a-zA-Z0-9_.-]+\s*:\s*[^\r\n]+\r?\n)+)", raw_text)
+        if lead_match:
+            for fm_line in lead_match.group(1).splitlines():
+                if ":" in fm_line:
+                    key, value = fm_line.split(":", 1)
+                    frontmatter[key.strip().lower()] = value.strip().strip("'\"`")
 
     def _section_text(heading_pattern: str) -> str:
         match = re.search(
@@ -414,6 +438,7 @@ def _extract_markdown_runbook_fields(markdown: str, service: str = "") -> dict[s
     parsed_service = (
         (service_match.group(1).strip().strip("`'\"* ") if service_match else "")
         or frontmatter.get("service", "")
+        or frontmatter.get("services", "")
         or str(service or "").strip()
     )
     parsed_alert = (
@@ -424,6 +449,8 @@ def _extract_markdown_runbook_fields(markdown: str, service: str = "") -> dict[s
     title = title_match.group(1).strip() if title_match else ""
     if not parsed_alert and ":" in title:
         parsed_alert = title.split(":", 1)[1].strip()
+    if " - " in parsed_alert:
+        parsed_alert = parsed_alert.split(" - ", 1)[1].strip()
 
     symptoms_section = _section_text(r"(?:Observed\s+)?Symptoms\s*&\s*Root\s*Cause|Root\s*Cause")
     root_cause_guidance = " ".join(
@@ -431,6 +458,25 @@ def _extract_markdown_runbook_fields(markdown: str, service: str = "") -> dict[s
         for line in symptoms_section.splitlines()
         if line.strip() and not line.strip().startswith("```")
     ).strip()
+    if root_cause_guidance:
+        root_cause_guidance = re.split(
+            r"\s+(?:Remediation(?:\s+Steps)?|Command)\s*:\s*",
+            root_cause_guidance,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
+
+    remediation_steps = _clean_items(_section_text(r"Remediation\s*Steps|Remediation|Resolution\s*Steps"))
+    if not remediation_steps:
+        inline_cmds = re.findall(
+            r"(?:Remediation\s+Command|Command)\s*:\s*(.+)$",
+            raw_text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        for cmd in inline_cmds:
+            cleaned_cmd = cmd.strip().strip("`").strip()
+            if cleaned_cmd:
+                remediation_steps.append(cleaned_cmd)
 
     return {
         "name": title,
@@ -438,7 +484,7 @@ def _extract_markdown_runbook_fields(markdown: str, service: str = "") -> dict[s
         "service_scope": [parsed_service.lower()] if parsed_service else [],
         "prerequisites": _clean_items(_section_text(r"Preconditions|Prerequisites")),
         "diagnostic_steps": _clean_items(_section_text(r"Diagnostic\s*Steps|Diagnostics")),
-        "remediation_steps": _clean_items(_section_text(r"Remediation\s*Steps|Remediation|Resolution\s*Steps")),
+        "remediation_steps": remediation_steps,
         "validation_steps": _clean_items(_section_text(r"Validation(?:\s*Steps)?|Verification(?:\s*Steps)?")),
         "rollback_steps": _clean_items(_section_text(r"Rollback\s*Plan|Rollback(?:\s*Steps)?")),
         "root_cause_guidance": root_cause_guidance,
@@ -611,6 +657,20 @@ def register_learned_runbooks(
             or content.get("slug")
             or f"learned-{slug_seed}-{runbook_id[:8]}"
         )
+        raw_rc_guidance = str(
+            content.get("root_cause_guidance")
+            or content.get("root_cause")
+            or extracted.get("root_cause_guidance")
+            or content.get("symptom_and_root_cause")
+            or ""
+        ).strip()
+        if raw_rc_guidance:
+            raw_rc_guidance = re.split(
+                r"\s+(?:Remediation(?:\s+Steps)?|Command)\s*:\s*",
+                raw_rc_guidance,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip()
         option_id = f"learned-{runbook_id}-v{version}"
         option = {
             "id": option_id,
@@ -633,9 +693,15 @@ def register_learned_runbooks(
             "runbook_slug": runbook_slug,
             "runbook_version": version,
             "alert_name": record_alert_name,
-            "root_cause_guidance": str(
-                content.get("root_cause_guidance") or extracted.get("root_cause_guidance") or ""
-            ),
+            "root_cause_guidance": raw_rc_guidance,
+            "observed_symptoms": str(
+                content.get("observed_symptoms")
+                or content.get("symptoms")
+                or extracted.get("observed_symptoms")
+                or ""
+            ).strip(),
+            "business_impact": str(content.get("business_impact") or "").strip(),
+            "markdown": markdown_text,
             "success_count": successes,
             "failure_count": failures,
             "execution_eligible": self_heal,

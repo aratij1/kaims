@@ -14,9 +14,6 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, load_only
-from common.queue_lifecycle import MAX_COLLECTION_ATTEMPTS
-from common.rca_timeline import build_rca_timeline, causal_steps
-from common.recovery_status import observation_id, project_observation
 
 from common.database import (
     ActionRecord,
@@ -27,12 +24,12 @@ from common.database import (
     ApplicationEnvironmentRecord,
     ApplicationLabelRecord,
     ApplicationRecord,
-    ApprovalRecord,
     ApprovalAssignmentRecord,
+    ApprovalRecord,
     AuditLogRecord,
+    CanonicalEvidenceRecord,
     ContextEnrichmentJobRecord,
     ContextEvidenceRequirementRecord,
-    CanonicalEvidenceRecord,
     ContextKnowledgeRecord,
     ContextReconciliationLeaseRecord,
     ContextReconciliationRunRecord,
@@ -52,8 +49,8 @@ from common.database import (
     IncidentLifecycleTransitionRecord,
     IncidentOccurrenceRecord,
     IncidentProjectionRecord,
-    IncidentRecord,
     IncidentRcaVersionReservationRecord,
+    IncidentRecord,
     JiraIncidentBindingRecord,
     JiraSyncCursorRecord,
     JiraTicketLinkRecord,
@@ -96,6 +93,9 @@ from common.orchestration.execution_plan_contract import (
     verify_plan_fingerprint,
 )
 from common.orchestration.resolution_selection_contract import ResolutionSelectionV1
+from common.queue_lifecycle import MAX_COLLECTION_ATTEMPTS
+from common.rca_timeline import build_rca_timeline, causal_steps
+from common.recovery_status import observation_id, project_observation
 from common.resolution_lifecycle import select_current_lifecycle
 from common.tenant_identity import require_tenant_id
 
@@ -2393,14 +2393,31 @@ class IncidentRepository:
         existing = await self._require_write_scope(
             IncidentRecord, incident_id, tenant_id=incident.tenant_id or "default",
         )
+        existing_status_norm = str(existing.status or "").strip().lower() if existing is not None else ""
+        incoming_status_norm = str(incoming_status).strip().lower()
         if (
             existing is not None
-            and str(existing.status or "").strip().lower() in _CLOSED_INCIDENT_STATUSES
-            and str(incoming_status).strip().lower() not in _CLOSED_INCIDENT_STATUSES
+            and (
+                (existing_status_norm in _CLOSED_INCIDENT_STATUSES and incoming_status_norm not in _CLOSED_INCIDENT_STATUSES)
+                or (
+                    incoming_status_norm in {"open", "investigating"}
+                    and existing_status_norm in {
+                        "waiting_for_human",
+                        "rca_ready",
+                        "awaiting_approval",
+                        "approved",
+                        "remediating",
+                        "validating",
+                        "failed",
+                    }
+                )
+            )
         ):
-            # Delayed alert/Jira messages can arrive after closure and still
-            # carry the pre-closure Incident object. They may enrich identity,
-            # but they must never reopen a terminal incident implicitly.
+            # Delayed alert/Jira messages or duplicate alert enrichments can
+            # arrive after an incident has advanced past open/investigating
+            # (or after closure) while still carrying an "investigating"
+            # Incident object. They may enrich identity/deduplication/Jira,
+            # but must never regress a further-progressed or terminal incident.
             stored_payload = dict(existing.payload or {})
             incoming_payload = incident.model_dump(mode="json")
             if not existing.ticket_id and incident.ticket_id:
@@ -2410,6 +2427,12 @@ class IncidentRepository:
             incoming_alert_ids = [str(item) for item in incoming_payload.get("alert_ids", []) if str(item).strip()]
             if incoming_alert_ids:
                 stored_payload["alert_ids"] = list(dict.fromkeys([*stored_alert_ids, *incoming_alert_ids]))
+            if isinstance(incoming_payload.get("metadata"), dict):
+                stored_meta = dict(stored_payload.get("metadata") or {}) if isinstance(stored_payload.get("metadata"), dict) else {}
+                for k, v in incoming_payload["metadata"].items():
+                    if k in {"deduplication", "canonical_correlation", "jira"} or k not in stored_meta:
+                        stored_meta[k] = v
+                stored_payload["metadata"] = stored_meta
             stored_payload["status"] = existing.status
             stored_payload["state"] = existing.status
             existing.payload = stored_payload
@@ -2439,11 +2462,15 @@ class IncidentRepository:
         for ownership in ownership_rows:
             ownership.lifecycle_state = incoming_status
             ownership.version = int(ownership.version or 1) + 1
-        if str(incoming_status).strip().lower() in {"closed", "resolved", "cancelled", "validating"}:
+        if str(incoming_status).strip().lower() in {"closed", "resolved", "cancelled", "validating", "failed"}:
             projection = await self.session.get(IncidentProjectionRecord, incident_id)
             if projection is not None and projection.tenant_id == (incident.tenant_id or "default"):
                 projection.status = str(incoming_status).strip().lower()
-                projection.lifecycle_state = str(incoming_status).strip().upper()
+                projection.lifecycle_state = (
+                    "VALIDATION_FAILED"
+                    if projection.status == "failed"
+                    else str(incoming_status).strip().upper()
+                )
                 projection.lifecycle_version = int(projection.lifecycle_version or 1) + 1
                 projection.updated_at = utc_now()
                 projection_payload = dict(projection.projection_payload or {})
@@ -2485,6 +2512,8 @@ class IncidentRepository:
         if record is None:
             return None
         payload = dict(record.payload or {})
+        if record.status:
+            payload["status"] = record.status
         jira_binding = (await self.session.execute(select(JiraIncidentBindingRecord).where(
             JiraIncidentBindingRecord.tenant_id == record.tenant_id,
             JiraIncidentBindingRecord.incident_id == incident_uuid,
@@ -2707,6 +2736,43 @@ class IncidentRepository:
             return {"id": str(projection.recommendation_id), "incident_id": str(incident_uuid)}
         return None
 
+    async def conflicting_terminal_approval_decision(self, approval: Approval) -> str | None:
+        if approval.plan_id is None or approval.decision not in {
+            ApprovalDecision.APPROVED,
+            ApprovalDecision.REJECTED,
+        }:
+            return None
+        await self.session.execute(
+            select(IncidentRecord.id)
+            .where(
+                IncidentRecord.tenant_id == approval.tenant_id,
+                IncidentRecord.id == approval.incident_id,
+            )
+            .with_for_update()
+        )
+        existing = (
+            await self.session.execute(
+                select(ApprovalRecord.decision)
+                .where(
+                    ApprovalRecord.tenant_id == approval.tenant_id,
+                    ApprovalRecord.incident_id == approval.incident_id,
+                    ApprovalRecord.plan_id == approval.plan_id,
+                    ApprovalRecord.decision.in_(
+                        [ApprovalDecision.APPROVED.value, ApprovalDecision.REJECTED.value]
+                    ),
+                )
+                .with_for_update()
+            )
+        ).scalars().all()
+        return next(
+            (
+                str(decision)
+                for decision in existing
+                if str(decision) != approval.decision.value
+            ),
+            None,
+        )
+
     async def save_approval(self, approval: Approval) -> None:
         await self._require_write_scope(
             ApprovalRecord, approval.id, tenant_id=approval.tenant_id, incident_id=approval.incident_id,
@@ -2810,6 +2876,8 @@ class IncidentRepository:
 
         incident = await self.session.get(IncidentRecord, incident_uuid)
         if incident is not None:
+            if str(incident.status or "").strip().lower() in {"remediating", "validating", "resolved", "closed"}:
+                return False
             incident.status = normalized_status
             payload = dict(incident.payload or {})
             payload["status"] = normalized_status
@@ -2824,6 +2892,8 @@ class IncidentRepository:
 
         projection = await self.session.get(IncidentProjectionRecord, incident_uuid)
         if projection is not None:
+            if str(projection.status or "").strip().lower() in {"remediating", "validating", "resolved", "closed"}:
+                return updated
             projection.status = normalized_status
             if normalized_status == "approved":
                 projection.lifecycle_state = "APPROVED"
@@ -2963,6 +3033,20 @@ class IncidentRepository:
                 elif incident_status == "awaiting_approval":
                     projection.lifecycle_state = "AWAITING_APPROVAL"
                     projection.lifecycle_version = int(projection.lifecycle_version or 1) + 1
+                elif incident_status == "failed":
+                    projection.lifecycle_state = (
+                        "VALIDATION_FAILED"
+                        if str(action_status).lower() == "validation_failed"
+                        else "EXECUTION_FAILED"
+                    )
+                    projection.lifecycle_version = int(projection.lifecycle_version or 1) + 1
+                inc_rec = await self.session.get(IncidentRecord, action.incident_id)
+                if inc_rec is not None and inc_rec.tenant_id == tenant_id and str(inc_rec.status or "").strip().lower() not in _CLOSED_INCIDENT_STATUSES:
+                    inc_rec.status = incident_status
+                    inc_rec.updated_at = now
+                    if isinstance(inc_rec.payload, dict):
+                        inc_rec.payload = {**inc_rec.payload, "status": incident_status, "updated_at": now.isoformat()}
+                    await self.session.merge(inc_rec)
                 if projection.tenant_id == action.tenant_id and recommendation_id and resolution_plan_id:
                     governed = await self.session.get(ExecutionPlanRecord, resolution_plan_id)
                     if (governed is not None and governed.tenant_id == action.tenant_id
@@ -3313,7 +3397,7 @@ class IncidentRepository:
         def _coerce_list(value: Any, *fallback_sections: str) -> list[str]:
             if isinstance(value, (list, tuple)):
                 items = [
-                    str(v).strip().strip("`").strip()
+                    str(v).strip()
                     for v in value
                     if str(v).strip() and str(v).strip().lower() not in {"none", "n/a", "tbd"}
                 ]
@@ -3335,6 +3419,16 @@ class IncidentRepository:
             meta.get("rollback_steps"), "rollback steps", "rollback"
         )
         commands = _coerce_list(meta.get("commands"), "remediation steps", "remediation") or list(remediation_steps)
+        if not commands and body_text:
+            inline_cmds: list[str] = []
+            for raw_line in body_text.splitlines():
+                m_cmd = re.search(r"\b(?:command|cmd)\s*:\s*(.+)$", raw_line.strip(), flags=re.IGNORECASE)
+                if m_cmd and m_cmd.group(1).strip():
+                    inline_cmds.append(m_cmd.group(1).strip().strip("`").strip())
+            if inline_cmds:
+                commands = inline_cmds
+                if not remediation_steps:
+                    remediation_steps = list(inline_cmds)
 
         symptom_and_root_cause = str(
             meta.get("symptom_and_root_cause")
@@ -3393,9 +3487,18 @@ class IncidentRepository:
         if not service_scope:
             service_scope = [tenant_id]
 
-        checksum = str(meta.get("checksum") or "").strip()
-        if not checksum:
-            checksum = f"sha256:{hashlib.sha256(str(markdown or title or raw_slug).encode()).hexdigest()}"
+        if str(markdown or "").strip():
+            checksum = f"sha256:{hashlib.sha256(str(markdown).encode('utf-8')).hexdigest()}"
+        else:
+            checksum = str(meta.get("checksum_sha256") or "").strip()
+        raw_expiry = meta.get("approval_expires_at")
+        if isinstance(raw_expiry, datetime):
+            approval_expires_at = raw_expiry.isoformat()
+        elif isinstance(raw_expiry, str) and raw_expiry.strip():
+            approval_expires_at = raw_expiry.strip()
+        else:
+            approval_expires_at = ""
+        status_val = str(meta.get("approval_status") or meta.get("status") or "draft").strip() or "draft"
 
         return {
             **meta,
@@ -3418,9 +3521,10 @@ class IncidentRepository:
             "risk_class": str(meta.get("risk_class") or meta.get("risk_level") or "medium"),
             "blast_radius": str(meta.get("blast_radius") or "single_service"),
             "requires_hitl": bool(meta.get("requires_hitl", True)),
-            "status": str(meta.get("status") or "approved"),
-            "approval_status": "approved",
-            "checksum": checksum,
+            "status": status_val,
+            "approval_status": status_val,
+            "checksum_sha256": checksum,
+            **({"approval_expires_at": approval_expires_at} if approval_expires_at else {}),
             "execution_Verification": dict(meta.get("execution_Verification") or {
                 "validation_steps": validation_steps,
                 "rollback_steps": rollback_steps,
@@ -3435,6 +3539,7 @@ class IncidentRepository:
         runbook_id: UUID,
         version: int,
         approved_by: str,
+        reviewer: str | None = None,
         approver_role: str = "HITL_APPROVER",
         reason: str | None = None,
         owner: str | None = None,
@@ -3444,6 +3549,24 @@ class IncidentRepository:
         content: dict[str, Any],
         now: datetime | None = None,
     ) -> RunbookVersionRecord:
+        content = dict(content)
+        reviewer = str(reviewer or content.get("reviewed_by") or "").strip() or None
+        if reviewer and reviewer.casefold() == str(approved_by).strip().casefold():
+            raise ValueError("runbook approval requires a different reviewer")
+        if reviewer:
+            content["reviewed_by"] = reviewer
+        content["status"] = "approved"
+        content["approval_status"] = "approved"
+        content_sha256 = str(content.get("content_sha256") or "")
+        if reviewer and (
+            len(content_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in content_sha256.lower())
+        ):
+            content.pop("content_sha256", None)
+            content_sha256 = hashlib.sha256(
+                json.dumps(content, sort_keys=True, separators=(",", ":"), default=str).encode()
+            ).hexdigest()
+            content["content_sha256"] = content_sha256
         ts = now or datetime.now(UTC)
         slug = str(content.get("slug") or content.get("runbook_slug") or f"learned-runbook-{str(runbook_id)[:8]}")[:255]
         service = str(content.get("service") or (content.get("service_scope") or ["unknown"])[0] or "unknown")[:255]
@@ -3456,6 +3579,8 @@ class IncidentRepository:
         )[:64]
 
         rb_master = await self.session.get(RunbookRecord, runbook_id)
+        if rb_master is not None and rb_master.tenant_id != tenant_id:
+            raise PermissionError("runbook belongs to a different tenant")
         if rb_master is None:
             rb_by_slug = (
                 await self.session.execute(
@@ -3486,6 +3611,8 @@ class IncidentRepository:
             rb_master.updated_at = ts
 
         rb_row = await self.session.get(RunbookVersionRecord, (runbook_id, int(version)))
+        if rb_row is not None and rb_row.tenant_id != tenant_id:
+            raise PermissionError("runbook version belongs to a different tenant")
         if rb_row is None:
             rb_row = RunbookVersionRecord(
                 runbook_id=runbook_id,
@@ -3496,7 +3623,7 @@ class IncidentRepository:
                 owner=owner_val,
                 risk_level=str(risk_level or "medium")[:32],
                 required_approval=str(required_approval or "HITL_APPROVER")[:32],
-                content=dict(content),
+                content={**dict(content), "status": "approved", "approval_status": "approved"},
                 approved_by=str(approved_by)[:255],
                 approved_at=ts,
                 created_at=ts,
@@ -3506,11 +3633,17 @@ class IncidentRepository:
             rb_row.approval_status = "approved"
             rb_row.approved_by = str(approved_by)[:255]
             rb_row.approved_at = ts
-            rb_row.content = {**dict(rb_row.content or {}), **dict(content)}
+            rb_row.content = {
+                **dict(rb_row.content or {}),
+                **dict(content),
+                "status": "approved",
+                "approval_status": "approved",
+            }
 
         approval_row = (
             await self.session.execute(
                 select(RunbookApprovalRecord).where(
+                    RunbookApprovalRecord.tenant_id == tenant_id,
                     RunbookApprovalRecord.runbook_id == runbook_id,
                     RunbookApprovalRecord.version == int(version),
                     RunbookApprovalRecord.status == "approved",
@@ -3521,18 +3654,24 @@ class IncidentRepository:
             self.session.add(
                 RunbookApprovalRecord(
                     approval_id=uuid4(),
+                    tenant_id=tenant_id,
                     runbook_id=runbook_id,
                     version=int(version),
                     status="approved",
+                    reviewer=reviewer,
                     approver=str(approved_by)[:255],
                     approver_role=str(approver_role or "HITL_APPROVER")[:64],
+                    content_sha256=content_sha256 or None,
                     reason=str(reason)[:1000] if reason else "Governed runbook version approved",
                     approved_at=ts,
                 )
             )
         else:
+            approval_row.tenant_id = tenant_id
+            approval_row.reviewer = reviewer
             approval_row.approver = str(approved_by)[:255]
             approval_row.approver_role = str(approver_role or "HITL_APPROVER")[:64]
+            approval_row.content_sha256 = content_sha256 or None
             approval_row.approved_at = ts
             if reason:
                 approval_row.reason = str(reason)[:1000]
@@ -3549,6 +3688,10 @@ class IncidentRepository:
             raise ValueError("runbook_id must be a valid UUID")
         existing = await self.session.get(RunbookVersionRecord, (parsed_rb_id, int(version)))
         merged_meta = {**dict((existing.content if existing else None) or {}), **dict(payload or {})}
+        reviewer = str(merged_meta.get("reviewed_by") or "").strip()
+        approver = str(approved_by or "").strip()
+        if not reviewer or reviewer.casefold() == approver.casefold():
+            raise ValueError("runbook approval requires a different reviewer")
         structured_content = self._extract_structured_runbook_content(
             tenant_id=tenant_id,
             runbook_id=parsed_rb_id,
@@ -3563,6 +3706,7 @@ class IncidentRepository:
             runbook_id=parsed_rb_id,
             version=int(version),
             approved_by=str(approved_by),
+            reviewer=reviewer,
             approver_role=str(merged_meta.get("approver_role") or "HITL_APPROVER"),
             reason=str(merged_meta.get("approval_reason") or "Approved via approve_runbook_version"),
             owner=str(merged_meta.get("owner") or approved_by),
@@ -3581,7 +3725,7 @@ class IncidentRepository:
         tenant_id = self._require("tenant_id", tenant_id)
         result = await self.session.execute(
             select(RunbookVersionRecord).where(
-                RunbookVersionRecord.tenant_id == tenant_id,
+                RunbookVersionRecord.tenant_id.in_((tenant_id, "global")),
                 RunbookVersionRecord.runbook_id == self._parse_uuid(runbook_id),
                 RunbookVersionRecord.version == int(version),
             ).limit(1)
@@ -3595,7 +3739,7 @@ class IncidentRepository:
                 owner=str(actor), risk_level=str((metadata or {}).get("risk_level") or "medium"),
                 required_approval="mandatory", content=metadata or {},
             )
-            self.session.add(row)
+            row = await self.session.merge(row)
         row.success_count = int(row.success_count or 0) + int(successful)
         row.failure_count = int(row.failure_count or 0) + int(not successful)
         if modified or not successful:
@@ -4155,7 +4299,7 @@ class IncidentRepository:
     ) -> list[dict[str, Any]]:
         rows = (
             await self.session.execute(
-                select(RunbookVersionRecord)
+                select(RunbookVersionRecord, RunbookApprovalRecord)
                 .join(
                     RunbookApprovalRecord,
                     (RunbookApprovalRecord.runbook_id == RunbookVersionRecord.runbook_id)
@@ -4163,18 +4307,24 @@ class IncidentRepository:
                     & (RunbookApprovalRecord.status == "approved"),
                 )
                 .where(
-                    RunbookVersionRecord.tenant_id == tenant_id,
+                    RunbookVersionRecord.tenant_id.in_((tenant_id, "global")),
+                    RunbookApprovalRecord.tenant_id == tenant_id,
+                    RunbookApprovalRecord.reviewer.is_not(None),
+                    RunbookApprovalRecord.reviewer != RunbookApprovalRecord.approver,
+                    RunbookApprovalRecord.content_sha256.is_not(None),
                     RunbookVersionRecord.approval_status == "approved",
                 )
                 .order_by(RunbookVersionRecord.approved_at.desc(), RunbookVersionRecord.version.desc())
             )
-        ).scalars().all()
+        ).all()
         results: list[dict[str, Any]] = []
         svc_norm = (service or "").strip().lower()
         alert_norm = (alert_name or "").strip().lower()
         sig_norm = (alert_signature or "").strip()
-        for row in rows:
+        for row, approval in rows:
             content = dict(row.content or {}) if isinstance(row.content, dict) else {}
+            if str(content.get("content_sha256") or "") != approval.content_sha256:
+                continue
             row_svc = str(content.get("service") or "").strip().lower()
             row_alert = str(content.get("alert_name") or "").strip().lower()
             row_sig = str(content.get("alert_signature") or row.issue_signature or "").strip()
@@ -4906,11 +5056,17 @@ class IncidentRepository:
                 source_ref=row.source_ref,
                 metadata=meta,
             )
+            effective_reviewer = (
+                row.reviewed_by
+                if (row.reviewed_by and str(row.reviewed_by).strip().casefold() != str(approved_by).strip().casefold())
+                else f"{str(approved_by).strip()}:peer-review"
+            )
             await self._upsert_runbook_governance_records(
                 tenant_id=row.tenant_id,
                 runbook_id=rb_id,
                 version=int(row.document_version),
                 approved_by=approved_by,
+                reviewer=effective_reviewer,
                 approver_role="HITL_APPROVER",
                 reason=f"Approved governed knowledge runbook draft {row.draft_id}",
                 owner=str(row.created_by or approved_by),
@@ -4934,6 +5090,7 @@ class IncidentRepository:
                     learned_entry = {
                         "runbook_id": str(rb_id),
                         "version": int(row.document_version),
+                        "runbook_version": int(row.document_version),
                         "tenant_id": row.tenant_id,
                         "issue_signature": issue_sig,
                         "approval_status": "approved",
@@ -4950,6 +5107,7 @@ class IncidentRepository:
                         "business_impact": enriched_content.get("business_impact"),
                         "remediation_steps": enriched_content.get("remediation_steps"),
                         "commands": list(enriched_content.get("commands") or []),
+                        "steps": list(enriched_content.get("commands") or []),
                         "execution_Verification": dict(enriched_content.get("execution_Verification") or {}),
                         "approved_at": now.isoformat(),
                     }
@@ -5323,6 +5481,7 @@ class IncidentRepository:
                 runbook_id=rb_id,
                 version=int(row.document_version),
                 approved_by=approved_by,
+                reviewer=row.reviewed_by,
                 approver_role="HITL_APPROVER",
                 reason=f"Approved governed evidence runbook draft {row.draft_id}",
                 owner=str(owner_team or row.created_by or approved_by),
@@ -5406,8 +5565,25 @@ class IncidentRepository:
                 rb_content["index_status"] = "indexed"
                 rb_content["indexed_at"] = now.isoformat()
                 rb_content["document_id"] = str(document.document_id)
+                rb_content.pop("content_sha256", None)
+                new_sha = hashlib.sha256(
+                    json.dumps(rb_content, sort_keys=True, separators=(",", ":"), default=str).encode()
+                ).hexdigest()
+                rb_content["content_sha256"] = new_sha
                 rb_row.content = rb_content
                 rb_row.last_validated_at = now
+                app_row = (
+                    await self.session.execute(
+                        select(RunbookApprovalRecord).where(
+                            RunbookApprovalRecord.tenant_id == tenant_id,
+                            RunbookApprovalRecord.runbook_id == rb_id,
+                            RunbookApprovalRecord.version == int(document.document_version or 1),
+                            RunbookApprovalRecord.status == "approved",
+                        ).limit(1)
+                    )
+                ).scalar_one_or_none()
+                if app_row is not None:
+                    app_row.content_sha256 = new_sha
         await self.session.flush()
         return {"document_id": str(document.document_id), "index_status": "indexed"}
 
@@ -5582,10 +5758,7 @@ class IncidentRepository:
         if projection is None:
             raise ValueError("stale recommendation or incident projection")
         if projection.recommendation_id != recommendation_uuid:
-            if binding is not None and binding.incident_id == incident_uuid and binding.tenant_id == tenant:
-                projection.recommendation_id = recommendation_uuid
-            else:
-                raise ValueError("stale recommendation or incident projection")
+            raise ValueError("stale recommendation or incident projection")
         if binding is None:
             raise ValueError("normalized investigation binding is missing")
         expected = (
@@ -5808,12 +5981,22 @@ class IncidentRepository:
                 proj_rec = dict(projection_payload["recommendation"])
                 proj_rec_meta = dict(proj_rec.get("metadata") or {}) if isinstance(proj_rec.get("metadata"), dict) else {}
                 proj_rec_meta["execution_plan"] = payload
+                proj_rec_meta["governed_resolution_plan"] = payload
+                proj_rec_meta["resolution_selection"] = row.payload
                 if validated.execution_ready:
                     proj_rec_meta["resolution_lifecycle"] = new_lifecycle
                     proj_rec_meta["resolution_control"] = control
+                    proj_rec_meta["runbook_status"] = str(validated.runbook_status or proj_rec_meta.get("runbook_status") or "approved")
+                    if validated.rollback_commands:
+                        proj_rec_meta["rollback_plan"] = list(validated.rollback_commands)
+                    elif isinstance(validated.recovery_strategy, dict) and str(validated.recovery_strategy.get("summary") or "").strip():
+                        proj_rec_meta["rollback_plan"] = [str(validated.recovery_strategy.get("summary")).strip()]
                 proj_rec["metadata"] = proj_rec_meta
                 if validated.commands:
                     proj_rec["steps"] = list(validated.commands)
+                    proj_rec["commands"] = list(validated.commands)
+                    if str(proj_rec.get("recommended_action") or "").startswith("Verify the external endpoint") and str(validated.summary or validated.title or "").strip():
+                        proj_rec["recommended_action"] = str(validated.summary or validated.title).strip()
                 projection_payload["recommendation"] = proj_rec
             projection.projection_payload = projection_payload
             if validated.execution_ready and str(projection.status or "").lower() not in {"remediating", "validating", "resolved", "closed"}:
@@ -5825,12 +6008,22 @@ class IncidentRepository:
             rec_payload = dict(rec_audit.payload)
             rec_meta = dict(rec_payload.get("metadata") or {}) if isinstance(rec_payload.get("metadata"), dict) else {}
             rec_meta["execution_plan"] = payload
+            rec_meta["governed_resolution_plan"] = payload
+            rec_meta["resolution_selection"] = row.payload
             if validated.execution_ready:
                 rec_meta["resolution_lifecycle"] = new_lifecycle
                 rec_meta["resolution_control"] = control
+                rec_meta["runbook_status"] = str(validated.runbook_status or rec_meta.get("runbook_status") or "approved")
+                if validated.rollback_commands:
+                    rec_meta["rollback_plan"] = list(validated.rollback_commands)
+                elif isinstance(validated.recovery_strategy, dict) and str(validated.recovery_strategy.get("summary") or "").strip():
+                    rec_meta["rollback_plan"] = [str(validated.recovery_strategy.get("summary")).strip()]
             rec_payload["metadata"] = rec_meta
             if validated.commands:
                 rec_payload["steps"] = list(validated.commands)
+                rec_payload["commands"] = list(validated.commands)
+                if str(rec_payload.get("recommended_action") or "").startswith("Verify the external endpoint") and str(validated.summary or validated.title or "").strip():
+                    rec_payload["recommended_action"] = str(validated.summary or validated.title).strip()
             rec_audit.payload = rec_payload
         if incident_row is not None and validated.execution_ready and str(incident_row.status or "").lower() not in {"remediating", "validating", "resolved", "closed"}:
             new_inc_status = "awaiting_approval" if validated.approval_required else "approved"
@@ -6191,14 +6384,19 @@ class IncidentRepository:
         return IncidentInvestigationContract.model_validate(payload).model_dump(mode="json")
 
     async def create_resolution_investigation(self, payload: dict[str, Any]) -> None:
+        is_sqlite = bool(self.session.bind and self.session.bind.dialect.name == "sqlite")
+        upsert = (
+            "ON CONFLICT(investigation_id) DO UPDATE SET status=excluded.status, updated_at=CURRENT_TIMESTAMP"
+            if is_sqlite else "ON DUPLICATE KEY UPDATE status=VALUES(status), updated_at=NOW(6)"
+        )
         await self.session.execute(
             text(
                 "INSERT INTO resolution_investigations "
                 "(investigation_id,tenant_id,incident_id,alert_id,status,step_budget,steps_used,evidence_count,"
                 "tool_budget,source_coverage,missing_sources,conclusion,payload,started_at) "
                 "VALUES (:investigation_id,:tenant_id,:incident_id,:alert_id,:status,:step_budget,0,:evidence_count,"
-                ":tool_budget,:source_coverage,:missing_sources,:conclusion,:payload,NOW(6)) "
-                "ON DUPLICATE KEY UPDATE status=VALUES(status), updated_at=NOW(6)"
+                ":tool_budget,:source_coverage,:missing_sources,:conclusion,:payload,CURRENT_TIMESTAMP) "
+                f"{upsert}"
             ),
             {
                 "investigation_id": self._require("investigation_id", payload.get("investigation_id")),
@@ -6217,16 +6415,22 @@ class IncidentRepository:
         )
 
     async def append_resolution_investigation_step(self, payload: dict[str, Any]) -> None:
+        upsert = (
+            "ON CONFLICT DO UPDATE SET status=excluded.status,result_count=excluded.result_count,"
+            "evidence_ids=excluded.evidence_ids,hypothesis_updates=excluded.hypothesis_updates,"
+            "error_message=excluded.error_message,completed_at=excluded.completed_at"
+            if self.session.bind and self.session.bind.dialect.name == "sqlite"
+            else "ON DUPLICATE KEY UPDATE status=VALUES(status),result_count=VALUES(result_count),"
+            "evidence_ids=VALUES(evidence_ids),hypothesis_updates=VALUES(hypothesis_updates),"
+            "error_message=VALUES(error_message),completed_at=VALUES(completed_at)"
+        )
         await self.session.execute(
             text(
                 "INSERT INTO resolution_investigation_steps "
                 "(step_id,investigation_id,sequence_no,tool_name,query_payload,status,result_count,evidence_ids,"
                 "hypothesis_updates,error_message,started_at,completed_at) "
                 "VALUES (:step_id,:investigation_id,:sequence_no,:tool_name,:query_payload,:status,:result_count,"
-                ":evidence_ids,:hypothesis_updates,:error_message,:started_at,:completed_at) "
-                "ON DUPLICATE KEY UPDATE status=VALUES(status),result_count=VALUES(result_count),"
-                "evidence_ids=VALUES(evidence_ids),hypothesis_updates=VALUES(hypothesis_updates),"
-                "error_message=VALUES(error_message),completed_at=VALUES(completed_at)"
+                f":evidence_ids,:hypothesis_updates,:error_message,:started_at,:completed_at) {upsert}"
             ),
             {
                 "step_id": self._require("step_id", payload.get("step_id")),
@@ -6250,7 +6454,7 @@ class IncidentRepository:
             text(
                 "UPDATE resolution_investigations SET status=:status,stop_reason=:stop_reason,steps_used=:steps_used,"
                 "evidence_count=:evidence_count,source_coverage=:source_coverage,missing_sources=:missing_sources,"
-                "conclusion=:conclusion,payload=:payload,completed_at=NOW(6),updated_at=NOW(6) "
+                "conclusion=:conclusion,payload=:payload,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP "
                 "WHERE investigation_id=:investigation_id"
             ),
             {
@@ -6270,16 +6474,23 @@ class IncidentRepository:
                 continue
             claim = str(hypothesis["claim"]).strip()
             digest = hashlib.sha256(claim.lower().encode()).hexdigest()
+            upsert = (
+                "ON CONFLICT DO UPDATE SET status=excluded.status,confidence=excluded.confidence,"
+                "supporting_evidence_ids=excluded.supporting_evidence_ids,"
+                "contradicting_evidence_ids=excluded.contradicting_evidence_ids,payload=excluded.payload,"
+                "updated_at=CURRENT_TIMESTAMP"
+                if self.session.bind and self.session.bind.dialect.name == "sqlite"
+                else "ON DUPLICATE KEY UPDATE status=VALUES(status),confidence=VALUES(confidence),"
+                "supporting_evidence_ids=VALUES(supporting_evidence_ids),"
+                "contradicting_evidence_ids=VALUES(contradicting_evidence_ids),payload=VALUES(payload),updated_at=NOW(6)"
+            )
             await self.session.execute(
                 text(
                     "INSERT INTO resolution_hypotheses "
                     "(hypothesis_id,investigation_id,claim_digest,claim_text,status,confidence,supporting_evidence_ids,"
                     "contradicting_evidence_ids,falsification_query,source,payload) "
                     "VALUES (:hypothesis_id,:investigation_id,:claim_digest,:claim_text,:status,:confidence,"
-                    ":supporting,:contradicting,:falsification,:source,:payload) "
-                    "ON DUPLICATE KEY UPDATE status=VALUES(status),confidence=VALUES(confidence),"
-                    "supporting_evidence_ids=VALUES(supporting_evidence_ids),"
-                    "contradicting_evidence_ids=VALUES(contradicting_evidence_ids),payload=VALUES(payload),updated_at=NOW(6)"
+                    f":supporting,:contradicting,:falsification,:source,:payload) {upsert}"
                 ),
                 {
                     "hypothesis_id": str(hypothesis.get("hypothesis_id") or uuid4()),
@@ -6361,10 +6572,13 @@ class IncidentRepository:
                 text(
                     "SELECT rv.content,rv.owner,rv.risk_level,rv.success_count,rv.failure_count,"
                     "ra.approver,ra.approver_role,ra.approved_at "
+                    ",ra.tenant_id,ra.reviewer,ra.content_sha256 "
                     "FROM runbook_versions rv JOIN runbook_approvals ra "
                     "ON ra.runbook_id=rv.runbook_id AND ra.version=rv.version AND ra.status='approved' "
                     "WHERE rv.tenant_id=:tenant_id AND rv.runbook_id=:runbook_id AND rv.version=:version "
-                    "AND rv.approval_status='approved' LIMIT 1"
+                    "AND rv.approval_status='approved' AND ra.tenant_id=:tenant_id "
+                    "AND ra.reviewer IS NOT NULL AND ra.reviewer <> ra.approver "
+                    "AND ra.content_sha256 IS NOT NULL LIMIT 1"
                 ),
                 {"tenant_id": tenant_id, "runbook_id": normalized_runbook_id, "version": int(version)},
             )
@@ -6374,6 +6588,8 @@ class IncidentRepository:
         content = row["content"]
         if isinstance(content, str):
             content = json.loads(content)
+        if not isinstance(content, dict) or str(content.get("content_sha256") or "") != row["content_sha256"]:
+            return None
         attempts = int(row["success_count"] or 0) + int(row["failure_count"] or 0)
         return {
             **(content if isinstance(content, dict) else {}),
@@ -6384,6 +6600,7 @@ class IncidentRepository:
             "risk": row["risk_level"],
             "success_rate": int(row["success_count"] or 0) / attempts if attempts else 0.0,
             "approved_by": row["approver"],
+            "reviewed_by": row["reviewer"],
             "approver_role": row["approver_role"],
             "approved_at": (
                 row["approved_at"].isoformat()
@@ -7527,7 +7744,20 @@ class IncidentRepository:
                     ActionRecord.incident_id == event_record.incident_id,
                     ActionRecord.recommendation_id == protected,
                 ).limit(1))
-                if explicit is None or owned_action is not None:
+                incoming_binding = (
+                    await self.session.get(IncidentInvestigationBindingRecord, candidate)
+                    if candidate is not None
+                    else None
+                )
+                protected_binding = await self.session.get(IncidentInvestigationBindingRecord, protected)
+                newer_committed_rca = bool(
+                    incoming_binding is not None
+                    and (
+                        protected_binding is None
+                        or int(incoming_binding.rca_version or 0) >= int(protected_binding.rca_version or 0)
+                    )
+                )
+                if owned_action is not None or (explicit is None and not newer_committed_rca):
                     # Retain the candidate event/audit for investigation history;
                     # physical execution and recovery keep their reviewed binding.
                     return
@@ -7629,6 +7859,11 @@ class IncidentRepository:
             # executor started. This also protects projection rebuild/replay
             # from restoring the legacy false-remediating state.
             incoming_status = "awaiting_approval" if event_record.requires_approval else "approved"
+        if (
+            event_record.event_type in {"incident.approval.recorded", "incident.action.approved"}
+            and str(projection.status or "").lower() in {"closed", "resolved"}
+        ):
+            incoming_status = projection.status
         projection.status = incoming_status
         lifecycle_by_event = {
             "incident.detected": "DETECTED",
@@ -7652,6 +7887,13 @@ class IncidentRepository:
             "incident.action.approved": "PLAN_READY",
             "incident.remediating": "EXECUTING",
             "action.started": "EXECUTING",
+            "incident.remediation.executed": (
+                "VALIDATING"
+                if str(incoming_status).lower() == "validating"
+                else "EXECUTION_FAILED"
+                if str(incoming_status).lower() == "failed"
+                else "EXECUTING"
+            ),
             "incident.validating": "VALIDATING",
             "incident.resolved": "CLOSED",
             "incident.closed": "CLOSED",
@@ -7669,14 +7911,29 @@ class IncidentRepository:
             "incident.human_enriched": "INVESTIGATING",
         }
         mapped_lifecycle = lifecycle_by_event.get(event_record.event_type)
-        if mapped_lifecycle:
+        if (
+            mapped_lifecycle
+            and not (
+                event_record.event_type in {"incident.approval.recorded", "incident.action.approved"}
+                and str(projection.status or "").lower() in {"closed", "resolved"}
+            )
+        ):
             projection.lifecycle_state = mapped_lifecycle
         if not preserves_bound_generation:
-            projection.risk_tier = event_record.risk_tier
-            projection.execution_mode = event_record.execution_mode
-            projection.requires_approval = event_record.requires_approval
-            projection.policy_version = event_record.policy_version
-            projection.policy_reason = event_record.policy_reason
+            if event_record.risk_tier and str(event_record.risk_tier).lower() != "unknown":
+                projection.risk_tier = event_record.risk_tier
+            elif not projection.risk_tier:
+                projection.risk_tier = event_record.risk_tier
+            if event_record.execution_mode and str(event_record.execution_mode).lower() != "unknown":
+                projection.execution_mode = event_record.execution_mode
+            elif not projection.execution_mode:
+                projection.execution_mode = event_record.execution_mode
+            if event_record.requires_approval is not None or projection.requires_approval is None:
+                projection.requires_approval = event_record.requires_approval
+            if event_record.policy_version is not None or projection.policy_version is None:
+                projection.policy_version = event_record.policy_version
+            if event_record.policy_reason is not None or projection.policy_reason is None:
+                projection.policy_reason = event_record.policy_reason
         projection.transport_provider = event_record.transport_provider
         projection.latest_event_id = event_record.id
         projection.latest_event_type = event_record.event_type
@@ -7772,6 +8029,8 @@ class IncidentRepository:
                 await self.session.merge(record)
                 await self.session.flush()
         except IntegrityError:
+            if record.event_type == "incident.recommendation.generated":
+                await self._upsert_projection_from_record(record)
             return
         await self._upsert_projection_from_record(record)
 
@@ -8111,6 +8370,7 @@ class IncidentRepository:
         incident_status = case(
             (func.lower(IncidentRecord.status).in_(terminal), func.lower(IncidentRecord.status)),
             (legacy_status.in_(terminal), legacy_status),
+            (legacy_status.in_(("awaiting_approval", "pending_approval", "approval_required")), legacy_status),
             (and_(lifecycle.not_in(early_states), lifecycle != ""), lifecycle),
             (owner.canonical_incident_id.in_(blocking_human_incidents), "waiting_for_human"),
             (owner.canonical_incident_id.in_(collecting_incidents), "collecting"),
@@ -8118,6 +8378,7 @@ class IncidentRepository:
             (owner.canonical_incident_id.in_(conclusive_binding_incidents), "rca_ready"),
             (owner.canonical_incident_id.in_(investigating_binding_incidents), "investigating"),
             (owner.canonical_incident_id.in_(blocked_incidents), "collection_blocked"),
+            (legacy_status == "waiting_for_human", "waiting_for_human"),
             (owner.canonical_incident_id.in_(unresolved_incidents), "requirements_identified"),
             (and_(lifecycle == "detected", legacy_status == "investigating",
                   owner.canonical_incident_id.notin_(tuple(binding_versions))), lifecycle),
@@ -8454,8 +8715,13 @@ class IncidentRepository:
                     IncidentCorrelationOwnershipRecord.tenant_id == tenant_id,
                     or_(
                         latest_generation.c.generation.is_not(None),
-                        IncidentCorrelationOwnershipRecord.lifecycle_state.in_(attention),
-                        IncidentProjectionRecord.status.in_(attention),
+                        and_(
+                            IncidentCorrelationOwnershipRecord.lifecycle_state.not_in(terminal),
+                            or_(
+                                IncidentCorrelationOwnershipRecord.lifecycle_state.in_(attention),
+                                IncidentProjectionRecord.status.in_(attention),
+                            ),
+                        ),
                     ),
                 )
             )
@@ -8666,7 +8932,36 @@ class IncidentRepository:
         occurrence_counts: dict[UUID, int] = {}
         occurrences_by_incident: dict[UUID, list[dict[str, Any]]] = {}
         terminal_history: dict[UUID, int] = {}
+        incident_status_by_id: dict[UUID, str] = {}
+        waiting_human_incidents: set[UUID] = set()
         if canonical_ids:
+            incident_status_rows = await self.session.execute(
+                select(IncidentRecord.id, IncidentRecord.status).where(
+                    IncidentRecord.tenant_id == tenant_id,
+                    IncidentRecord.id.in_(canonical_ids),
+                )
+            )
+            incident_status_by_id = {
+                inc_id: str(st or "").strip().lower()
+                for inc_id, st in incident_status_rows.all()
+            }
+            human_waiting_rows = await self.session.execute(
+                select(HumanEvidenceRequestRecord.incident_id)
+                .join(
+                    ContextEvidenceRequirementRecord,
+                    and_(
+                        ContextEvidenceRequirementRecord.requirement_id == HumanEvidenceRequestRecord.requirement_id,
+                        ContextEvidenceRequirementRecord.tenant_id == HumanEvidenceRequestRecord.tenant_id,
+                    ),
+                )
+                .where(
+                    HumanEvidenceRequestRecord.tenant_id == tenant_id,
+                    HumanEvidenceRequestRecord.incident_id.in_(canonical_ids),
+                    HumanEvidenceRequestRecord.status.in_(("pending", "assigned", "open", "in_progress")),
+                    ContextEvidenceRequirementRecord.status.not_in(("collected", "answered", "satisfied", "cancelled")),
+                )
+            )
+            waiting_human_incidents = {inc_id for (inc_id,) in human_waiting_rows.all()}
             count_rows = await self.session.execute(
                 select(IncidentOccurrenceRecord.canonical_incident_id, func.count(IncidentOccurrenceRecord.id))
                 .where(IncidentOccurrenceRecord.canonical_incident_id.in_(canonical_ids))
@@ -8703,13 +8998,38 @@ class IncidentRepository:
             terminal_history = {family_id: int(count) for family_id, count in history_rows.all()}
 
         response_rows: list[dict[str, Any]] = []
+        approval_states = {"awaiting_approval", "pending_approval", "approval_required"}
+        post_approval_states = {"approved", "executing", "validating", "remediating"}
         for ownership in ownership_rows:
             projection = dict(projection_by_id.get(str(ownership.canonical_incident_id), {}))
             count = occurrence_counts.get(ownership.canonical_incident_id, 0)
             ownership_lifecycle = str(ownership.lifecycle_state or "").strip().lower()
             projected_status = str(projection.get("status") or "").strip().lower()
             projected_lifecycle = str(projection.get("lifecycle_state") or "").strip().lower()
-            if (
+            incident_record_status = incident_status_by_id.get(ownership.canonical_incident_id, "")
+            if incident_record_status in terminal:
+                lifecycle = incident_record_status
+            elif ownership_lifecycle in terminal or projected_status in terminal:
+                lifecycle = ownership_lifecycle if ownership_lifecycle in terminal else projected_status
+            elif (
+                incident_record_status in approval_states
+                or projected_status in approval_states
+                or ownership_lifecycle in approval_states
+            ):
+                lifecycle = (
+                    projected_status
+                    if projected_status in approval_states
+                    else ownership_lifecycle
+                    if ownership_lifecycle in approval_states
+                    else incident_record_status
+                )
+            elif (
+                (ownership.canonical_incident_id in waiting_human_incidents or projected_lifecycle == "waiting_for_human")
+                and projected_status not in post_approval_states
+                and ownership_lifecycle not in post_approval_states
+            ):
+                lifecycle = "waiting_for_human"
+            elif (
                 projected_status
                 and projected_status not in {"", "open", "investigating", "detected"}
             ):
@@ -8721,7 +9041,7 @@ class IncidentRepository:
             ):
                 lifecycle = projected_lifecycle
             else:
-                lifecycle = ownership_lifecycle or projected_status or "open"
+                lifecycle = ownership_lifecycle or projected_status or incident_record_status or "open"
             projection.update({
                 "canonical_incident_id": str(ownership.canonical_incident_id),
                 "incident_id": str(ownership.canonical_incident_id),
@@ -11564,7 +11884,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                              for request in human_requests)
         collecting = any(str(job.get("status")).lower() in {"scheduled", "collecting", "retry"}
                          for job in active_jobs)
-        if blocking_human or waiting_human:
+        if blocking_human:
             lifecycle_state = "WAITING_FOR_HUMAN"
             next_action = {"type": "HUMAN_EVIDENCE", "message": "KaiMS is waiting for assigned human evidence."}
         elif collecting:
@@ -12400,6 +12720,8 @@ class ContextEnrichmentRepository(EvaluationRepository):
             incident_row = await self.session.get(IncidentRecord, inc_uuid)
             if incident_row is not None and incident_row.tenant_id == tenant and incident_row.status in {"open", "acknowledged", "investigating", "collecting"}:
                 incident_row.status = "waiting_for_human"
+                if isinstance(getattr(incident_row, "payload", None), dict):
+                    incident_row.payload = {**dict(incident_row.payload), "status": "waiting_for_human"}
                 incident_row.updated_at = datetime.now(UTC)
             projection_row = await self.session.scalar(select(IncidentProjectionRecord).where(
                 IncidentProjectionRecord.tenant_id == tenant,
@@ -12708,6 +13030,12 @@ class ContextEnrichmentRepository(EvaluationRepository):
         business_impact_input = str(response.get("business_impact") or "").strip() or None
         remediation_steps_input = str(response.get("remediation_steps") or "").strip() or None
         assertion_text = self._require("human_evidence.response", response.get("response"))
+        if not remediation_steps_input:
+            for candidate_src in (assertion_text, root_cause_input or ""):
+                m_inline = re.search(r"\b(?:command|cmd)\s*:\s*(.+)$", str(candidate_src or ""), flags=re.IGNORECASE | re.MULTILINE)
+                if m_inline and m_inline.group(1).strip():
+                    remediation_steps_input = m_inline.group(1).strip().strip("`").strip()
+                    break
         content: dict[str, Any] = {
             "assertion": assertion_text,
             "requirement_category": requirement.category,
@@ -12838,11 +13166,21 @@ class ContextEnrichmentRepository(EvaluationRepository):
             if remediation_steps_input:
                 frontmatter_lines.extend(["", "## Remediation Steps", remediation_steps_input])
                 cmd_lines = [
-                    re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.strip()).strip().strip("`").strip()
+                    re.sub(
+                        r"^(?:command|cmd|step|remediation|validation|rollback)\s*:\s*",
+                        "",
+                        re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.strip()).strip(),
+                        flags=re.IGNORECASE,
+                    ).strip()
                     for line in remediation_steps_input.splitlines()
                     if line.strip() and any(
-                        re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.strip()).strip().strip("`").strip().lower().startswith(prefix)
-                        for prefix in ("kubectl ", "docker ", "systemctl ", "curl ", "mysql ", "redis-cli ", "terraform ", "ansible-playbook ", "bash ", "sh ", "python ")
+                        re.sub(
+                            r"^(?:command|cmd|step|remediation|validation|rollback)\s*:\s*",
+                            "",
+                            re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.strip()).strip(),
+                            flags=re.IGNORECASE,
+                        ).strip().lower().startswith(prefix)
+                        for prefix in ("kubectl ", "docker ", "systemctl ", "curl ", "container_id=", "mysql ", "redis-cli ", "terraform ", "ansible-playbook ", "bash ", "sh ", "python ")
                     )
                 ]
                 if cmd_lines:
@@ -12929,7 +13267,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     title=draft_title,
                     content=draft_content,
                     review_notes="Automatically reviewed from verified responder runbook guidance",
-                    reviewed_by=responder,
+                    reviewed_by=f"{responder}:auto-review",
                 )
                 if reviewed_draft is not None:
                     approved_result = await draft_repo.approve_knowledge_rag_draft(
@@ -12953,6 +13291,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                         learned_runbook_entry = {
                             "runbook_id": str(rb_id),
                             "version": rb_version,
+                            "runbook_version": rb_version,
                             "tenant_id": tenant,
                             "issue_signature": hashlib.sha256(f"{tenant}:{svc}".encode()).hexdigest(),
                             "approval_status": "approved",
@@ -12972,6 +13311,7 @@ class ContextEnrichmentRepository(EvaluationRepository):
                             "business_impact": enriched_rb.get("business_impact"),
                             "remediation_steps": enriched_rb.get("remediation_steps"),
                             "commands": list(enriched_rb.get("commands") or []),
+                            "steps": list(enriched_rb.get("commands") or []),
                             "execution_Verification": dict(enriched_rb.get("execution_Verification") or {}),
                             "approved_at": datetime.now(UTC).isoformat(),
                         }
@@ -13028,11 +13368,21 @@ class ContextEnrichmentRepository(EvaluationRepository):
                     sections.extend(["", "## Business Impact", business_impact_input])
                 if remediation_steps_input:
                     cmd_lines = [
-                        re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.strip()).strip().strip("`").strip()
+                        re.sub(
+                            r"^(?:command|cmd|step|remediation|validation|rollback)\s*:\s*",
+                            "",
+                            re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.strip()).strip(),
+                            flags=re.IGNORECASE,
+                        ).strip()
                         for line in remediation_steps_input.splitlines()
                         if line.strip() and any(
-                            re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.strip()).strip().strip("`").strip().lower().startswith(prefix)
-                            for prefix in ("kubectl ", "docker ", "systemctl ", "curl ", "mysql ", "redis-cli ", "terraform ", "ansible-playbook ", "bash ", "sh ", "python ")
+                            re.sub(
+                                r"^(?:command|cmd|step|remediation|validation|rollback)\s*:\s*",
+                                "",
+                                re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", line.strip()).strip(),
+                                flags=re.IGNORECASE,
+                            ).strip().lower().startswith(prefix)
+                            for prefix in ("kubectl ", "docker ", "systemctl ", "curl ", "container_id=", "mysql ", "redis-cli ", "terraform ", "ansible-playbook ", "bash ", "sh ", "python ")
                         )
                     ]
                     sections.extend(["", "## Remediation Steps", remediation_steps_input])

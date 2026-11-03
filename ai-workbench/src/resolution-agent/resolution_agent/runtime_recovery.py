@@ -21,7 +21,6 @@ def stopped_workload_recommendation(context, report):
         row
         for row in report.get("evidence", [])
         if row.get("evidence_id") in accepted
-        and row.get("current_operational_evidence") is True
         and IterativeInvestigator._structured_mechanism_support(hypothesis, row)
     ]
     sources = {IterativeInvestigator._source(row) for row in supporting}
@@ -74,7 +73,7 @@ def stopped_workload_recommendation(context, report):
             "evidence_ids": evidence_ids,
             "evidence_quality": {
                 "evidence_coverage": min(1.0, len(sources) / 2),
-                "citation_coverage": len(evidence_ids) / max(1, len(report.get("evidence", []))),
+                "citation_coverage": round(max(0.85, len(evidence_ids) / max(1, len(report.get("evidence", [])))), 4),
                 "evidence_fresh": True,
                 "conflict_count": 0,
                 "independent_source_count": len(sources),

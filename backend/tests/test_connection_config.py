@@ -247,7 +247,7 @@ def test_policy_engine_alert_uses_reviewed_target_connector_not_detector_connect
     assert plan["readiness_blocks"] == []
 
 
-def test_alternative_or_incomplete_mutations_require_operator_resolution() -> None:
+def test_incomplete_mutations_require_operator_resolution() -> None:
     latency = _resolve(
         Alert(
             source="prometheus",
@@ -268,7 +268,8 @@ def test_alternative_or_incomplete_mutations_require_operator_resolution() -> No
     )
 
     assert latency["execution_ready"] is False
-    assert any("operator selection" in reason for reason in latency["readiness_blocks"])
+    assert any("requires: replicas" in reason for reason in latency["readiness_blocks"])
+    assert any("rollback requires: previous_replicas" in reason for reason in latency["readiness_blocks"])
     assert mysql["execution_ready"] is False
     assert any("rollback is a procedure" in reason for reason in mysql["readiness_blocks"])
 
@@ -351,7 +352,7 @@ def test_docker_compose_restart_without_acknowledged_recovery_strategy_stays_blo
     assert "mutating plan has no executable rollback" in plan["readiness_blocks"]
 
 
-def test_docker_compose_does_not_emit_unsupported_scale_commands(monkeypatch) -> None:
+def test_docker_compose_uses_the_supported_scale_executor(monkeypatch) -> None:
     monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
 
     plan = _resolve(
@@ -364,9 +365,11 @@ def test_docker_compose_does_not_emit_unsupported_scale_commands(monkeypatch) ->
         )
     )
 
-    assert plan["execution_ready"] is False
-    assert plan["commands"] == []
-    assert any("does not implement catalog operations" in reason for reason in plan["readiness_blocks"])
+    assert plan["execution_ready"] is True
+    assert len(plan["commands"]) == 1
+    assert "--scale api-gateway=2 api-gateway" in plan["commands"][0]
+    assert plan["rollback_commands"]
+    assert "--scale api-gateway=1 api-gateway" in plan["rollback_commands"][0]
 
 
 def _catalogs_with_scale_only_playbook():
@@ -444,7 +447,7 @@ def test_docker_compose_scale_service_stays_blocked_outside_internal_services(mo
         Alert(
             source="prometheus",
             name="KaiOpsHighLatencyP95",
-            service="kaiops-core1",
+            service="external-orders-api",
             severity=AlertSeverity.CRITICAL,
             description="p95 latency is above the SLO",
         )

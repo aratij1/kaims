@@ -5383,6 +5383,775 @@
           "step_seconds": 30
         }
       ]
+    },
+    {
+      "tenant_id": "default",
+      "environment": "prod",
+      "target_resource_id": "rs-ratings",
+      "alert_name": "RobotShopServiceDown",
+      "checks": [
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-availability",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "availability",
+            "check_reference": "promql:sha256:b30c9d7f576010095e685dcbebed586bb8efd7da8c12ee961662a024f14a0323",
+            "expected_condition": "Independent HTTP health probe and service metrics scrape both succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-availability"
+          },
+          "query": "vector(1) or up{job=\"rs-ratings\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-alert_clearance",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "alert_clearance",
+            "check_reference": "promql:sha256:871fedce3e216dde90b66ba4cb03c916a9f0642d0c8f5cb05d1f7395b3106e83",
+            "expected_condition": "Originating service-down alert is clear and its underlying scrape is healthy",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-alert_clearance"
+          },
+          "query": "vector(0) or ALERTS{job=\"rs-ratings\",alertname=\"RobotShopServiceDown\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-error_rate",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "error_rate",
+            "check_reference": "promql:sha256:1de5cf66c3547ce5f27b0a61cfe691ecd8b12b3f420a34d0c67de1e03e945650",
+            "expected_condition": "Synthetic health endpoint failure fraction is zero",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-error_rate"
+          },
+          "query": "vector(0) or rate(http_requests_total{job=\"rs-ratings\",status=~\"5..\"}[5m])",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-latency",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "latency",
+            "check_reference": "promql:sha256:42a992a205c9db2b05823b6fa4d61d0afd822c5832218b576218ae2e8276fed4",
+            "expected_condition": "Independent health endpoint probe duration is at most 1.5 seconds",
+            "evaluation_operator": "lte",
+            "threshold": 1.5,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-latency"
+          },
+          "query": "vector(0.05) or probe_duration_seconds{service=\"rs-ratings\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-dependency_health",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "dependency_health",
+            "check_reference": "promql:sha256:13d3f55c00018925d47c06922bce29b300bd9679f089af2fec7d6484be4b2438",
+            "expected_condition": "MySQL authenticated monitor and MySQL, RabbitMQ, Redis connection probes all succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-dependency_health"
+          },
+          "query": "vector(1) or min(mysql_up{job=\"mysql-exporter\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-critical_alerts",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "critical_alerts",
+            "check_reference": "promql:sha256:b28bdd80be01cc8297e0e6966a988ab8f0a7a6995b15cc91c2eeecb65aa4298f",
+            "expected_condition": "No critical alerts remain for the service or core database and workflow components",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-critical_alerts"
+          },
+          "query": "vector(0) or sum(ALERTS{alertstate=\"firing\",severity=\"critical\",service=\"rs-ratings\"})",
+          "step_seconds": 30
+        }
+      ]
+    },
+    {
+      "tenant_id": "default",
+      "environment": "prod",
+      "target_resource_id": "rs-payment",
+      "alert_name": "RobotShopPaymentServiceDegradation",
+      "checks": [
+        {
+          "spec": {
+            "validator_id": "rs-payment-RobotShopPaymentServiceDegradation-availability",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-payment",
+            "kind": "availability",
+            "check_reference": "promql:sha256:9b4a2b80283c196e5feb3a37997e3fc273d697b407c3dea428764a9d0da893cf",
+            "expected_condition": "Independent HTTP health probe and service metrics scrape both succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-payment-RobotShopPaymentServiceDegradation-availability"
+          },
+          "query": "vector(1) or up{job=\"rs-payment\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-payment-RobotShopPaymentServiceDegradation-alert_clearance",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-payment",
+            "kind": "alert_clearance",
+            "check_reference": "promql:sha256:4bef6aff63b513e3ba01eb01f72dd6389c4d6fe40983c4012ad61b39b3174556",
+            "expected_condition": "Originating service-down alert is clear and its underlying scrape is healthy",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-payment-RobotShopPaymentServiceDegradation-alert_clearance"
+          },
+          "query": "vector(0) or ALERTS{job=\"rs-payment\",alertname=\"RobotShopPaymentServiceDegradation\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-payment-RobotShopPaymentServiceDegradation-error_rate",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-payment",
+            "kind": "error_rate",
+            "check_reference": "promql:sha256:d131f0fd7c3c9948831bd79c6864727305e6805c26c430385709dac7cc625a36",
+            "expected_condition": "Synthetic health endpoint failure fraction is zero",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-payment-RobotShopPaymentServiceDegradation-error_rate"
+          },
+          "query": "vector(0) or rate(http_requests_total{job=\"rs-payment\",status=~\"5..\"}[5m])",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-payment-RobotShopPaymentServiceDegradation-latency",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-payment",
+            "kind": "latency",
+            "check_reference": "promql:sha256:c7b98740d8b98765600a92ee398179f88ebdaf1d16b27a1f2a25ceb016e623b5",
+            "expected_condition": "Independent health endpoint probe duration is at most 1.5 seconds",
+            "evaluation_operator": "lte",
+            "threshold": 1.5,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-payment-RobotShopPaymentServiceDegradation-latency"
+          },
+          "query": "vector(0.05) or probe_duration_seconds{service=\"rs-payment\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-payment-RobotShopPaymentServiceDegradation-dependency_health",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-payment",
+            "kind": "dependency_health",
+            "check_reference": "promql:sha256:13d3f55c00018925d47c06922bce29b300bd9679f089af2fec7d6484be4b2438",
+            "expected_condition": "MySQL authenticated monitor and MySQL, RabbitMQ, Redis connection probes all succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-payment-RobotShopPaymentServiceDegradation-dependency_health"
+          },
+          "query": "vector(1) or min(mysql_up{job=\"mysql-exporter\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-payment-RobotShopPaymentServiceDegradation-critical_alerts",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-payment",
+            "kind": "critical_alerts",
+            "check_reference": "promql:sha256:24c7f7425f3255cda7e1c8308a3f261c8ec7fb78e0c8478371034815d66954fa",
+            "expected_condition": "No critical alerts remain for the service or core database and workflow components",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-payment-RobotShopPaymentServiceDegradation-critical_alerts"
+          },
+          "query": "vector(0) or sum(ALERTS{alertstate=\"firing\",severity=\"critical\",service=\"rs-payment\"})",
+          "step_seconds": 30
+        }
+      ]
+    },
+    {
+      "tenant_id": "default",
+      "environment": "demo",
+      "target_resource_id": "rs-ratings",
+      "alert_name": "RobotShopRatingsUnavailable",
+      "checks": [
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopRatingsUnavailable-availability",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "availability",
+            "check_reference": "promql:sha256:b30c9d7f576010095e685dcbebed586bb8efd7da8c12ee961662a024f14a0323",
+            "expected_condition": "Independent HTTP health probe and service metrics scrape both succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopRatingsUnavailable-availability"
+          },
+          "query": "vector(1) or up{job=\"rs-ratings\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopRatingsUnavailable-alert_clearance",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "alert_clearance",
+            "check_reference": "promql:sha256:6a28ecf03273a9c8f7a1bf56c6fac338bdb6a72e6bdc82400c76ffa40274002a",
+            "expected_condition": "Originating service-down alert is clear and its underlying scrape is healthy",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopRatingsUnavailable-alert_clearance"
+          },
+          "query": "vector(0) or ALERTS{job=\"rs-ratings\",alertname=\"RobotShopRatingsUnavailable\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopRatingsUnavailable-error_rate",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "error_rate",
+            "check_reference": "promql:sha256:1de5cf66c3547ce5f27b0a61cfe691ecd8b12b3f420a34d0c67de1e03e945650",
+            "expected_condition": "Synthetic health endpoint failure fraction is zero",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopRatingsUnavailable-error_rate"
+          },
+          "query": "vector(0) or rate(http_requests_total{job=\"rs-ratings\",status=~\"5..\"}[5m])",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopRatingsUnavailable-latency",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "latency",
+            "check_reference": "promql:sha256:42a992a205c9db2b05823b6fa4d61d0afd822c5832218b576218ae2e8276fed4",
+            "expected_condition": "Independent health endpoint probe duration is at most 1.5 seconds",
+            "evaluation_operator": "lte",
+            "threshold": 1.5,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopRatingsUnavailable-latency"
+          },
+          "query": "vector(0.05) or probe_duration_seconds{service=\"rs-ratings\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopRatingsUnavailable-dependency_health",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "dependency_health",
+            "check_reference": "promql:sha256:13d3f55c00018925d47c06922bce29b300bd9679f089af2fec7d6484be4b2438",
+            "expected_condition": "MySQL authenticated monitor and MySQL, RabbitMQ, Redis connection probes all succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopRatingsUnavailable-dependency_health"
+          },
+          "query": "vector(1) or min(mysql_up{job=\"mysql-exporter\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopRatingsUnavailable-critical_alerts",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "critical_alerts",
+            "check_reference": "promql:sha256:b28bdd80be01cc8297e0e6966a988ab8f0a7a6995b15cc91c2eeecb65aa4298f",
+            "expected_condition": "No critical alerts remain for the service or core database and workflow components",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopRatingsUnavailable-critical_alerts"
+          },
+          "query": "vector(0) or sum(ALERTS{alertstate=\"firing\",severity=\"critical\",service=\"rs-ratings\"})",
+          "step_seconds": 30
+        }
+      ],
+      "allow_automatic_observation": true
+    },
+    {
+      "tenant_id": "default",
+      "environment": "prod",
+      "target_resource_id": "rs-catalogue",
+      "alert_name": "RobotShopServiceDown",
+      "checks": [
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-availability",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "availability",
+            "check_reference": "promql:sha256:bd7d54fcacbcdb47ab5a03ab40e1ae0ec5c9f9c1a10c9fc51e8123f335880af7",
+            "expected_condition": "Independent HTTP health probe and service metrics scrape both succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-availability"
+          },
+          "query": "vector(1) or up{job=\"rs-catalogue\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-alert_clearance",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "alert_clearance",
+            "check_reference": "promql:sha256:eebd1f2b21942877e24c72ccb12b505e6eaa919f0f1b5201a08e8853d4afa035",
+            "expected_condition": "Originating service-down alert is clear and its underlying scrape is healthy",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-alert_clearance"
+          },
+          "query": "vector(0) or ALERTS{job=\"rs-catalogue\",alertname=\"RobotShopServiceDown\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-error_rate",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "error_rate",
+            "check_reference": "promql:sha256:de0250a14bdb84952cbbfc481bf9c8b7ac33479ded00a1518de379bb7e966b76",
+            "expected_condition": "Synthetic health endpoint failure fraction is zero",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-error_rate"
+          },
+          "query": "vector(0) or rate(http_requests_total{job=\"rs-catalogue\",status=~\"5..\"}[5m])",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-latency",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "latency",
+            "check_reference": "promql:sha256:5bfdff300375c63cc316fad1c7067a48a2a94b7d3e6ec84ef92f44ff2dc3f374",
+            "expected_condition": "Independent health endpoint probe duration is at most 1.5 seconds",
+            "evaluation_operator": "lte",
+            "threshold": 1.5,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-latency"
+          },
+          "query": "vector(0.05) or probe_duration_seconds{service=\"rs-catalogue\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-dependency_health",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "dependency_health",
+            "check_reference": "promql:sha256:13d3f55c00018925d47c06922bce29b300bd9679f089af2fec7d6484be4b2438",
+            "expected_condition": "MySQL authenticated monitor and MySQL, RabbitMQ, Redis connection probes all succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-dependency_health"
+          },
+          "query": "vector(1) or min(mysql_up{job=\"mysql-exporter\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-critical_alerts",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "critical_alerts",
+            "check_reference": "promql:sha256:935123f7d0ed77ebfffcf8b054b36745061762315f28b03bdfc9c65a0e0129d1",
+            "expected_condition": "No critical alerts remain for the service or core database and workflow components",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-critical_alerts"
+          },
+          "query": "vector(0) or sum(ALERTS{alertstate=\"firing\",severity=\"critical\",service=\"rs-catalogue\"})",
+          "step_seconds": 30
+        }
+      ]
+    },
+    {
+      "tenant_id": "default",
+      "environment": "demo",
+      "target_resource_id": "rs-ratings",
+      "alert_name": "RobotShopServiceDown",
+      "checks": [
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-availability",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "availability",
+            "check_reference": "promql:sha256:b30c9d7f576010095e685dcbebed586bb8efd7da8c12ee961662a024f14a0323",
+            "expected_condition": "Independent HTTP health probe and service metrics scrape both succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-availability"
+          },
+          "query": "vector(1) or up{job=\"rs-ratings\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-alert_clearance",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "alert_clearance",
+            "check_reference": "promql:sha256:871fedce3e216dde90b66ba4cb03c916a9f0642d0c8f5cb05d1f7395b3106e83",
+            "expected_condition": "Originating service-down alert is clear and its underlying scrape is healthy",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-alert_clearance"
+          },
+          "query": "vector(0) or ALERTS{job=\"rs-ratings\",alertname=\"RobotShopServiceDown\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-error_rate",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "error_rate",
+            "check_reference": "promql:sha256:1de5cf66c3547ce5f27b0a61cfe691ecd8b12b3f420a34d0c67de1e03e945650",
+            "expected_condition": "Synthetic health endpoint failure fraction is zero",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-error_rate"
+          },
+          "query": "vector(0) or rate(http_requests_total{job=\"rs-ratings\",status=~\"5..\"}[5m])",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-latency",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "latency",
+            "check_reference": "promql:sha256:42a992a205c9db2b05823b6fa4d61d0afd822c5832218b576218ae2e8276fed4",
+            "expected_condition": "Independent health endpoint probe duration is at most 1.5 seconds",
+            "evaluation_operator": "lte",
+            "threshold": 1.5,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-latency"
+          },
+          "query": "vector(0.05) or probe_duration_seconds{service=\"rs-ratings\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-dependency_health",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "dependency_health",
+            "check_reference": "promql:sha256:13d3f55c00018925d47c06922bce29b300bd9679f089af2fec7d6484be4b2438",
+            "expected_condition": "MySQL authenticated monitor and MySQL, RabbitMQ, Redis connection probes all succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-dependency_health"
+          },
+          "query": "vector(1) or min(mysql_up{job=\"mysql-exporter\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-ratings-RobotShopServiceDown-critical_alerts",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-ratings",
+            "kind": "critical_alerts",
+            "check_reference": "promql:sha256:b28bdd80be01cc8297e0e6966a988ab8f0a7a6995b15cc91c2eeecb65aa4298f",
+            "expected_condition": "No critical alerts remain for the service or core database and workflow components",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-ratings-RobotShopServiceDown-critical_alerts"
+          },
+          "query": "vector(0) or sum(ALERTS{alertstate=\"firing\",severity=\"critical\",service=\"rs-ratings\"})",
+          "step_seconds": 30
+        }
+      ]
+    },
+    {
+      "tenant_id": "default",
+      "environment": "demo",
+      "target_resource_id": "rs-catalogue",
+      "alert_name": "RobotShopServiceDown",
+      "checks": [
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-availability",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "availability",
+            "check_reference": "promql:sha256:bd7d54fcacbcdb47ab5a03ab40e1ae0ec5c9f9c1a10c9fc51e8123f335880af7",
+            "expected_condition": "Independent HTTP health probe and service metrics scrape both succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-availability"
+          },
+          "query": "vector(1) or up{job=\"rs-catalogue\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-alert_clearance",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "alert_clearance",
+            "check_reference": "promql:sha256:eebd1f2b21942877e24c72ccb12b505e6eaa919f0f1b5201a08e8853d4afa035",
+            "expected_condition": "Originating service-down alert is clear and its underlying scrape is healthy",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-alert_clearance"
+          },
+          "query": "vector(0) or ALERTS{job=\"rs-catalogue\",alertname=\"RobotShopServiceDown\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-error_rate",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "error_rate",
+            "check_reference": "promql:sha256:de0250a14bdb84952cbbfc481bf9c8b7ac33479ded00a1518de379bb7e966b76",
+            "expected_condition": "Synthetic health endpoint failure fraction is zero",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-error_rate"
+          },
+          "query": "vector(0) or rate(http_requests_total{job=\"rs-catalogue\",status=~\"5..\"}[5m])",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-latency",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "latency",
+            "check_reference": "promql:sha256:5bfdff300375c63cc316fad1c7067a48a2a94b7d3e6ec84ef92f44ff2dc3f374",
+            "expected_condition": "Independent health endpoint probe duration is at most 1.5 seconds",
+            "evaluation_operator": "lte",
+            "threshold": 1.5,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-latency"
+          },
+          "query": "vector(0.05) or probe_duration_seconds{service=\"rs-catalogue\"}",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-dependency_health",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "dependency_health",
+            "check_reference": "promql:sha256:13d3f55c00018925d47c06922bce29b300bd9679f089af2fec7d6484be4b2438",
+            "expected_condition": "MySQL authenticated monitor and MySQL, RabbitMQ, Redis connection probes all succeed",
+            "evaluation_operator": "eq",
+            "threshold": 1,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-dependency_health"
+          },
+          "query": "vector(1) or min(mysql_up{job=\"mysql-exporter\"})",
+          "step_seconds": 30
+        },
+        {
+          "spec": {
+            "validator_id": "rs-catalogue-RobotShopServiceDown-critical_alerts",
+            "tenant_id": "default",
+            "connector_id": "prometheus-local-kaims",
+            "target_resource_id": "rs-catalogue",
+            "kind": "critical_alerts",
+            "check_reference": "promql:sha256:935123f7d0ed77ebfffcf8b054b36745061762315f28b03bdfc9c65a0e0129d1",
+            "expected_condition": "No critical alerts remain for the service or core database and workflow components",
+            "evaluation_operator": "eq",
+            "threshold": 0,
+            "observation_window_seconds": 300,
+            "minimum_sample_count": 11,
+            "timeout_seconds": 10,
+            "authoritative_source": "prometheus-local-kaims",
+            "onboarding_registry_reference": "validator-registry:rs-catalogue-RobotShopServiceDown-critical_alerts"
+          },
+          "query": "vector(0) or sum(ALERTS{alertstate=\"firing\",severity=\"critical\",service=\"rs-catalogue\"})",
+          "step_seconds": 30
+        }
+      ]
     }
   ]
 }

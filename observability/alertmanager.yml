@@ -15,6 +15,12 @@ route:
         - environment="demo"
         - service="frontend-proxy"
         - alertname="TelemetryApplicationUnavailable"
+    - receiver: kaiops-landing-pad
+      matchers:
+        - alertname="RobotShopRatingsUnavailable"
+        - service="rs-ratings"
+        - environment="demo"
+        - monitoring_scope="demo"
     - receiver: demo-monitoring-only
       matchers:
         - monitoring_scope="demo"

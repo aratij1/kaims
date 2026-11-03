@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -10,12 +11,25 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from common.config import get_settings
 from common.continuous_learning import FailurePattern, FailurePatternAnalyzer, IncidentEvidence, issue_signature
-from common.database import ActionRecord, FailurePatternRecord, IncidentEvidenceRecord, IncidentRecord, KnowledgeBaseRecord, KnowledgeRagDraftRecord, LearningAuditRecord, RcaReportRecord, RunbookOutcomeRecord, RunbookVersionRecord
+from common.database import (
+    ActionRecord,
+    FailurePatternRecord,
+    IncidentEvidenceRecord,
+    IncidentRecord,
+    KnowledgeBaseRecord,
+    KnowledgeRagDraftRecord,
+    LearningAuditRecord,
+    RcaReportRecord,
+    RunbookApprovalRecord,
+    RunbookOutcomeRecord,
+    RunbookVersionRecord,
+)
 from common.learning_workflows import Mode02Worker
 from common.models import EvidenceReference
 from common.service import create_app
 from common.tenant_identity import require_tenant_id
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import load_only
@@ -68,7 +82,7 @@ class RunRequest(BaseModel):
 class CatalogPromotionRequest(BaseModel):
     tenant_id: str
     actor: str = Field(min_length=1, max_length=255)
-    decision: Literal["approve", "reject"]
+    decision: Literal["review", "approve", "reject"]
     expected_content_sha256: str = Field(min_length=64, max_length=64)
     risk_level: Literal["low", "medium", "high"] = "medium"
     reason: str = Field(default="", max_length=2000)
@@ -103,6 +117,13 @@ def _iso(value: datetime | None) -> str | None:
 def _hash(payload: dict[str, Any]) -> str:
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _candidate_content_sha(content: dict[str, Any]) -> str:
+    immutable_payload = dict(content)
+    immutable_payload.pop("content_sha256", None)
+    immutable_payload.pop("version", None)
+    return _hash(immutable_payload)
 
 
 def _in_application_scope(scope: str, *, service: str, application: str = "") -> bool:
@@ -356,9 +377,35 @@ def _bootstrap_evidence(request: IncidentBootstrapRequest) -> IncidentEvidence:
 def _build_evidence(report: RcaReportRecord, incident: IncidentRecord, latest_action: ActionRecord | None) -> IncidentEvidence:
     report_payload = report.payload if isinstance(report.payload, dict) else {}
     action_payload = latest_action.payload if latest_action and isinstance(latest_action.payload, dict) else {}
-    validation = action_payload.get("validation") if isinstance(action_payload.get("validation"), dict) else {}
+    validation = report_payload.get("validation") if isinstance(report_payload.get("validation"), dict) else {}
+    report_metadata = report_payload.get("metadata") if isinstance(report_payload.get("metadata"), dict) else {}
+    stability_window = report_metadata.get("stability_window")
+    stability_window = stability_window if isinstance(stability_window, dict) else {}
+    observations = report_metadata.get("independent_validation_observations")
+    observations = observations if isinstance(observations, list) else []
     action_status = str(getattr(latest_action, "status", "") or "").lower()
-    validated = bool(action_status.endswith("succeeded") and report_payload.get("health_restored") and report_payload.get("alerts_cleared") and validation.get("passed", True))
+    report_action_id = str(report_payload.get("remediation_action_id") or "")
+    observations_verified = bool(observations) and all(
+        isinstance(item, dict)
+        and item.get("phase") == "post_state"
+        and item.get("passed") is True
+        and str(item.get("execution_id") or "") == report_action_id
+        and str(item.get("result_checksum") or "").strip()
+        for item in observations
+    )
+    validated = bool(
+        str(getattr(incident, "status", "") or "").lower() == "closed"
+        and str(report_payload.get("closure_status") or "").lower() == "closed"
+        and latest_action is not None
+        and action_status == "succeeded"
+        and str(getattr(latest_action, "id", "")) == report_action_id
+        and report_payload.get("health_restored") is True
+        and report_payload.get("alerts_cleared") is True
+        and validation.get("independent_checks_passed") is True
+        and validation.get("all_recovery_checks_passed") is True
+        and stability_window.get("status") == "recovered"
+        and observations_verified
+    )
     failed = action_status.endswith("failed") or action_status.endswith("rolled_back")
     return IncidentEvidence(
         incident_id=str(incident.id), service=incident.service, environment=incident.environment,
@@ -538,6 +585,27 @@ async def shutdown(_: FastAPI) -> None:
 app = create_app(title="KaiMS Knowledge Development Worker", settings=settings, startup=startup, shutdown=shutdown)
 
 
+@app.middleware("http")
+async def require_governance_internal_auth(request: Request, call_next):
+    path = request.url.path
+    is_governance_route = (
+        request.method.upper() == "POST"
+        and (
+            (path.startswith("/runbooks/") and path.endswith("/approve"))
+            or (path.startswith("/catalog/") and path.endswith("/review"))
+        )
+    )
+    if not is_governance_route:
+        return await call_next(request)
+    expected_token = settings.service_internal_token
+    if not expected_token:
+        return JSONResponse(status_code=503, content={"detail": "Internal service authentication is not configured"})
+    supplied_token = str(request.headers.get("x-kaiops-internal-token") or "")
+    if not hmac.compare_digest(supplied_token, expected_token):
+        return JSONResponse(status_code=403, content={"detail": "Internal service authentication failed"})
+    return await call_next(request)
+
+
 @app.post("/incidents/bootstrap")
 async def bootstrap_incident_catalog(request: IncidentBootstrapRequest) -> dict[str, Any]:
     """Persist current evidence and bootstrap an idempotent, non-executable candidate."""
@@ -647,10 +715,12 @@ async def approve_runbook_draft(
     version: int = 1,
     request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Approve an operator-submitted or catalog runbook draft into active guided reuse."""
+    """Compatibility route that delegates to the canonical review and approval gates."""
     payload = request or {}
-    tenant_id = require_tenant_id(str(payload.get("tenant_id") or "default"), source="runbook draft approval")
-    actor = str(payload.get("actor") or "admin")
+    tenant_id = require_tenant_id(str(payload.get("tenant_id") or ""), source="runbook draft approval")
+    actor = str(payload.get("actor") or "").strip()
+    if not actor:
+        raise HTTPException(status_code=422, detail="an authenticated governance actor is required")
     async with app.state.session_factory() as session:
         candidate = (await session.execute(select(RunbookVersionRecord).where(
             RunbookVersionRecord.tenant_id == tenant_id,
@@ -659,73 +729,109 @@ async def approve_runbook_draft(
         ).limit(1))).scalar_one_or_none()
         if candidate is None:
             raise HTTPException(status_code=404, detail="runbook draft was not found")
-        now = datetime.now(timezone.utc)
         content = dict(candidate.content or {})
-        candidate.approval_status = "approved"
-        candidate.approved_by = actor
-        candidate.approved_at = now
-        content.update({
-            "review_state": "approved",
-            "approved_by": actor,
-            "approved_at": now.isoformat(),
-            "autonomy_policy": str(content.get("autonomy_policy") or "repeat-match-hitl"),
-        })
-        candidate.content = content
-        audit = {
-            "decision": "approve",
-            "version": version,
-            "risk_level": str(candidate.risk_level or "medium"),
-            "self_heal_eligible": bool(content.get("self_heal_eligible", False)),
-            "reason": str(payload.get("reason") or "approved for active catalog reuse"),
-            "content_sha256": str(content.get("content_sha256") or ""),
-        }
-        session.add(LearningAuditRecord(
+        current_sha = str(content.get("content_sha256") or "")
+    expected_sha = str(payload.get("expected_content_sha256") or current_sha)
+    if len(expected_sha) != 64:
+        raise HTTPException(status_code=409, detail="runbook candidate has no valid content checksum")
+    try:
+        governance_request = CatalogPromotionRequest(
             tenant_id=tenant_id,
             actor=actor,
-            action="runbook.draft_approved",
-            resource_type="runbook",
-            resource_id=str(runbook_id),
-            payload=audit,
-            payload_sha256=_hash(audit),
-            occurred_at=now,
-        ))
-        await session.commit()
-    return {
-        "status": candidate.approval_status,
-        "runbook_id": str(runbook_id),
-        "version": version,
-        "lifecycle_mode": "active",
-        "approved_by": actor,
-        "approved_at": now.isoformat(),
-        "self_heal_eligible": bool(content.get("self_heal_eligible", False)),
-        "autonomy_policy": content.get("autonomy_policy"),
-    }
+            decision=str(payload.get("decision") or "approve"),
+            expected_content_sha256=expected_sha,
+            risk_level=str(payload.get("risk_level") or candidate.risk_level or "medium"),
+            reason=str(payload.get("reason") or "legacy runbook governance request"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return await _apply_catalog_decision(runbook_id, version, governance_request)
 
 
-@app.post("/catalog/{runbook_id}/versions/{version}/review")
-async def review_catalog_candidate(
-    runbook_id: UUID, version: int, request: CatalogPromotionRequest,
+async def _apply_catalog_decision(
+    runbook_id: UUID,
+    version: int,
+    request: CatalogPromotionRequest,
 ) -> dict[str, Any]:
-    """Promote or reject one immutable learned recovery version."""
     tenant_id = require_tenant_id(request.tenant_id, source="catalog promotion")
+    actor = request.actor.strip()
+    if not actor:
+        raise HTTPException(status_code=422, detail="an authenticated governance actor is required")
     async with app.state.session_factory() as session:
         candidate = (await session.execute(select(RunbookVersionRecord).where(
             RunbookVersionRecord.tenant_id == tenant_id,
             RunbookVersionRecord.runbook_id == runbook_id,
             RunbookVersionRecord.version == version,
-        ).limit(1))).scalar_one_or_none()
+        ).with_for_update().limit(1))).scalar_one_or_none()
         if candidate is None:
             raise HTTPException(status_code=404, detail="catalog candidate was not found")
         content = dict(candidate.content or {})
         stored_sha = str(content.get("content_sha256") or "")
-        if stored_sha and stored_sha != request.expected_content_sha256:
+        if (
+            len(stored_sha) != 64
+            or stored_sha != request.expected_content_sha256
+            or _candidate_content_sha(content) != stored_sha
+        ):
             raise HTTPException(status_code=409, detail="catalog candidate changed; refresh before reviewing")
+        if candidate.approval_status != "draft" and request.decision != "reject":
+            raise HTTPException(status_code=409, detail="only draft runbooks can be reviewed or approved")
+        now = datetime.now(timezone.utc)
+        eligible_review = None
+        if request.decision == "review":
+            audit = {
+                "decision": "review",
+                "version": version,
+                "risk_level": request.risk_level,
+                "reason": request.reason or "runbook candidate reviewed",
+                "content_sha256": stored_sha,
+            }
+            session.add(LearningAuditRecord(
+                tenant_id=tenant_id,
+                actor=actor,
+                action="runbook.candidate_reviewed",
+                resource_type="runbook",
+                resource_id=str(runbook_id),
+                payload=audit,
+                payload_sha256=_hash(audit),
+                occurred_at=now,
+            ))
+            await session.commit()
+            return {
+                "status": "review_pending",
+                "runbook_id": str(runbook_id),
+                "version": version,
+                "reviewed_by": actor,
+                "approval_requires_distinct_actor": True,
+            }
         if request.decision == "reject":
             candidate.approval_status = "suspended"
             content.update({"review_state": "rejected", "execution_eligible": False,
                             "self_heal_eligible": False, "rejection_reason": request.reason or "rejected by reviewer"})
             audit_action = "runbook.challenger_rejected"
         else:
+            review_rows = (await session.execute(select(LearningAuditRecord).where(
+                LearningAuditRecord.tenant_id == tenant_id,
+                LearningAuditRecord.resource_type == "runbook",
+                LearningAuditRecord.resource_id == str(runbook_id),
+                LearningAuditRecord.action == "runbook.candidate_reviewed",
+            ).order_by(LearningAuditRecord.occurred_at.desc()))).scalars().all()
+            matching_reviews = [
+                row for row in review_rows
+                if isinstance(row.payload, dict)
+                and row.payload.get("decision") == "review"
+                and row.payload.get("version") == version
+                and row.payload.get("content_sha256") == stored_sha
+                and row.payload.get("risk_level") == request.risk_level
+            ]
+            eligible_review = next(
+                (row for row in matching_reviews if row.actor.strip().casefold() != actor.casefold()),
+                None,
+            )
+            if eligible_review is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="approval requires a checksum- and risk-bound review by a different actor",
+                )
             reviewed_success = bool(await session.scalar(select(func.count()).select_from(IncidentEvidenceRecord).where(
                 IncidentEvidenceRecord.tenant_id == tenant_id,
                 IncidentEvidenceRecord.issue_signature == candidate.issue_signature,
@@ -737,25 +843,47 @@ async def review_catalog_candidate(
                 raise HTTPException(status_code=409, detail={"code": "catalog_promotion_blocked", "blocking_reasons": blockers})
             self_heal = (request.risk_level == "low") and not is_operator_draft
             candidate.approval_status = "approved"
-            candidate.approved_by = request.actor
-            candidate.approved_at = datetime.now(timezone.utc)
+            candidate.approved_by = actor
+            candidate.approved_at = now
             candidate.risk_level = request.risk_level
             content.update({
                 "review_state": "approved", "risk_level": request.risk_level,
                 "execution_eligible": self_heal, "self_heal_eligible": self_heal,
-                "promotion_requirements": [], "approved_by": request.actor,
-                "approved_at": candidate.approved_at.isoformat(),
+                "promotion_requirements": [], "reviewed_by": eligible_review.actor,
+                "approved_by": actor, "approved_at": candidate.approved_at.isoformat(),
                 "autonomy_policy": "repeat-match-auto" if self_heal else "repeat-match-hitl",
             })
+            approval = (await session.execute(select(RunbookApprovalRecord).where(
+                RunbookApprovalRecord.runbook_id == runbook_id,
+                RunbookApprovalRecord.version == version,
+                RunbookApprovalRecord.status == "approved",
+            ).with_for_update().limit(1))).scalar_one_or_none()
+            if approval is not None and approval.tenant_id not in (None, tenant_id):
+                raise HTTPException(status_code=409, detail="existing approval belongs to a different tenant")
+            if approval is None:
+                approval = RunbookApprovalRecord(
+                    runbook_id=runbook_id,
+                    version=version,
+                    status="approved",
+                )
+                session.add(approval)
+            approval.tenant_id = tenant_id
+            approval.reviewer = eligible_review.actor
+            approval.approver = actor
+            approval.approver_role = "ADMINISTRATOR"
+            approval.content_sha256 = stored_sha
+            approval.reason = request.reason or "Governed runbook approval"
+            approval.approved_at = now
             audit_action = "runbook.challenger_promoted"
         candidate.content = content
         audit = {
             "decision": request.decision, "version": version, "risk_level": request.risk_level,
             "self_heal_eligible": bool(content.get("self_heal_eligible")), "reason": request.reason,
-            "content_sha256": request.expected_content_sha256,
+            "content_sha256": stored_sha,
+            "reviewed_by": eligible_review.actor if request.decision == "approve" else None,
         }
         session.add(LearningAuditRecord(
-            tenant_id=tenant_id, actor=request.actor, action=audit_action,
+            tenant_id=tenant_id, actor=actor, action=audit_action,
             resource_type="runbook", resource_id=str(runbook_id), payload=audit,
             payload_sha256=_hash(audit), occurred_at=datetime.now(timezone.utc),
         ))
@@ -765,6 +893,14 @@ async def review_catalog_candidate(
         "self_heal_eligible": bool(content.get("self_heal_eligible")),
         "autonomy_policy": content.get("autonomy_policy"),
     }
+
+
+@app.post("/catalog/{runbook_id}/versions/{version}/review")
+async def review_catalog_candidate(
+    runbook_id: UUID, version: int, request: CatalogPromotionRequest,
+) -> dict[str, Any]:
+    """Record review, then require a distinct actor for approval or rejection."""
+    return await _apply_catalog_decision(runbook_id, version, request)
 
 
 @app.post("/run")
@@ -817,8 +953,16 @@ def _recent_report_records(model, tenant: str, timestamp, limit: int):
     # Sorting whole ORM rows makes MySQL read large JSON/TEXT for every
     # historical candidate, even though the report returns a small page.
     keys = list(model.__mapper__.primary_key)
-    recent = select(*keys).where(model.tenant_id == tenant).order_by(timestamp.desc(), *keys).limit(limit).subquery()
-    return select(model).join(recent, and_(*(key == recent.c[key.key] for key in keys))).order_by(timestamp.desc(), *keys)
+    version = getattr(model, "version", None)
+    tie_breakers = ([version.desc()] if version is not None else []) + [
+        key for key in keys if key.key != "version"
+    ]
+    recent = select(*keys).where(model.tenant_id == tenant).order_by(
+        timestamp.desc(), *tie_breakers,
+    ).limit(limit).subquery()
+    return select(model).join(recent, and_(*(key == recent.c[key.key] for key in keys))).order_by(
+        timestamp.desc(), *tie_breakers,
+    )
 
 
 @app.get("/report")

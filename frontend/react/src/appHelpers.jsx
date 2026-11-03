@@ -372,12 +372,15 @@ function filterAlertsForMonitor(rows, applicationToMonitor) {
     const candidates = [
       row?.application,
       row?.project,
+      row?.project_id,
       row?.project_name,
       metadata?.application,
       metadata?.project,
+      metadata?.project_id,
       metadata?.project_name,
       labels?.application,
       labels?.project,
+      labels?.project_id,
       labels?.project_name,
       row?.service,
       labels?.service,
@@ -417,12 +420,15 @@ function filterRowsForMonitor(rows, applicationToMonitor) {
     const candidates = [
       row?.application,
       row?.project,
+      row?.project_id,
       row?.project_name,
       metadata?.application,
       metadata?.project,
+      metadata?.project_id,
       metadata?.project_name,
       labels?.application,
       labels?.project,
+      labels?.project_id,
       labels?.project_name,
       row?.service,
       labels?.service,
@@ -445,11 +451,16 @@ function inferMonitorScope(row) {
     || labels?.project_name
     || row?.project
     || labels?.project
+    || row?.project_id
+    || labels?.project_id
     || row?.application
     || labels?.application
     || metadata?.project_name
     || metadata?.project
+    || metadata?.project_id
     || metadata?.application
+    || projection?.project_id
+    || event?.project_id
     || ""
   ).trim().toLowerCase();
   const alertName = String(row?.name || row?.title || labels?.alertname || "").trim().toLowerCase();
@@ -505,6 +516,33 @@ function isGeneratedOrTestAlert(row) {
   if (["1", "true", "yes"].includes(syntheticLabel) || ["synthetic", "simulation", "validation", "test"].includes(eventMode)) {
     return true;
   }
+  const serviceOrProjectTokens = [
+    row?.service,
+    row?.application,
+    row?.project_name,
+    row?.project,
+    labels?.service,
+    labels?.application,
+    labels?.project,
+    labels?.project_name,
+    labels?.job,
+    metadata?.service,
+    metadata?.application,
+    metadata?.project,
+    metadata?.project_name,
+    projection?.service,
+    projection?.application,
+    projection?.project,
+    projection?.project_name,
+    eventPayload?.service,
+    eventPayload?.application,
+    eventPayload?.project,
+    eventPayload?.project_name,
+    projectionLabels?.service,
+    projectionLabels?.application,
+    projectionLabels?.project,
+    projectionLabels?.project_name,
+  ].map((value) => String(value || "").toLowerCase()).join(" ");
   const tokens = [
     row?.id,
     row?.alert_id,
@@ -520,14 +558,12 @@ function isGeneratedOrTestAlert(row) {
     row?.application,
     row?.project_name,
     row?.project,
-    row?.environment,
     row?.description,
     row?.summary,
     row?.source_path,
     labels?.application,
     labels?.project,
     labels?.project_name,
-    labels?.environment,
     labels?.namespace,
     labels?.tenant,
     labels?.job,
@@ -537,19 +573,15 @@ function isGeneratedOrTestAlert(row) {
     metadata?.application,
     metadata?.project,
     metadata?.project_name,
-    metadata?.environment,
     projection?.title,
     projection?.alert_name,
     projection?.application,
-    projection?.environment,
     eventPayload?.title,
     eventPayload?.name,
     eventPayload?.alert_name,
     eventPayload?.application,
-    eventPayload?.environment,
     projectionLabels?.alertname,
     projectionLabels?.application,
-    projectionLabels?.environment,
   ].map((value) => String(value || "").toLowerCase()).join(" ");
   const isExplicitRealOrTelemetry = (
     ["0", "false", "no"].includes(syntheticLabel)
@@ -557,11 +589,13 @@ function isGeneratedOrTestAlert(row) {
     || inferMonitorScope(row) === "telemetry"
   );
   if (isExplicitRealOrTelemetry) {
-    return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test|test\d*|testing|sample|mock|fake|dummy)([-_\s]|$)/i.test(tokens)
+    return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test|test\d*|testing|sample)([-_\s]|$)/i.test(tokens)
+      || /(^|[-_\s])(fake|mock|dummy)([-_\s]|$)/i.test(serviceOrProjectTokens)
       || tokens.includes("stresspipelinealert")
       || tokens.includes("onboarding-smoke-test");
   }
-  return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test|test\d*|testing|demo|sample|mock|synthetic|fake|dummy)([-_\s]|$)/i.test(tokens)
+  return /(^|[-_\s])(e2e|ui-e2e|admin-e2e|setup-doc-e2e|stress|smoke|onboarding-smoke-test|test\d*|testing|sample)([-_\s]|$)/i.test(tokens)
+    || /(^|[-_\s])(fake|mock|synthetic|dummy)([-_\s]|$)/i.test(serviceOrProjectTokens)
     || tokens.includes("stresspipelinealert")
     || tokens.includes("onboarding-smoke-test");
 }

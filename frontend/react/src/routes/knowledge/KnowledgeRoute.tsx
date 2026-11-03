@@ -69,7 +69,7 @@ export default function KnowledgeRoute() {
       setDevelopment((current) => ({ ...current, running: false }));
     } catch (error: any) { setDevelopment((current) => ({ ...current, running: false, error: error.message })); }
   };
-  const reviewCatalog = async (row: any, risk_level: "low" | "medium", decision: "approve" | "reject" = "approve") => {
+  const reviewCatalog = async (row: any, risk_level: "low" | "medium", decision: "review" | "approve" | "reject") => {
     const key = `${row.runbook_id}-${row.version}`;
     setCatalogAction({ key, message: "" });
     try {
@@ -78,18 +78,35 @@ export default function KnowledgeRoute() {
         body: JSON.stringify({ decision, risk_level, expected_content_sha256: row.content?.content_sha256, reason: decision === "reject" ? "Rejected from catalog review" : "Reviewed for repeat-incident policy" }),
       });
       await loadDevelopment();
-      setCatalogAction({ key: "", message: result.self_heal_eligible ? "Certified for matching repeat incidents." : "Approved for guided reuse." });
+      const message = decision === "review"
+        ? "Review recorded. A different authorized actor must approve the same version, checksum, and risk level."
+        : decision === "reject"
+          ? "Candidate rejected."
+          : result.self_heal_eligible
+            ? "Certified for matching repeat incidents."
+            : "Approved for guided reuse.";
+      setCatalogAction({ key: "", message });
     } catch (error: any) { setCatalogAction({ key: "", message: error.message }); }
   };
-  const approveDraftDirect = async (row: any) => {
+  const approveDraftDirect = async (row: any, decision: "review" | "approve") => {
     const key = `${row.runbook_id}-${row.version}`;
     setCatalogAction({ key, message: "" });
     try {
       await request(`/runbooks/${encodeURIComponent(row.runbook_id)}/approve?version=${encodeURIComponent(String(row.version || 1))}`, {
         method: "POST",
+        body: JSON.stringify({
+          decision,
+          expected_content_sha256: row.content?.content_sha256,
+          risk_level: row.risk_level || "medium",
+        }),
       });
       await loadDevelopment();
-      setCatalogAction({ key: "", message: `Runbook ${row.runbook_id} v${row.version} approved and marked Active.` });
+      setCatalogAction({
+        key: "",
+        message: decision === "review"
+          ? "Review recorded. A different authorized actor must approve this runbook."
+          : `Runbook ${row.runbook_id} v${row.version} approved and marked Active.`,
+      });
     } catch (error: any) { setCatalogAction({ key: "", message: error.message }); }
   };
   useEffect(() => {
@@ -191,8 +208,8 @@ export default function KnowledgeRoute() {
         const pageRows = allRows.slice((safePage - 1) * DEV_PAGE_SIZE, safePage * DEV_PAGE_SIZE);
         const totalInDb = development.report?.drafts_total ?? development.report?.drafts?.length ?? 0;
         return <article className="panel development-record-panel"><div className="panel-head"><div><h3>Resolution catalog lifecycle</h3><p>Discovery and operator evidence create Draft runbooks. Reviewing and approving a draft promotes it to Active for guided reuse or low-risk self-healing.</p></div><span className="ai-hub-count">{totalInDb} total in DB ({allRows.length} matching)</span></div>
-        <details className="technical-settings"><summary>How Runbook Approval Works (Draft &rarr; Active)</summary><p><strong>1. Draft creation:</strong> Submitting remediation steps in an incident&apos;s Evidence tab or running historical discovery creates a governed runbook in <code>Draft</code> state (<code>status = draft</code>). Drafts are never auto-executed.<br/><strong>2. Quality &amp; recovery verification:</strong> When the associated incident has corroborated evidence (&ge;2 independent sources) or verified recovery, the candidate reaches <code>3 · Ready for review</code>.<br/><strong>3. Operator promotion to Active:</strong> An authorized operator (<code>ADMIN</code>, <code>OPERATOR</code>, or <code>HITL_APPROVER</code>) clicks <strong>Approve guided</strong> (promotes to <code>Active / approved</code> for human-approved reuse), <strong>Certify low-risk self-heal</strong> (promotes to <code>Active / approved</code> with autonomous execution eligibility), or <strong>Approve draft</strong> for direct governance activation.</p></details>
-        {catalogAction.message?<p className="status-message" role="status">{catalogAction.message}</p>:null}<div className="table-wrap"><table><thead><tr><th>Candidate</th><th>Application</th><th>Associated Incident &amp; Created</th><th>Lifecycle &amp; Mode</th><th>Evidence</th><th>Repeat policy</th><th>Governance</th></tr></thead><tbody>{pageRows.map((row:any)=>{const stage=String(row.content?.catalog_stage||'');const diagnostic=stage!=='resolution_candidate';const blockers=Array.isArray(row.content?.promotion_requirements)?row.content.promotion_requirements:[];const key=`${row.runbook_id}-${row.version}`;const isActive=row.lifecycle_mode==='active'||row.status==='approved';const assocIncident=row.incident_id||row.content?.incident_id||row.content?.source_incident_id||'—';return <tr key={key}><td><button type="button" className="knowledge-document-link" onClick={()=>openRunbook(row)}><FileText size={17}/><strong>{row.content?.name || row.runbook_id}</strong></button><button type="button" className="button-secondary" onClick={()=>openRunbook(row)}>View runbook</button><small><code>{row.runbook_id}</code> · v{row.version} · {row.risk_level} risk</small></td><td>{row.content?.application || row.content?.service || '—'}</td><td><code>{assocIncident}</code><br/><small>Created: {row.created_at || '—'}</small></td><td><span className={`workflow-pill ${isActive?'workflow-pill-active':'workflow-pill-idle'}`}>{isActive?'Active':'Draft'} ({row.status})</span><br/><small>{stage==='evidence_work_candidate'?'1 · Discovering evidence':diagnostic?'2 · Confirming cause':row.status==='approved'?'4 · Certified catalog':'3 · Ready for review'}</small></td><td>{row.quality_gate?.passed?'Successful recovery verified':`${row.quality_gate?.metrics?.independent_sources || 0} independent sources`}</td><td>{row.content?.self_heal_eligible?'Self-heal on strong match':row.status==='approved'?'Guided reuse with approval':(blockers[0]||'Not eligible yet')}</td><td>{stage==='resolution_candidate'&&row.status==='draft'?<div className="catalog-review-actions"><button className="button-secondary" disabled={catalogAction.key===key} onClick={()=>reviewCatalog(row,'medium')}>Approve guided</button><button className="button-primary" disabled={catalogAction.key===key} onClick={()=>reviewCatalog(row,'low')}>Certify low-risk self-heal</button></div>:row.status==='draft'?<div className="catalog-review-actions"><button className="button-secondary" disabled={catalogAction.key===key} onClick={()=>approveDraftDirect(row)}>Approve draft</button></div>:<span className={`workflow-pill ${row.status==='approved'?'workflow-pill-active':'workflow-pill-idle'}`}>{row.status}</span>}</td></tr>})}{!pageRows.length?<tr><td colSpan={7}>No matching candidates found.</td></tr>:null}</tbody></table></div>
+        <details className="technical-settings"><summary>How Runbook Approval Works (Draft &rarr; Active)</summary><p><strong>1. Draft creation:</strong> Submitting remediation steps creates a governed runbook in <code>Draft</code> state. Drafts are never auto-executed.<br/><strong>2. Quality &amp; recovery verification:</strong> Candidates must pass the existing quality and recovery gates.<br/><strong>3. Two-person promotion:</strong> One authorized operator records a checksum- and risk-bound review. A different authorized operator must approve that same version, checksum, and risk level. Low-risk self-heal eligibility remains subject to the existing policy gates.</p></details>
+        {catalogAction.message?<p className="status-message" role="status">{catalogAction.message}</p>:null}<div className="table-wrap"><table><thead><tr><th>Candidate</th><th>Application</th><th>Associated Incident &amp; Created</th><th>Lifecycle &amp; Mode</th><th>Evidence</th><th>Repeat policy</th><th>Governance</th></tr></thead><tbody>{pageRows.map((row:any)=>{const stage=String(row.content?.catalog_stage||'');const diagnostic=stage!=='resolution_candidate';const blockers=Array.isArray(row.content?.promotion_requirements)?row.content.promotion_requirements:[];const key=`${row.runbook_id}-${row.version}`;const isActive=row.lifecycle_mode==='active'||row.status==='approved';const assocIncident=row.incident_id||row.content?.incident_id||row.content?.source_incident_id||'—';return <tr key={key}><td><button type="button" className="knowledge-document-link" onClick={()=>openRunbook(row)}><FileText size={17}/><strong>{row.content?.name || row.runbook_id}</strong></button><button type="button" className="button-secondary" onClick={()=>openRunbook(row)}>View runbook</button><small><code>{row.runbook_id}</code> · v{row.version} · {row.risk_level} risk</small></td><td>{row.content?.application || row.content?.service || '—'}</td><td><code>{assocIncident}</code><br/><small>Created: {row.created_at || '—'}</small></td><td><span className={`workflow-pill ${isActive?'workflow-pill-active':'workflow-pill-idle'}`}>{isActive?'Active':'Draft'} ({row.status})</span><br/><small>{stage==='evidence_work_candidate'?'1 · Discovering evidence':diagnostic?'2 · Confirming cause':row.status==='approved'?'4 · Certified catalog':'3 · Ready for review'}</small></td><td>{row.quality_gate?.passed?'Successful recovery verified':`${row.quality_gate?.metrics?.independent_sources || 0} independent sources`}</td><td>{row.content?.self_heal_eligible?'Self-heal on strong match':row.status==='approved'?'Guided reuse with approval':(blockers[0]||'Not eligible yet')}</td><td>{stage==='resolution_candidate'&&row.status==='draft'?<div className="catalog-review-actions"><button className="button-secondary" disabled={catalogAction.key===key} onClick={()=>reviewCatalog(row,'medium','review')}>Review guided</button><button className="button-secondary" disabled={catalogAction.key===key} onClick={()=>reviewCatalog(row,'medium','approve')}>Approve guided</button><button className="button-secondary" disabled={catalogAction.key===key} onClick={()=>reviewCatalog(row,'low','review')}>Review low-risk</button><button className="button-primary" disabled={catalogAction.key===key} onClick={()=>reviewCatalog(row,'low','approve')}>Certify low-risk</button></div>:row.status==='draft'?<div className="catalog-review-actions"><button className="button-secondary" disabled={catalogAction.key===key} onClick={()=>approveDraftDirect(row,'review')}>Review draft</button><button className="button-primary" disabled={catalogAction.key===key} onClick={()=>approveDraftDirect(row,'approve')}>Approve draft</button></div>:<span className={`workflow-pill ${row.status==='approved'?'workflow-pill-active':'workflow-pill-idle'}`}>{row.status}</span>}</td></tr>})}{!pageRows.length?<tr><td colSpan={7}>No matching candidates found.</td></tr>:null}</tbody></table></div>
         {totalPages > 1 ? <div className="action-row" aria-label="Resolution catalog pagination"><button type="button" className="button-secondary" disabled={safePage<=1} onClick={()=>setDevPage((p)=>Math.max(1,p-1))}>Previous</button><span>Page {safePage} of {totalPages} ({allRows.length} loaded · {totalInDb} total in DB)</span><button type="button" className="button-secondary" disabled={safePage>=totalPages} onClick={()=>setDevPage((p)=>Math.min(totalPages,p+1))}>Next</button></div> : null}
         </article>;
       })() : null}

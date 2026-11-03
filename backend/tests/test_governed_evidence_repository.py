@@ -455,6 +455,7 @@ async def test_indexing_recovery_lifecycle_pending_failed_stale_indexing_and_fal
                 "environment": "prod",
                 "alert_name": "PaymentGatewayTimeout",
                 "alert_signature": "sig-payments-timeout",
+                "reviewed_by": "reviewer-a",
             },
         )
         reviewed = await repo.review_knowledge_rag_draft(

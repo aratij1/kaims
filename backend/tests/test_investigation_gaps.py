@@ -99,9 +99,15 @@ def test_unsupported_categories_cannot_schedule_uningestible_evidence():
     from datetime import datetime, UTC
     from uuid import uuid4
     requirements = build_evidence_requirements(tenant_id="test", incident_id=uuid4(), rca_version=1,
-        missing_evidence=[{"category": "validation", "question": "Confirm causality", "candidate_connectors": ["prometheus"]}, "database"], now=datetime.now(UTC))
+        missing_evidence=[{"category": "validation", "question": "Confirm causality", "candidate_connectors": ["prometheus"]},
+                          "unmapped-source-kind"], now=datetime.now(UTC))
     assert len(requirements) == 2
     assert all(not r.candidate_connectors and r.collection_mode == "connector_required" for r in requirements)
+    database_requirement = build_evidence_requirements(
+        tenant_id="test", incident_id=uuid4(), rca_version=1,
+        missing_evidence=["database"], now=datetime.now(UTC),
+    )[0]
+    assert database_requirement.candidate_connectors
 
 
 def test_deterministic_contract_failure_does_not_repeat_four_times():

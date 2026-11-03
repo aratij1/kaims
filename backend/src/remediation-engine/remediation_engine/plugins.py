@@ -12,15 +12,19 @@ from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
 import httpx
-
 from ai_workbench_common.agentic import AgentContext, BaseAgent
 from common.execution_safety import ExecutionSafetyDecision, assess_execution_safety
 from common.models import Approval, ApprovalDecision, RemediationAction, RemediationStatus, utc_now
-from common.orchestration.execution_plan import docker_compose_restart_plan
-from common.orchestration.execution_plan_contract import verify_plan_fingerprint
-from common.resolution_lifecycle import ResolutionState, create_lifecycle, extract_lifecycle
+from common.orchestration.compose_targets import compose_recovery_target
+from common.orchestration.execution_plan import docker_compose_restart_plan, validate_plan_commands_allowlisted
+from common.orchestration.execution_plan_contract import (
+    require_unexpired_plan_expiry,
+    verify_plan_fingerprint,
+)
 from common.resilience import CircuitBreaker, circuit_breaker
+from common.resolution_lifecycle import ResolutionState, create_lifecycle, extract_lifecycle
 from common.tool_registry import ToolRegistry, ToolSpec
+
 from remediation_engine.capability_executors import (
     AnsibleConnectorExecutor,
     ApiConnectorExecutor,
@@ -935,7 +939,7 @@ class RemediationEngine(BaseAgent):
         sanitized: list[str] = []
         seen: set[str] = set()
         for raw in commands:
-            token = str(raw or "").strip().strip("`")
+            token = str(raw or "").strip()
             if not token:
                 continue
             token = re.sub(r"^\s*(cmd|command|script|query)\s*:\s*", "", token, flags=re.IGNORECASE).strip()
@@ -1015,6 +1019,13 @@ class RemediationEngine(BaseAgent):
             raise ValueError("remediation requires the exact approved kaims.execution-plan.v2 plan")
         if not verify_plan_fingerprint(approved_execution_plan):
             raise ValueError("remediation requires an unmodified kaims.execution-plan.v2 plan")
+        require_unexpired_plan_expiry(approved_execution_plan)
+        policy_plan = {
+            **approved_execution_plan,
+            "recommended_commands": approval.metadata.get("recommended_commands", []),
+        }
+        if validate_plan_commands_allowlisted(policy_plan):
+            raise ValueError("remediation commands are outside the automated allowlist")
         if str(approved_execution_plan.get("tenant_id") or "") != approval.tenant_id:
             raise ValueError("approved execution plan tenant does not match approval tenant")
         if str(approved_execution_plan.get("plan_id") or "") != str(approval.plan_id or ""):
@@ -1059,6 +1070,7 @@ class RemediationEngine(BaseAgent):
             action_type=action_type,
             target=target,
             service=service,
+            tenant=approval.tenant_id,
             environment=environment,
             namespace=namespace,
             recommended_action=recommended_action,
@@ -1282,6 +1294,7 @@ class RemediationEngine(BaseAgent):
         action_type: str,
         target: str,
         service: str,
+        tenant: str,
         environment: str,
         namespace: str,
         recommended_action: str,
@@ -1307,16 +1320,34 @@ class RemediationEngine(BaseAgent):
                 r"[^a-zA-Z0-9_.-]", "",
                 os.getenv("REMEDIATION_COMPOSE_PROJECT", "kaiops_azure"),
             )
-            docker_plan = docker_compose_restart_plan(project=compose_project, service=safe_service)
+            recovery_target = compose_recovery_target(
+                tenant=tenant,
+                environment=environment,
+                service=safe_service,
+            )
+            health_url = f"http://{safe_service}:8000/healthz"
+            container_id = None
+            if recovery_target:
+                compose_project = recovery_target["project"]
+                safe_service = recovery_target["service"]
+                container_id = recovery_target["container_id"]
+                health_url = recovery_target["health_url"]
+            docker_plan = docker_compose_restart_plan(
+                project=compose_project,
+                service=safe_service,
+                container_id=container_id,
+            )
             return {
                 "schema_version": "kaiops.remediation.v2",
                 "commands": [*docker_plan["commands"],
-                    f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 http://{safe_service}:8000/healthz",
+                    f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 {health_url}",
                 ],
                 "scripts": [],
-                "queries": [f"http://{safe_service}:8000/healthz"],
+                "queries": [health_url],
                 "preflight": docker_plan["preflight"],
-                "validation_commands": [f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 http://{safe_service}:8000/healthz"],
+                "validation_commands": [
+                    f"curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 {health_url}"
+                ],
                 # A process restart has no meaningful inverse operation. Do
                 # not label a read-only container inspection as a rollback.
                 "rollback_commands": [],

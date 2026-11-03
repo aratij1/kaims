@@ -8,9 +8,9 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from common.models import Alert, Incident
 from common.evidence_source_policy import is_alert_artifact, is_derived_observation
 from common.evidence_subject import metric_matches_subject, service_matches
+from common.models import Alert, Incident
 
 EvidenceCategory = Literal[
     "metrics",
@@ -716,7 +716,6 @@ _REQUIREMENT_CONNECTORS: dict[str, list[str]] = {
     "database": ["discovery-mcp", "prometheus"],
     "ticket": ["discovery-mcp", "jira", "vector-db"],
     "runbook": ["vector-db", "discovery-mcp", "local-evidence"],
-    "validation": ["discovery-mcp", "local-evidence"],
 }
 _HUMAN_CATEGORIES = {"ownership", "business_impact"}
 _CATEGORY_ALIASES = {
@@ -826,7 +825,7 @@ def build_evidence_requirements(
                    "candidate_connectors": []}
             category = "validation"
         connectors = list((gap.get("candidate_connectors") or []) if "candidate_connectors" in gap else _REQUIREMENT_CONNECTORS.get(category, []))
-        if category not in _CANONICAL_CATEGORY:
+        if category not in _CANONICAL_CATEGORY or category == "validation":
             # Do not schedule a source category that the evidence contract cannot ingest.
             connectors = []
         mode = (

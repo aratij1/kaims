@@ -110,6 +110,73 @@ async def test_impact_model_is_separately_opt_in_and_summary_is_not_observation(
     assert agent.deep_analysis_enabled is False
     assert state["impact_analysis"]["observed_impact"] == ""
 
+
+@pytest.mark.asyncio
+async def test_unsupported_model_business_impact_is_labeled_unestablished(monkeypatch):
+    from unittest.mock import AsyncMock
+    from ai_workbench_common.models import Context
+    from common.models import Alert, AlertSeverity
+    from resolution_agent.graph import ResolutionIntelligenceAgent
+
+    monkeypatch.setenv("RESOLUTION_DEEP_ANALYSIS_ENABLED", "false")
+    monkeypatch.setenv("RESOLUTION_IMPACT_ANALYSIS_ENABLED", "true")
+    agent = ResolutionIntelligenceAgent()
+    agent._generate_with_fallback = AsyncMock(return_value={
+        "model": "test",
+        "content": (
+            '{"impact_summary":"Payments are failing for customers",'
+            '"customer_impact":"Thousands of payments failed",'
+            '"business_impact":"Revenue loss is confirmed",'
+            '"observed_impact":"Thousands of payments failed",'
+            '"confidence_score":0.99,"evidence_used":["not-a-valid-evidence-id"]}'
+        ),
+        "usage": {"provider": "test", "task": "impact"},
+    })
+    context = Context(
+        tenant_id="test",
+        incident_id=uuid4(),
+        alert=Alert(
+            tenant_id="test",
+            name="PaymentErrors",
+            source="test",
+            service="payments",
+            description="Elevated payment errors",
+            severity=AlertSeverity.HIGH,
+        ),
+    )
+
+    state = await agent.impact_analysis({
+        "context": context,
+        "root_cause": "Unconfirmed",
+        "gathered_context": {
+            "discovery_evidence": [],
+            "context_quality": {"impact_ready": False, "impact_readiness_score": 0.2},
+        },
+        "model_usage": [],
+    })
+
+    impact = state["impact_analysis"]
+    assert impact["business_impact"].startswith("No direct customer or service impact is established")
+    assert impact["business_impact_status"] == "not_established"
+    assert impact["observed_impact"] == ""
+
+    agent._generate_with_fallback.return_value["content"] = (
+        '{"impact_summary":"Payments are failing for customers",'
+        '"customer_impact":"Thousands of payments failed",'
+        '"confidence_score":0.9,"evidence_used":["impact-evidence"]}'
+    )
+    supported_state = await agent.impact_analysis({
+        "context": context,
+        "root_cause": "Confirmed by investigation",
+        "gathered_context": {
+            "discovery_evidence": [{"evidence_id": "impact-evidence"}],
+            "context_quality": {"impact_ready": True, "impact_readiness_score": 0.9},
+        },
+        "model_usage": [],
+    })
+    assert supported_state["impact_analysis"]["business_impact"] == "Thousands of payments failed"
+    assert supported_state["impact_analysis"]["business_impact_status"] == "supported"
+
 @pytest.mark.parametrize('passes', [1, 3])
 def test_trace_structure_survives_recompilation_without_nested_metadata(passes):
     now = datetime.now(UTC)

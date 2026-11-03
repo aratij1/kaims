@@ -1041,11 +1041,11 @@ services:
       rabbitmq: { condition: service_healthy }
       redis: { condition: service_healthy }
 
-  # Exposes a *read-only, containers-only* view of the Docker API over TCP so discovery-mcp
+  # Exposes a containers-only view of the Docker API over TCP so discovery-mcp
   # never touches /var/run/docker.sock directly. A raw socket mount (even with ":ro" on the
   # bind mount) grants the full Docker API -- create/exec/mount -- which is host-root
-  # equivalent. The proxy restricts access to /containers*; POST is enabled so
-  # the governed Jenkins allowlist can restart an explicitly named container.
+  # equivalent. The proxy restricts access to /containers*; POST allows only the
+  # explicitly enabled start/restart operations used by governed Jenkins plans.
   docker-socket-proxy:
     image: tecnativa/docker-socket-proxy:0.2.0
     mem_limit: ${DOCKER_SOCKET_PROXY_MEMORY_LIMIT:-128m}
@@ -1054,6 +1054,8 @@ services:
     environment:
       CONTAINERS: 1
       POST: 1
+      ALLOW_RESTARTS: 1
+      ALLOW_START: 1
       # Narrowly widened so the Jenkins agent's `docker compose scale` can
       # add a correctly-networked replica of an internal service (see
       # deploy/jenkins/Dockerfile.local and Jenkinsfile.auto-remediation's
@@ -1309,6 +1311,9 @@ services:
       # needs this project's actual compose file to resolve a service's
       # image/env/network config for a new replica.
       - ./docker-compose.yml:/opt/kaiops/docker-compose.yml:ro
+    networks:
+      default: {}
+      robot-shop-net: {}
     depends_on:
       docker-socket-proxy: { condition: service_started }
     healthcheck:
@@ -1690,6 +1695,12 @@ services:
     restart: unless-stopped
     environment:
       APP_ENV: prod
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error http://127.0.0.1:80/_health >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     networks:
       robot-shop-net:
         aliases: [ratings]

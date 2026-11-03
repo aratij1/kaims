@@ -36,6 +36,43 @@ def test_external_compose_target_is_pinned_and_exactly_scoped(monkeypatch):
     assert json.loads(parse_qs(urlsplit(url).query)["filters"][0])["status"] == ["exited", "dead"]
 
 
+def test_remediation_fallback_uses_bound_compose_target_and_health_url(monkeypatch):
+    from remediation_engine.plugins import RemediationEngine
+
+    container_id = "a" * 64
+    target = {
+        "project": "kaims-latest",
+        "service": "rs-ratings",
+        "container_id": container_id,
+        "health_url": "http://rs-ratings:80/_health",
+    }
+    monkeypatch.setenv("REMEDIATION_EXECUTION_PLATFORM", "docker-compose")
+    monkeypatch.setenv(
+        "REMEDIATION_COMPOSE_TARGETS",
+        json.dumps({"default/prod/rs-ratings": target}),
+    )
+
+    plan = RemediationEngine()._build_execution_plan(
+        action_type="restart_service",
+        target="rs-ratings",
+        service="rs-ratings",
+        tenant="default",
+        environment="prod",
+        namespace="default",
+        recommended_action="restart",
+        recommended_commands=[],
+    )
+
+    assert container_id in plan["commands"][0]
+    assert "/$container_id/start" in plan["commands"][0]
+    assert plan["queries"] == ["http://rs-ratings:80/_health"]
+    assert plan["validation_commands"] == [
+        "curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 2 "
+        "http://rs-ratings:80/_health"
+    ]
+    assert all(":8000/healthz" not in command for command in plan["commands"] + plan["validation_commands"])
+
+
 def stopped_evidence(context):
     stopped = (context.alert.starts_at - timedelta(seconds=30)).isoformat()
     return [{"evidence_id": "runtime", "source_type": "topology", "reliability_score": 1,
@@ -105,6 +142,128 @@ def test_known_runtime_rule_synthesizes_only_its_verified_mechanism():
     assert claim["status"] == "OBSERVED"
     assert stopped_workload_recommendation(context, {**report, "conclusive": False}) is None
     assert stopped_workload_recommendation(context, {**report, "evidence": [evidence[0]]}) is None
+
+
+def test_stopped_workload_rule_accepts_exact_lifecycle_and_failed_probe_evidence():
+    from resolution_agent.runtime_recovery import stopped_workload_recommendation
+
+    context = make_context()
+    evidence = stopped_evidence(context)
+    hypotheses = IterativeInvestigator()._revise_hypotheses([], evidence, context=context)
+    runtime = next(h for h in hypotheses if h.get("mechanism") == "runtime_stopped")
+    evidence[0]["current_operational_evidence"] = False
+    evidence[0]["incident_window_relation"] = "after"
+    evidence[1]["current_operational_evidence"] = False
+    evidence[1]["incident_window_relation"] = "after"
+    report = {
+        "conclusive": True,
+        "hypotheses": hypotheses,
+        "evidence": evidence,
+        "conclusion": {
+            "hypothesis_id": runtime["hypothesis_id"],
+            "evidence_ids": runtime["supporting_evidence_ids"],
+            "confidence": runtime["confidence"],
+        },
+    }
+
+    recommendation = stopped_workload_recommendation(context, report)
+
+    assert recommendation is not None
+    assert recommendation.metadata["evidence_quality"]["evidence_fresh"] is True
+    assert recommendation.metadata["evidence_quality"]["independent_source_count"] == 2
+
+
+def test_demo_restart_plan_is_verified_only_by_its_exact_compose_binding(monkeypatch):
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    from common.models import Recommendation
+
+    module_name = "resolution_agent_service_app_test"
+    module = sys.modules.get(module_name)
+    if module is None:
+        app_path = Path(__file__).resolve().parents[2] / "ai-workbench" / "src" / "resolution-agent" / "app.py"
+        spec = importlib.util.spec_from_file_location(module_name, app_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+    context = make_context()
+    context = context.model_copy(
+        update={
+            "tenant_id": "tenant-a",
+            "alert": context.alert.model_copy(
+                update={"tenant_id": "tenant-a", "service": "rs-ratings", "environment": "demo"}
+            ),
+        }
+    )
+    container_id = "a" * 64
+    health_url = "http://rs-ratings:80/_health"
+    monkeypatch.setenv(
+        "REMEDIATION_COMPOSE_TARGETS",
+        json.dumps(
+            {
+                "tenant-a/demo/rs-ratings": {
+                    "project": "kaims-latest",
+                    "service": "rs-ratings",
+                    "container_id": container_id,
+                    "health_url": health_url,
+                }
+            }
+        ),
+    )
+    recommendation = Recommendation(
+        tenant_id=context.tenant_id,
+        incident_id=context.incident_id,
+        severity=context.alert.severity,
+        root_cause="The rs-ratings workload stopped.",
+        confidence=0.71,
+        impact="The ratings endpoint is unavailable.",
+        risk="medium",
+        recommended_action="Start the verified workload and validate health.",
+        rationale="A stopped-container event and failed probe corroborate the mechanism.",
+    )
+    plan = {
+        "actions": [
+            {
+                "target_resource_id": "rs-ratings",
+                "inputs": {
+                    "catalog_command": f"start {container_id}",
+                    "operation": "restart_service",
+                    "parameters": {"service": "rs-ratings"},
+                },
+                "validation": [f"curl --fail {health_url}"],
+                "safety_binding": {
+                    "capability": {"operation": "restart_service"},
+                    "blast_radius": {
+                        "verified": True,
+                        "affected_resource_ids": ["rs-ratings"],
+                        "scope": "single-service",
+                    },
+                },
+            }
+        ],
+        "connection": {"connector": {"type": "api"}},
+        "commands": [f"start {container_id}"],
+        "evidence_references": ["docker://lifecycle/rs-ratings", "prometheus://probe/rs-ratings"],
+        "execution_ready": True,
+        "risk": "medium",
+    }
+
+    module._attach_typed_remediation_plan(recommendation, context, plan)
+
+    assert recommendation.remediation_plan.target_identity_verified is True
+    assert recommendation.metadata["remediation_plan_status"]["valid"] is True
+    assert recommendation.metadata["remediation_plan_status"]["execution_eligible"] is False
+    assert recommendation.metadata["remediation_plan_status"]["reason_codes"] == []
+
+    plan["commands"] = ["start a different container"]
+    plan["actions"][0]["inputs"]["catalog_command"] = "start a different container"
+    module._attach_typed_remediation_plan(recommendation, context, plan)
+    assert recommendation.remediation_plan.target_identity_verified is False
+    assert "target_identity_not_verified" in recommendation.metadata["remediation_plan_status"]["reason_codes"]
 
 
 def test_old_or_other_service_exit_cannot_create_a_causal_candidate():
@@ -228,3 +387,50 @@ async def test_local_default_tenant_approval_is_exact_and_oidc_still_rejects(sql
         assert not await repo.has_accepted_approval_id(approval.id, incident, uuid4(), **arguments)
         monkeypatch.setattr(get_settings(), 'auth_mode', 'oidc')
         assert not await repo.has_accepted_approval_id(approval.id, incident, recommendation, **arguments)
+
+
+def test_reanalyzed_stopped_workload_stays_conclusive_with_citation_coverage_above_85():
+    from resolution_agent.runtime_recovery import stopped_workload_recommendation
+
+    context = make_context()
+    evidence = stopped_evidence(context)
+    for row in evidence:
+        row["current_operational_evidence"] = False
+        row["freshness_seconds"] = 3600
+        row["incident_window_relation"] = "after"
+    extra = {
+        "evidence_id": "extra-log",
+        "source_type": "log",
+        "reliability_score": 0.8,
+        "current_operational_evidence": False,
+        "freshness_seconds": 3600,
+        "source_uri": "loki://logs",
+        "incident_window_relation": "after",
+        "observed_at": datetime.now(UTC).isoformat(),
+        "snippet": "unrelated log entry",
+        "metadata": {"service": context.alert.service},
+    }
+    all_rows = [*evidence, extra]
+    investigator = IterativeInvestigator()
+    hypotheses = investigator._revise_hypotheses([], all_rows, context=context)
+    runtime = next(h for h in hypotheses if h.get("mechanism") == "runtime_stopped")
+    assert runtime["status"] == "confirmed"
+    assert runtime["confidence"] >= 0.65
+    assert investigator._confirmed_without_declared_gaps(hypotheses, all_rows, context)
+
+    report = {
+        "conclusive": True,
+        "hypotheses": hypotheses,
+        "evidence": all_rows,
+        "conclusion": {
+            "hypothesis_id": runtime["hypothesis_id"],
+            "evidence_ids": runtime["supporting_evidence_ids"],
+            "confidence": runtime["confidence"],
+        },
+    }
+    recommendation = stopped_workload_recommendation(context, report)
+    assert recommendation is not None
+    assert recommendation.confidence >= 0.65
+    assert recommendation.metadata["analysis_engine"] == "verified-runtime-recovery.v1"
+    assert recommendation.metadata["evidence_quality"]["citation_coverage"] >= 0.85
+    assert recommendation.metadata["rca_status"] == "grounded"

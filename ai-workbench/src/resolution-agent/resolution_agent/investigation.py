@@ -306,15 +306,23 @@ class IterativeInvestigator:
         return bool(row.get("current_operational_evidence", metadata.get("current_operational_evidence", True)))
 
     @classmethod
-    def _operational_for_support(cls, row: dict[str, Any]) -> bool:
+    def _operational_for_support(
+        cls, row: dict[str, Any], hypothesis: dict[str, Any] | None = None,
+    ) -> bool:
         """Historical causality needs incident-window observations.
 
         Pre-window changes may seed timing hypotheses, but a later runtime
         health/resource snapshot cannot prove or disprove an earlier cause.
-        Current health remains available separately for recovery validation.
+        A runtime-stopped hypothesis is the narrow exception: the container's
+        lifecycle timestamp is the event time, even when inventory was queried
+        after the incident window.
         """
         return cls._current_operational(row) or (
             cls._source(row) == "changes" and row.get("incident_window_relation") == "before"
+        ) or (
+            hypothesis is not None
+            and hypothesis.get("mechanism") == "runtime_stopped"
+            and cls._structured_mechanism_support(hypothesis, row)
         )
 
     @staticmethod
@@ -439,10 +447,20 @@ class IterativeInvestigator:
             # this claim's own alerting service, unlike "dependency" -- no
             # related_to/self-check distinction is needed here.
             return metadata.get("saturated") is True
+        if row.get("source_type") == "database" and any(
+            token in claim for token in ("resource", "data-path", "data path", "database", "mysql", "query")
+        ):
+            return True
         if row.get("source_type") != "trace":
             return False
         spans = metadata.get("slowest_spans") if isinstance(metadata.get("slowest_spans"), list) else []
         edges = metadata.get("dependency_edges") if isinstance(metadata.get("dependency_edges"), list) else []
+        downstream = {
+            str(edge.get("downstream") or "").lower()
+            for edge in edges if isinstance(edge, dict)
+            and edge.get("upstream") and edge.get("downstream")
+            and edge["upstream"] != edge["downstream"]
+        }
         if "dependency" in claim or "upstream" in claim or "downstream" in claim:
             if "connection timeout" in claim:
                 return any(
@@ -452,12 +470,6 @@ class IterativeInvestigator:
                             for kind in span.get("exception_types", []))
                     for span in spans
                 )
-            downstream = {
-                str(edge.get("downstream") or "").lower()
-                for edge in edges if isinstance(edge, dict)
-                and edge.get("upstream") and edge.get("downstream")
-                and edge["upstream"] != edge["downstream"]
-            }
             return any(
                 float(span.get("duration_ms") or 0) >= 500
                 and str(span.get("service") or "").lower() in downstream
@@ -467,6 +479,7 @@ class IterativeInvestigator:
             return any(
                 isinstance(span, dict)
                 and float(span.get("duration_ms") or 0) >= 250
+                and str(span.get("service") or "").lower() not in downstream
                 and isinstance(span.get("tags"), dict)
                 and bool(span["tags"].get("db.system") or span["tags"].get("db.operation"))
                 for span in spans
@@ -608,6 +621,14 @@ class IterativeInvestigator:
         coverage = {source: 0 for source in self.SOURCE_TOOL}
         for row in evidence:
             source = self._source(row)
+            if source == "topology":
+                meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                if (
+                    str(row.get("connector_id") or "").strip().lower() in {"unavailable", "alert-metadata", ""}
+                    and str(row.get("source_uri") or row.get("uri") or "").startswith("alert://")
+                    and not meta.get("runtime_state")
+                ):
+                    continue
             if source in coverage:
                 coverage[source] += 1
         return coverage
@@ -706,7 +727,7 @@ class IterativeInvestigator:
         signaled: set[str] = set()
         if not hypotheses:
             return signaled
-        for hypothesis in hypotheses:
+        for hypothesis in hypotheses[:1]:
             if str(hypothesis.get("status") or "") not in {"leading", "confirmed"}:
                 continue
             claim = str(hypothesis.get("claim") or "").lower()
@@ -763,6 +784,8 @@ class IterativeInvestigator:
             required.add("data")
         if any(token in text for token in ("recurring", "repeat", "known issue", "regression")):
             required.add("history")
+        if any(token in text for token in ("down", "unavailable", "availability", "unreachable", "stopped")):
+            required.add("topology")
         if not external_probe and (
             context.dependency_services or context.cmdb or context.kubernetes
             or any(token in text for token in ("dependency", "upstream", "downstream", "dependent"))
@@ -802,6 +825,8 @@ class IterativeInvestigator:
         # must not redirect every latency investigation to change search first.
         if any(token in alert_text for token in ("deploy", "release", "config", "stack", "traceback")):
             priority = ["changes", "code", "logs", "telemetry", "traces", "topology", "dependency", "resource", "runbooks", "history", "data"]
+        elif any(token in alert_text for token in ("down", "unavailable", "availability", "unreachable", "stopped")):
+            priority = ["topology", "logs", "telemetry", "dependency", "resource", "changes", "runbooks", "code", "history", "data", "traces"]
         elif any(token in alert_text for token in ("database", "mysql", "query", "replica", "table")):
             priority = ["data", "logs", "telemetry", "topology", "dependency", "resource", "changes", "runbooks", "code", "history", "traces"]
         elif any(token in alert_text for token in ("recurring", "repeat", "known issue")):
@@ -859,6 +884,12 @@ class IterativeInvestigator:
             "operation": context.alert.labels.get("operation"),
         }
         if tool in {"dependency-health.search", "topology.search"}:
+            # Alert project/application labels identify the logical app, while
+            # runtime inventory indexes Docker Compose projects separately.
+            # Keep the query tenant- and service-scoped rather than filtering
+            # runtime evidence with a name that may not match the Compose project.
+            arguments.pop("project", None)
+            arguments.pop("application", None)
             # Querying the alerting service's OWN container ("is api-gateway
             # healthy?") can never support or contradict a claim that ONE OF
             # ITS DEPENDENCIES is unhealthy -- self != related_to in the
@@ -928,6 +959,7 @@ class IterativeInvestigator:
         evidence: list[dict[str, Any]],
         *,
         context: Context,
+        completed_tools: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         if not hypotheses:
             diagnostic = self._leading_diagnostic_candidate(evidence)
@@ -980,7 +1012,7 @@ class IterativeInvestigator:
                 onset = context.alert.starts_at
                 if onset.tzinfo is None:
                     onset = onset.replace(tzinfo=UTC)
-                if not onset - timedelta(minutes=15) <= stopped <= onset + timedelta(minutes=5):
+                if not onset - timedelta(hours=2) <= stopped <= onset + timedelta(minutes=15):
                     continue
             except (KeyError, ValueError, TypeError):
                 continue
@@ -1039,12 +1071,38 @@ class IterativeInvestigator:
                     hypothesis["claim"] = timeout_claim
         coverage = self._coverage(evidence)
         required_sources = self._required_sources(context, hypotheses)
+        all_required_checked = bool(completed_tools) and not any(
+            coverage.get(source, 0) == 0 and self.SOURCE_TOOL.get(source) not in completed_tools
+            for source in required_sources
+        )
         change_events = self._change_events(context, evidence)
+        evidence_by_id = {str(row.get("evidence_id") or ""): row for row in evidence if row.get("evidence_id")}
+        service_tokens = self._tokens(context.alert.service)
+        has_structured_mechanism = any(
+            h.get("source") == "mechanism_candidate"
+            and any(self._structured_mechanism_support(h, r) and self._operational_for_support(r, h) for r in evidence)
+            for h in hypotheses
+        )
+        alert_domain_text = f"{context.alert.name} {context.alert.description}".lower()
+        fallback_mechanism_token = (
+            "resource saturation"
+            if any(tok in alert_domain_text for tok in ("cpu", "memory", "oom", "disk", "saturation", "deadletter", "dead_letter", "dlq", "queue", "database", "mysql", "pool"))
+            else "dependency"
+            if any(tok in alert_domain_text for tok in ("dependency", "upstream", "downstream", "timeout"))
+            else "traffic"
+        )
         for hypothesis in hypotheses:
             claim_tokens = self._tokens(hypothesis.get("claim"))
+            claim_lower = str(hypothesis.get("claim") or "").lower()
             support: list[str] = []
             sources: set[str] = set()
             contradiction: list[str] = []
+            if hypothesis.get("source") in {"context", "derived_observation"}:
+                for seed_id in hypothesis.get("supporting_evidence_ids") or []:
+                    seed_row = evidence_by_id.get(str(seed_id))
+                    if seed_row is not None and self._operational_for_support(seed_row, hypothesis):
+                        support.append(str(seed_id))
+                        sources.add(self._source(seed_row))
             for row in evidence:
                 evidence_id = str(row.get("evidence_id") or "")
                 text = " ".join(str(row.get(key) or "") for key in ("snippet", "summary", "content", "title"))
@@ -1059,29 +1117,17 @@ class IterativeInvestigator:
                 # fallback claim gets built from (see _leading_diagnostic_candidate),
                 # and it must remain eligible to support - or contradict - a
                 # hypothesis on every later revision pass, not just at selection time.
-                current_operational = self._operational_for_support(row)
+                current_operational = self._operational_for_support(row, hypothesis)
                 if (structured_support or lexical_support) and current_operational:
                     if evidence_id:
                         support.append(evidence_id)
                     sources.add(self._source(row))
                 structured_contradiction = self._structured_mechanism_contradiction(hypothesis, row)
-                # Word-boundary match, not plain substring: "unhealthy" (the
-                # evidence text a dependency hypothesis is actually looking
-                # for) contains "healthy" as a literal substring, so a naive
-                # `"healthy" in text` search reads exactly the evidence that
-                # should SUPPORT "dependency is unhealthy" as if it said the
-                # opposite. Reproduced live: an unhealthy-dependency evidence
-                # row (metadata.healthy=False) simultaneously satisfied
-                # _structured_mechanism_support (True) and this check (also
-                # True, via "un-HEALTHY"), and the two are irreconcilable by
-                # design -- supporting_evidence_ids explicitly drops anything
-                # that also lands in contradicting_evidence_ids -- so the
-                # evidence ended up counted as neither, silently discarded.
                 generic_health_contradiction = (
-                    hypothesis.get("source") != "derived_observation"
-                    and row.get("source_type") not in {"topology", "dependency", "resource"}
+                    hypothesis.get("source") not in {"derived_observation", "mechanism_candidate"}
+                    and row.get("source_type") not in {"topology", "dependency", "resource", "change", "code", "ticket", "runbook"}
                     and bool(re.search(r"\b(healthy|normal|no errors|recovered)\b", text.lower()))
-                    and bool(overlap)
+                    and len(overlap - service_tokens) >= 2
                 )
                 if evidence_id and current_operational and (
                     structured_contradiction
@@ -1092,7 +1138,13 @@ class IterativeInvestigator:
             fresh_support = [
                 row for row in supporting_rows
                 if (int(row.get("freshness_seconds") or 0) <= 900 or self._incident_window_aligned(row))
-                and self._current_operational(row)
+                and (
+                    self._current_operational(row)
+                    or (
+                        hypothesis.get("mechanism") == "runtime_stopped"
+                        and self._structured_mechanism_support(hypothesis, row)
+                    )
+                )
             ]
             temporal_alignment = len(fresh_support) / max(1, len(supporting_rows))
             topology_support = 1.0 if any(row.get("source_type") in {"topology", "dependency"} for row in supporting_rows) else (
@@ -1113,18 +1165,60 @@ class IterativeInvestigator:
                     topology_resource_ids=[str(item) for item in context.metadata.get("topology_resource_ids", [])],
                 ),
             ) if change_events else []
-            change_correlation = max(
-                (item.change_correlation_score for item in correlated_changes), default=0.0
+            is_change_hypothesis = (
+                hypothesis.get("source") != "mechanism_candidate"
+                or any(tok in claim_lower for tok in ("change", "deploy", "release", "config"))
             )
-            for item in correlated_changes:
-                if item.change_correlation_score >= 0.55:
-                    support.extend(evidence_id for evidence_id in item.evidence_ids if evidence_id)
-                    sources.add("changes")
+            change_correlation = (
+                max((item.change_correlation_score for item in correlated_changes), default=0.0)
+                if is_change_hypothesis else 0.0
+            )
+            if is_change_hypothesis and not has_structured_mechanism:
+                for item in correlated_changes:
+                    if item.change_correlation_score >= 0.55:
+                        support.extend(evidence_id for evidence_id in item.evidence_ids if evidence_id)
+                        sources.add("changes")
+            if (
+                hypothesis.get("source") == "mechanism_candidate"
+                and hypothesis.get("mechanism") != "runtime_stopped"
+                and not contradiction
+                and (
+                    bool(support)
+                    or (
+                        all_required_checked
+                        and not has_structured_mechanism
+                        and not change_events
+                        and fallback_mechanism_token in claim_lower
+                    )
+                )
+            ):
+                allowed_corroboration = {"telemetry", "logs", "traces", "resource", "topology"}
+                for row in evidence:
+                    src = self._source(row)
+                    ev_id = str(row.get("evidence_id") or "")
+                    if (
+                        ev_id
+                        and src in allowed_corroboration
+                        and (self._incident_window_aligned(row) or self._operational_for_support(row, hypothesis))
+                        and (
+                            not row.get("service")
+                            or str(row.get("service")).lower() == str(context.alert.service or "").lower()
+                            or src == "topology"
+                        )
+                    ):
+                        support.append(ev_id)
+                        sources.add(src)
             supporting_rows = [row for row in evidence if str(row.get("evidence_id") or "") in set(support)]
             fresh_support = [
                 row for row in supporting_rows
-                if (int(row.get("freshness_seconds") or 0) <= 900 or self._incident_window_aligned(row))
-                and self._current_operational(row)
+                if (
+                    (int(row.get("freshness_seconds") or 0) <= 900 or self._incident_window_aligned(row))
+                    and self._current_operational(row)
+                )
+                or (
+                    hypothesis.get("mechanism") == "runtime_stopped"
+                    and self._structured_mechanism_support(hypothesis, row)
+                )
             ]
             temporal_alignment = len(fresh_support) / max(1, len(supporting_rows))
             topology_support = 1.0 if any(
@@ -1273,8 +1367,12 @@ class IterativeInvestigator:
         )
 
     def _source_assessments(
-        self, evidence: list[dict[str, Any]], hypotheses: list[dict[str, Any]],
+        self,
+        evidence: list[dict[str, Any]],
+        hypotheses: list[dict[str, Any]],
+        completed_tools: set[str] | None = None,
     ) -> dict[str, dict[str, Any]]:
+        completed = completed_tools or set()
         supporting_ids = {
             str(evidence_id)
             for hypothesis in hypotheses
@@ -1283,10 +1381,16 @@ class IterativeInvestigator:
         assessments: dict[str, dict[str, Any]] = {}
         for source in self.SOURCE_TOOL:
             rows = [row for row in evidence if self._source(row) == source]
-            eligible = [row for row in rows if self._current_operational(row)]
+            eligible = [
+                row for row in rows
+                if self._current_operational(row) or str(row.get("evidence_id") or "") in supporting_ids
+            ]
             used = [row for row in eligible if str(row.get("evidence_id") or "") in supporting_ids]
             if not rows:
-                disposition = "not_available"
+                if self.SOURCE_TOOL.get(source) in completed:
+                    disposition = "reviewed_no_incident_aligned_evidence"
+                else:
+                    disposition = "not_available"
             elif not eligible and source in {"logs", "telemetry", "traces", "data", "dependency", "changes"}:
                 disposition = "reviewed_no_incident_aligned_evidence"
             elif used:
@@ -1302,7 +1406,11 @@ class IterativeInvestigator:
         return assessments
 
     def _confirmed_without_declared_gaps(
-        self, hypotheses: list[dict[str, Any]], evidence: list[dict[str, Any]], context: Context,
+        self,
+        hypotheses: list[dict[str, Any]],
+        evidence: list[dict[str, Any]],
+        context: Context,
+        completed_tools: set[str] | None = None,
     ) -> bool:
         """True only once the leading "confirmed" hypothesis has actually been
         tested against every evidence plane its own claim requires.
@@ -1343,9 +1451,13 @@ class IterativeInvestigator:
         }
         if len(supporting) < 2 or leading.get("contradicting_evidence_ids"):
             return False
+        completed = completed_tools or set()
         coverage = self._coverage(evidence)
         required_sources = self._required_sources(context, hypotheses)
-        return not any(coverage.get(source, 0) == 0 for source in required_sources)
+        return not any(
+            coverage.get(source, 0) == 0 and self.SOURCE_TOOL.get(source) not in completed
+            for source in required_sources
+        )
 
     async def investigate(self, context: Context, *, persist: PersistEvent | None = None) -> dict[str, Any]:
         investigation_started = monotonic()
@@ -1399,9 +1511,12 @@ class IterativeInvestigator:
                 status, stop_reason = InvestigationStatus.BUDGET_EXHAUSTED, "evidence_budget_exhausted"
                 break
             leading = hypotheses[0] if hypotheses else None
+            completed_tools = {
+                str(s.get("tool_name") or "") for s in steps if s.get("status") == "completed"
+            }
             # Apply both source coverage and claim-grounding requirements at
             # every stopping point, including the final post-loop check.
-            if self._confirmed_without_declared_gaps(hypotheses, evidence, context):
+            if self._confirmed_without_declared_gaps(hypotheses, evidence, context, completed_tools=completed_tools):
                 status, stop_reason = InvestigationStatus.CONCLUSIVE, "corroborated_leading_hypothesis"
                 break
             selection = self._select_tool(
@@ -1431,7 +1546,13 @@ class IterativeInvestigator:
                 existing = {str(row.get("evidence_id") or "") for row in evidence}
                 new_rows = [row for row in combined if str(row.get("evidence_id") or "") not in existing]
                 evidence = combined
-                hypotheses = self._revise_hypotheses(hypotheses, evidence, context=context)
+                step_completed_tools = {
+                    *(str(s.get("tool_name") or "") for s in steps if s.get("status") == "completed"),
+                    tool_name,
+                }
+                hypotheses = self._revise_hypotheses(
+                    hypotheses, evidence, context=context, completed_tools=step_completed_tools
+                )
                 step = {
                     "step_id": step_id,
                     "sequence_no": sequence,
@@ -1462,23 +1583,33 @@ class IterativeInvestigator:
             if persist:
                 await persist("step", {"investigation_id": investigation_id, **step})
             leading = hypotheses[0] if hypotheses else None
+            completed_tools = {
+                str(s.get("tool_name") or "") for s in steps if s.get("status") == "completed"
+            }
             # Apply both source coverage and claim-grounding requirements at
             # every stopping point, including the final post-loop check.
-            if self._confirmed_without_declared_gaps(hypotheses, evidence, context):
+            if self._confirmed_without_declared_gaps(hypotheses, evidence, context, completed_tools=completed_tools):
                 status, stop_reason = InvestigationStatus.CONCLUSIVE, "corroborated_leading_hypothesis"
                 break
             if len(evidence) >= self.max_evidence:
                 status, stop_reason = InvestigationStatus.BUDGET_EXHAUSTED, "evidence_budget_exhausted"
                 break
 
+        completed_tools = {
+            str(s.get("tool_name") or "") for s in steps if s.get("status") == "completed"
+        }
         if status == InvestigationStatus.RUNNING:
-            if self._confirmed_without_declared_gaps(hypotheses, evidence, context):
+            if self._confirmed_without_declared_gaps(hypotheses, evidence, context, completed_tools=completed_tools):
                 status, stop_reason = InvestigationStatus.CONCLUSIVE, "corroborated_leading_hypothesis"
             else:
                 status, stop_reason = InvestigationStatus.BUDGET_EXHAUSTED, "step_budget_exhausted"
         coverage = self._coverage(evidence)
         required_sources = self._required_sources(context, hypotheses)
-        missing = [source for source in required_sources if coverage.get(source, 0) == 0]
+        missing = [
+            source
+            for source in required_sources
+            if coverage.get(source, 0) == 0 and self.SOURCE_TOOL.get(source) not in completed_tools
+        ]
         leading = hypotheses[0] if hypotheses else None
         grounding_gaps = []
         if leading and len({
@@ -1580,7 +1711,7 @@ class IterativeInvestigator:
             "evidence_budget": self.max_evidence,
             "evidence_count": len(evidence),
             "source_coverage": coverage,
-            "source_assessments": self._source_assessments(evidence, hypotheses),
+            "source_assessments": self._source_assessments(evidence, hypotheses, completed_tools=completed_tools),
             "diagnostic_decisions": diagnostic_decisions,
             "missing_sources": missing,
             "investigation_plan": investigation_plan.model_dump(mode="json"),

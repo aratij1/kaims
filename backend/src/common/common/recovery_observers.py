@@ -147,14 +147,15 @@ class RecoveryObserverRegistry(BaseModel):
         return self
 
     def profile_for(self, *, tenant_id: str, environment: str, target: str, alert_name: str) -> RecoveryProfile | None:
+        profiles = [profile for profile in self.profiles if not profile.operator_verified_incident_ids]
         key = (tenant_id, environment, target, alert_name)
-        matches = [profile for profile in self.profiles if profile.key == key]
+        matches = [profile for profile in profiles if profile.key == key]
         if matches:
             return matches[0]
         alt_targets = [f"kaiops-{target}", target.removeprefix("kaiops-")]
         for alt_target in alt_targets:
             alt_matches = [
-                profile for profile in self.profiles
+                profile for profile in profiles
                 if profile.key == (tenant_id, environment, alt_target, alert_name)
             ]
             if alt_matches:
@@ -165,17 +166,28 @@ class RecoveryObserverRegistry(BaseModel):
                 return cloned
         fallback_matches = (
             [
-                profile for profile in self.profiles
+                profile for profile in profiles
                 if (profile.tenant_id, profile.environment, profile.alert_name) == (tenant_id, environment, alert_name)
             ]
             or [
-                profile for profile in self.profiles
+                profile for profile in profiles
+                if (profile.tenant_id, profile.alert_name) == (tenant_id, alert_name)
+            ]
+            or [
+                profile for profile in profiles
                 if (profile.tenant_id, profile.target_resource_id)
                 in {(tenant_id, target), *((tenant_id, t) for t in alt_targets)}
             ]
-            or [profile for profile in self.profiles if profile.tenant_id == tenant_id]
+            or [
+                profile for profile in profiles
+                if profile.tenant_id == tenant_id and profile.target_resource_id.startswith("rs-") == target.startswith("rs-")
+            ]
+            or [profile for profile in profiles if profile.tenant_id == tenant_id]
         )
         if fallback_matches:
+            source_target = fallback_matches[0].target_resource_id
+            source_short = source_target.removeprefix("kaiops-")
+            target_short = target.removeprefix("kaiops-")
             cloned = fallback_matches[0].model_copy(deep=True)
             cloned.environment = environment or cloned.environment
             cloned.target_resource_id = target
@@ -183,6 +195,17 @@ class RecoveryObserverRegistry(BaseModel):
             for check in cloned.checks:
                 check.spec.tenant_id = tenant_id
                 check.spec.target_resource_id = target
+                if source_target and target and source_target != target:
+                    check.spec.validator_id = check.spec.validator_id.replace(source_target, target)
+                    if check.spec.onboarding_registry_reference:
+                        check.spec.onboarding_registry_reference = check.spec.onboarding_registry_reference.replace(
+                            source_target, target
+                        )
+                    updated_query = check.query.replace(source_target, target)
+                    if source_short and target_short and source_short != target_short:
+                        updated_query = updated_query.replace(source_short, target_short)
+                    check.query = updated_query
+                    check.spec.check_reference = "promql:sha256:" + sha256(check.query.encode()).hexdigest()
             return cloned
         return None
 

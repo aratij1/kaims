@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import importlib.util
-from pathlib import Path
 import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
@@ -349,13 +349,13 @@ async def test_scenario_a_known_learned_runbook_matches_when_pending_and_after_i
             title=draft["title"],
             content=draft["content"],
             review_notes="Approved billing-worker runbook",
-            reviewed_by="sre-lead@example.com",
+            reviewed_by="sre-reviewer@example.com",
         )
         approved_res = await repo.approve_knowledge_rag_draft(
             tenant_id=tenant_id,
             draft_id=draft["draft_id"],
             expected_row_version=reviewed["row_version"],
-            approved_by="release-owner@example.com",
+            approved_by="sre-approver@example.com",
         )
         await session.commit()
         assert approved_res is not None
@@ -405,6 +405,7 @@ async def test_scenario_a_known_learned_runbook_matches_when_pending_and_after_i
     matched = (context.metadata or {}).get("matched_learned_runbook")
     assert isinstance(matched, dict)
     assert matched["runbook_id"] == str(rb_uuid)
+    assert recommendation.risk == "medium"
     assert context.metadata.get("document_available") is True
     assert "kubectl rollout restart deployment/billing-worker -n prod" in context.runbook
     assert isinstance(recommendation.metadata.get("runbook_guidance"), dict)
@@ -546,8 +547,8 @@ async def test_scenario_b_and_c_missing_runbook_lifecycle_and_second_incident_re
         ops_state = await enrichment_repo.incident_operations_state(
             tenant_id=tenant_id, incident_id=incident_1_id
         )
-        assert ops_state["lifecycle_state"] == "WAITING_FOR_HUMAN"
-        assert ops_state["next_action"]["type"] == "HUMAN_EVIDENCE"
+        assert ops_state["lifecycle_state"] == "COLLECTING"
+        assert ops_state["next_action"]["type"] == "AUTONOMOUS_COLLECTION"
 
         # 3. Operator supplies missing runbook & root-cause information
         submission = {
@@ -601,13 +602,13 @@ async def test_scenario_b_and_c_missing_runbook_lifecycle_and_second_incident_re
             title=draft_obj.title,
             content=draft_obj.content,
             review_notes="Approved ledger-sync-worker deadlock runbook",
-            reviewed_by="sre-lead@kaims.local",
+            reviewed_by="sre-reviewer@kaims.local",
         )
         approved_res = await inc_repo.approve_knowledge_rag_draft(
             tenant_id=tenant_id,
             draft_id=draft_id,
             expected_row_version=reviewed["row_version"],
-            approved_by="release-owner@kaims.local",
+            approved_by="sre-approver@kaims.local",
         )
         await session.commit()
         assert approved_res is not None

@@ -168,6 +168,7 @@ def _definition(
     required: list[str] | None = None,
     mutating: bool = True,
     trust: CapabilityTrustLevel = CapabilityTrustLevel.HITL_ONLY,
+    allowed_environments: list[str] | None = None,
 ) -> CapabilityDefinition:
     return CapabilityDefinition(
         capability_id=capability_id,
@@ -180,6 +181,11 @@ def _definition(
         dry_run_supported=True,
         validation=["target health verified", "original alert state evaluated"],
         rollback_capability=rollback,
+        allowed_environments=(
+            allowed_environments
+            if allowed_environments is not None
+            else ["development", "test", "staging", "production"]
+        ),
         maximum_blast_radius=blast,
         required_approval_level=approval,
         trust_level=trust,
@@ -210,7 +216,14 @@ def default_capability_registry() -> CapabilityRegistry:
         _definition("jenkins.rollback_deployment", "jenkins", RiskLevel.HIGH, "job.build", rollback="jenkins.rollback_deployment"),
         _definition("terraform.rollback", "terraform", RiskLevel.CRITICAL, "state.apply", blast=BlastRadiusScope.ENVIRONMENT, approval=ApprovalLevel.ADMIN),
         _definition("application.invoke_recovery_endpoint", "custom-api", RiskLevel.MEDIUM, "endpoint.invoke", required=["endpoint_id"]),
-        _definition("application.restart_service", "api", RiskLevel.MEDIUM, "service.restart", rollback="application.restart_service"),
+        _definition(
+            "application.restart_service",
+            "api",
+            RiskLevel.MEDIUM,
+            "service.restart",
+            rollback="application.restart_service",
+            allowed_environments=["development", "test", "staging", "production", "demo"],
+        ),
         _definition(
             "application.scale_workload", "api", RiskLevel.HIGH, "service.scale",
             required=["replicas"], rollback="application.scale_workload",

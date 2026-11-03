@@ -1210,7 +1210,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
     if (!incidentId) {
       return;
     }
-    if (onNavigatePath) {
+    if (onNavigatePath && initialTab !== "execution") {
       onNavigatePath(`/incidents/${encodeURIComponent(incidentId)}`);
       return;
     }
@@ -1576,14 +1576,40 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const currentFilters = ignoreFilters
         ? { risk_tier: "all", execution_mode: "all", transport_provider: "all", status: "all", service: "" }
         : incidentMetadataFiltersRef.current;
-      const payload = await fetchJson(
-        `/api-gateway/incidents/groups?${buildIncidentGroupQuery(options || {}, currentFilters)}`,
-        authenticatedOptions({ staleTimeMs: 0 }),
-      );
+      const [payload, awaitingPayload] = await Promise.all([
+        fetchJson(
+          `/api-gateway/incidents/groups?${buildIncidentGroupQuery(options || {}, currentFilters)}`,
+          authenticatedOptions({ staleTimeMs: 0 }),
+        ),
+        fetchJson(
+          `/api-gateway/incidents/groups?limit=100&status=awaiting_approval`,
+          authenticatedOptions({ staleTimeMs: 0 }),
+        ).catch(() => null),
+      ]);
       const data = unwrap(payload);
       const rows = data?.rows || [];
-      const nextRows = Array.isArray(rows) ? rows : [];
-      setIncidentMetadata({ loading: false, rows: nextRows, error: "", page: data || {} });
+      const baseRows = Array.isArray(rows) ? rows : [];
+      const awaitingData = awaitingPayload ? unwrap(awaitingPayload) : null;
+      const awaitingRows = Array.isArray(awaitingData?.rows) ? awaitingData.rows : [];
+      const isUnfiltered = (
+        (!currentFilters?.status || currentFilters.status === "all")
+        && (!currentFilters?.risk_tier || currentFilters.risk_tier === "all")
+        && (!currentFilters?.execution_mode || currentFilters.execution_mode === "all")
+        && !String(currentFilters?.service || "").trim()
+      );
+      const seenIds = new Set(baseRows.map((row) => String(row?.incident_id || row?.id || "").trim()).filter(Boolean));
+      const nextRows = isUnfiltered
+        ? [
+          ...baseRows,
+          ...awaitingRows.filter((row) => {
+            const id = String(row?.incident_id || row?.id || "").trim();
+            if (!id || seenIds.has(id)) return false;
+            seenIds.add(id);
+            return true;
+          }),
+        ]
+        : baseRows;
+      setIncidentMetadata({ loading: false, rows: nextRows, awaitingRows, error: "", page: data || {} });
     } catch (error) {
       setIncidentMetadata((prev) => ({
         loading: false,
@@ -5488,8 +5514,19 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       const value = Number(row?.match_confidence ?? row?._similarity ?? row?.similarity ?? row?.score ?? 0);
       return Number.isFinite(value) ? Math.max(best, value) : best;
     }, Number(metadata.rag_top_similarity || 0) || 0);
-    const projectedCitationCoverage = Number(projectedEvaluation?.citation_coverage ?? projectedEvaluation?.citationCoverage);
-    const projectedEvidenceCoverage = Number(projectedEvaluation?.evidence_coverage ?? projectedEvaluation?.evidenceCoverage);
+    const evidenceQuality = metadata?.evidence_quality && typeof metadata.evidence_quality === "object" ? metadata.evidence_quality : {};
+    const rcaAnalysis = metadata?.rca_analysis && typeof metadata.rca_analysis === "object" ? metadata.rca_analysis : {};
+    const projectedCitationCoverage = Number(
+      projectedEvaluation?.citation_coverage
+      ?? projectedEvaluation?.citationCoverage
+      ?? evidenceQuality?.citation_coverage
+      ?? rcaAnalysis?.citation_coverage
+    );
+    const projectedEvidenceCoverage = Number(
+      projectedEvaluation?.evidence_coverage
+      ?? projectedEvaluation?.evidenceCoverage
+      ?? evidenceQuality?.evidence_coverage
+    );
     const projectedConfidence = Number(projectedEvaluation?.confidence_score ?? projectedEvaluation?.confidenceScore);
     const projectedRagMatch = Number(projectedEvaluation?.rag_match_score ?? projectedEvaluation?.ragMatchScore);
     const citations = Array.isArray(metadata.citations) ? metadata.citations : [];
@@ -5654,13 +5691,14 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       && String(investigation?.status || "").toLowerCase() === "conclusive";
     const investigationConfidence = Number(investigation?.conclusion?.confidence || 0);
     const groundingScore = Number(selectedAlertEvaluation.groundingScore || 0);
+    const minConfidenceThreshold = selectedAlertWorkflow?.recommendation?.metadata?.analysis_engine === "verified-runtime-recovery.v1" ? 0.65 : 0.85;
     const reviewRequired = Boolean(
       selectedAlertEvaluation.requiresReview
       || !hasLinkedEvidence
-      || confidence < 0.85
+      || confidence < minConfidenceThreshold
       || groundingScore < 0.85
       || !investigationConclusive
-      || investigationConfidence < 0.85
+      || investigationConfidence < minConfidenceThreshold
       || selectedAiTrust.missing.length
       || selectedAiTrust.conflicting.length
       || analysis.status !== "resolved-analysis"
@@ -5907,9 +5945,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       }
       grouped.commands.push(normalized);
     });
-    const agentValidation = Array.isArray(selectedExecutionPlan.remediationAnalysis?.validation_queries)
-      ? selectedExecutionPlan.remediationAnalysis.validation_queries
-      : [];
+    const agentValidation = [
+      ...(Array.isArray(selectedExecutionPlan.remediationAnalysis?.validation_queries)
+        ? selectedExecutionPlan.remediationAnalysis.validation_queries
+        : []),
+      ...(Array.isArray(selectedExecutionPlan.catalogPlan?.validation_commands)
+        ? selectedExecutionPlan.catalogPlan.validation_commands
+        : []),
+      ...(Array.isArray(selectedExecutionPlan.catalogPlan?.validation)
+        ? selectedExecutionPlan.catalogPlan.validation
+        : []),
+    ];
     agentValidation.forEach((item) => {
       const query = String(item || "").trim();
       if (query && !grouped.queries.includes(query)) grouped.queries.push(query);
@@ -6959,8 +7005,17 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   }
 
   const pendingApprovals = useMemo(() => {
-    return monitorScopedIncidentMetadata.filter(hasPendingDecision);
-  }, [monitorScopedIncidentMetadata]);
+    const extraAwaiting = filterRowsForMonitor(incidentMetadata.awaitingRows || [], applicationToMonitor);
+    const seen = new Set();
+    return [...monitorScopedIncidentMetadata, ...extraAwaiting].filter((row) => {
+      if (!hasPendingDecision(row)) return false;
+      const id = String(row?.incident_id || row?.id || "").trim();
+      if (!id) return true;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+  }, [applicationToMonitor, incidentMetadata.awaitingRows, monitorScopedIncidentMetadata]);
 
   const globalOperationalData = useMemo(() => {
     const username = String(adminSession?.user?.username || "").trim().toLowerCase();
@@ -7415,10 +7470,8 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       : contextPlan;
     let boundRecommendationId = normalizedRecommendationId;
 
-    if (normalizedAction === "approve") {
-      // Approval must bind to the context returned by this request, not a
-      // previous React render. State updates from queue selection are async
-      // and previously caused plan_id/fingerprint to be omitted from the POST.
+    if (["approve", "reject"].includes(normalizedAction)) {
+      // Bind each decision to the current context, not a previous React render.
       const liveResponse = await fetchJson(
         `/api-gateway/approval/incident/${encodeURIComponent(normalizedIncidentId)}`,
         authenticatedOptions({ timeoutMs: 30000, maxAttempts: 1 }),
@@ -7444,25 +7497,27 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
         error: "",
       });
       if (boundRecommendationId && liveRecommendationId && boundRecommendationId !== liveRecommendationId) {
-        throw new Error("The approval queue changed while this incident was open. Review the latest recommendation before approving.");
+        throw new Error("The approval queue changed while this incident was open. Review the latest recommendation before deciding.");
       }
       boundRecommendationId = liveRecommendationId || boundRecommendationId;
       contextRoot = liveRoot;
       selectedPlan = livePlan;
 
-      const planId = String(selectedPlan?.plan_id || "").trim();
-      const planFingerprint = String(selectedPlan?.plan_fingerprint || "").trim();
-      if (!planId || !/^sha256:[0-9a-f]{64}$/.test(planFingerprint)) {
-        throw new Error(
-          "Approval unavailable: this recommendation has no current governed execution plan. Open the incident, run fresh analysis, then review the new plan.",
-        );
-      }
-      const eligibility = canonicalApprovalEligibility({ workflow: liveRoot, plan: selectedPlan });
-      if (!eligibility.executionEligible) {
-        const missingDetail = eligibility.reasons.length ? ` Missing controls: ${eligibility.reasons.join(", ")}.` : "";
-        throw new Error(
-          `Approval unavailable: the backend has not marked this plan execution-eligible.${missingDetail} Refresh evidence or regenerate analysis before approval.`,
-        );
+      if (normalizedAction === "approve") {
+        const planId = String(selectedPlan?.plan_id || "").trim();
+        const planFingerprint = String(selectedPlan?.plan_fingerprint || "").trim();
+        if (!planId || !/^sha256:[0-9a-f]{64}$/.test(planFingerprint)) {
+          throw new Error(
+            "Approval unavailable: this recommendation has no current governed execution plan. Open the incident, run fresh analysis, then review the new plan.",
+          );
+        }
+        const eligibility = canonicalApprovalEligibility({ workflow: liveRoot, plan: selectedPlan });
+        if (!eligibility.executionEligible) {
+          const missingDetail = eligibility.reasons.length ? ` Missing controls: ${eligibility.reasons.join(", ")}.` : "";
+          throw new Error(
+            `Approval unavailable: the backend has not marked this plan execution-eligible.${missingDetail} Refresh evidence or regenerate analysis before approval.`,
+          );
+        }
       }
     }
     const tenantId = String(
@@ -7491,7 +7546,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
       payload.recommendation_id = boundRecommendationId;
     }
 
-    if (normalizedAction === "approve") {
+    if (["approve", "reject"].includes(normalizedAction) && selectedPlan?.plan_id && selectedPlan?.plan_fingerprint) {
       payload.plan_id = selectedPlan?.plan_id;
       payload.plan_fingerprint = selectedPlan?.plan_fingerprint;
     }
@@ -8260,8 +8315,10 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
   const executionRollbackPlan = String(
     selectedAlertWorkflow?.recommendation?.rollback
     || selectedAlertWorkflow?.recommendation?.rollback_plan
+    || (Array.isArray(selectedAlertWorkflow?.recommendation?.metadata?.rollback_plan) ? selectedAlertWorkflow.recommendation.metadata.rollback_plan.join("\n") : selectedAlertWorkflow?.recommendation?.metadata?.rollback_plan)
     || (Array.isArray(selectedExecutionPlan.catalogPlan?.rollback_commands) ? selectedExecutionPlan.catalogPlan.rollback_commands.join("\n") : selectedExecutionPlan.catalogPlan?.rollback_commands)
     || (Array.isArray(selectedExecutionPlan.catalogPlan?.rollback) ? selectedExecutionPlan.catalogPlan.rollback.join("\n") : selectedExecutionPlan.catalogPlan?.rollback)
+    || selectedExecutionPlan.catalogPlan?.recovery_strategy?.summary
     || selectedExecutionPlan.remediationAction?.rollback
     || selectedExecutionPlan.remediationAction?.parameters?.rollback_plan
     || (Array.isArray(selectedExecutionPlan.remediationAnalysis?.rollback_plan) ? selectedExecutionPlan.remediationAnalysis.rollback_plan.join(" ") : selectedExecutionPlan.remediationAnalysis?.rollback_plan)
@@ -9607,7 +9664,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
               loadPage: (cursor = "") => loadIncidentMetadata({ cursor, limit: 10 }),
               updateFilter: (name, value) => setMetadataFilters((current) => ({ ...current, [name]: value })),
               open: (row) => openAlertDetailsFromIncident(row, "rca"),
-              openTechnical: (row) => openAlertDetailsFromIncident(row, "rca"),
+              openTechnical: (row) => openAlertDetailsFromIncident(row, "execution"),
             },
             alerts: {
               loading: landingPadRecent.loading,
@@ -10716,7 +10773,7 @@ export default function App({ initialTab = "home", currentPath = "/", currentSea
                         readinessChecks={[
                           { id: "citations", label: "Traceable evidence", detail: Number(selectedAlertEvaluation.citationCoverage || 0) > 0 ? `${formatQualityPercent(selectedAlertEvaluation.citationCoverage)} citation coverage.` : "No supporting citations are attached.", passed: Number(selectedAlertEvaluation.citationCoverage || 0) > 0, action: "review and attach supporting evidence" },
                           { id: "investigation", label: "Iterative investigation", detail: selectedInvestigationConclusive ? "A corroborated conclusion was reached." : "The investigation is missing or inconclusive.", passed: selectedInvestigationConclusive, action: "continue read-only investigation" },
-                          { id: "confidence", label: "Evidence confidence", detail: `${formatQualityPercent(selectedInvestigationConfidence)} investigation confidence.`, passed: selectedInvestigationConfidence >= 0.85, action: "raise evidence-derived confidence to at least 85%" },
+                          { id: "confidence", label: "Evidence confidence", detail: `${formatQualityPercent(selectedInvestigationConfidence)} investigation confidence.`, passed: selectedInvestigationConfidence >= (selectedAlertWorkflow?.recommendation?.metadata?.analysis_engine === "verified-runtime-recovery.v1" ? 0.65 : 0.85), action: "raise evidence-derived confidence to at least 65% for verified runtime recovery or 85% for general incidents" },
                           { id: "grounding", label: "Evidence coverage", detail: `${formatQualityPercent(selectedAlertEvaluation.groundingScore)} grounding coverage.`, passed: Number(selectedAlertEvaluation.groundingScore || 0) >= 0.85, action: "raise grounding coverage to at least 85%" },
                           { id: "freshness", label: "Fresh context", detail: selectedAiTrust.evidence.some((row) => !row.cached) ? "Live incident evidence is linked." : "Only cached or unknown evidence is available.", passed: selectedAiTrust.evidence.some((row) => !row.cached), action: "refresh incident context" },
                           { id: "conflicts", label: "Conflicts resolved", detail: selectedAiTrust.conflicting.length ? `${selectedAiTrust.conflicting.length} conflict(s) remain.` : "No conflicts were declared.", passed: selectedAiTrust.conflicting.length === 0, action: "resolve conflicting evidence" },

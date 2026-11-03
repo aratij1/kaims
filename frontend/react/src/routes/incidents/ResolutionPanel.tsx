@@ -16,6 +16,13 @@ function commands(value: any): string[] {
   if (value && typeof value === "object") return commands(value.command ?? value.script ?? value.value);
   return [];
 }
+function firstCommands(...candidates: any[]): string[] {
+  for (const candidate of candidates) {
+    const resolved = commands(candidate);
+    if (resolved.length) return resolved;
+  }
+  return [];
+}
 function text(...values: any[]): string { return values.find((value) => typeof value === "string" && value.trim())?.trim() || ""; }
 
 export default function ResolutionPanel({ workflow, alertRow, executionPlan, onNavigateTab, embedded = false, readinessChecks = [] }: Props) {
@@ -56,12 +63,13 @@ export default function ResolutionPanel({ workflow, alertRow, executionPlan, onN
   const eligibility = canonicalApprovalEligibility({ workflow, plan, receipt });
   const target = text(executionPlan.target, plan.remediation_target, typedAction?.target_resource_id) || "Not identified";
   const environment = text(alertRow?.environment, workflow?.incident?.environment) || "Not identified";
-  const action = text(executionPlan.action, workflow?.recommendation?.recommended_action, analysis.action) || "No action proposed";
+  const rawAction = text(executionPlan.action, workflow?.recommendation?.recommended_action, analysis.action);
+  const action = (rawAction.startsWith("Verify the external endpoint") ? text(plan.summary, plan.title, rawAction) : rawAction) || "No action proposed";
   const reason = text(typedAction?.reason, typedAction?.rationale, plan.rationale, metadata.rationale, analysis.rootCause) || "The evidence does not yet establish why a system change is required.";
   const outcome = text(executionPlan.expectedOutcome, typedAction?.expected_outcome, plan.expected_outcome) || "Independent health checks confirm recovery for the target.";
-  const run = commands(typedAction?.commands ?? typedAction?.command ?? plan.commands);
-  const validation = commands(typedAction?.validation_commands ?? plan.validation_commands ?? plan.validation_queries);
-  const rollback = commands(typedAction?.rollback_commands ?? plan.rollback_commands ?? plan.rollback_plan);
+  const run = firstCommands(typedAction?.commands, typedAction?.command, plan.commands);
+  const validation = firstCommands(typedAction?.validation_commands, plan.validation_commands, plan.validation_queries);
+  const rollback = firstCommands(typedAction?.rollback_commands, plan.rollback_commands, plan.rollback_plan, metadata.rollback_plan, plan.recovery_strategy?.summary);
   const suggestions = run.length ? [] : commands(metadata.model_proposed_execution_plan?.commands);
   const hasScript = run.length > 0;
   const evidenceOnly = /collect|evidence|trace|runbook|investigat|diagnos/i.test(action) && !hasScript;

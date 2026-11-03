@@ -340,7 +340,7 @@ async def test_complete_missing_runbook_learning_and_reuse_e2e_workflow(
             "2. Confirm checkout HTTP 5xx error rate returns below 0.5% for 5 minutes"
         ),
         rollback_plan="1. `kubectl rollout undo deployment/checkout-api -n prod`",
-        auto_approve_runbook=True,
+        create_runbook_draft=True,
     )
 
     response_1 = await context_agent_module.respond_to_context_gap(
@@ -353,12 +353,41 @@ async def test_complete_missing_runbook_learning_and_reuse_e2e_workflow(
     # -------------------------------------------------------------------------
     # STEP 3 & 4: Verify runbook creation, persistence, Qdrant indexing, and reusable context
     # -------------------------------------------------------------------------
-    assert response_1["learning_complete"] is True
-    assert response_1["indexing_status"] == "indexed"
-    assert response_1.get("governed_document") is not None
+    assert response_1["learning_complete"] is False
+    assert response_1["indexing_status"] == "pending_approval"
+    assert response_1.get("governed_document") is None
+    assert len(indexed_documents) == 0
+    draft_id = str(response_1["knowledge_draft_id"])
+    async with sqlite_session_factory() as session:
+        draft = await session.get(KnowledgeRagDraftRecord, UUID(draft_id))
+        assert draft is not None
+        incident_repo = IncidentRepository(session)
+        reviewed = await incident_repo.review_knowledge_rag_draft(
+            tenant_id=tenant_id,
+            draft_id=draft_id,
+            expected_row_version=draft.row_version,
+            title=draft.title,
+            content=draft.content,
+            review_notes="Validated runbook instructions and rollback procedure.",
+            reviewed_by="runbook-reviewer@example.com",
+        )
+        approved = await incident_repo.approve_knowledge_rag_draft(
+            tenant_id=tenant_id,
+            draft_id=draft_id,
+            expected_row_version=reviewed["row_version"],
+            approved_by="runbook-approver@example.com",
+        )
+        await session.commit()
+        assert approved is not None
+        _, approved_document = approved
+    await context_agent_module._index_governed_document(context_agent_module.app, {
+        "tenant_id": tenant_id,
+        "document_id": approved_document["document_id"],
+        "content_checksum": approved_document["content_checksum"],
+    })
     assert len(indexed_documents) == 1
     assert indexed_documents[0]["tenant_id"] == tenant_id
-    assert indexed_documents[0]["document_id"] == response_1["governed_document"]["document_id"]
+    assert indexed_documents[0]["document_id"] == approved_document["document_id"]
 
     async with sqlite_session_factory() as session:
         gov_docs = (
@@ -683,7 +712,7 @@ async def test_failed_qdrant_indexing_does_not_falsely_report_successful_learnin
         root_cause="Primary payment gateway regional endpoint degraded.",
         business_impact="Card payments failing for 25% of checkout requests.",
         remediation_steps="`kubectl rollout restart deployment/payment-service -n prod`",
-        auto_approve_runbook=True,
+        create_runbook_draft=True,
     )
 
     response = await context_agent_module.respond_to_context_gap(
@@ -693,6 +722,30 @@ async def test_failed_qdrant_indexing_does_not_falsely_report_successful_learnin
         tenant_id=tenant_id,
     )
 
-    assert response["indexing_status"] == "failed"
+    assert response["indexing_status"] == "pending_approval"
     assert response["learning_complete"] is False
-    assert "Qdrant collection connection refused" in (response.get("indexing_error") or "")
+    draft_id = str(response["knowledge_draft_id"])
+    async with sqlite_session_factory() as session:
+        draft = await session.get(KnowledgeRagDraftRecord, UUID(draft_id))
+        assert draft is not None
+        reviewed = await IncidentRepository(session).review_knowledge_rag_draft(
+            tenant_id=tenant_id,
+            draft_id=draft_id,
+            expected_row_version=draft.row_version,
+            title=draft.title,
+            content=draft.content,
+            review_notes="Validated runbook instructions and rollback procedure.",
+            reviewed_by="runbook-reviewer@example.com",
+        )
+        await session.commit()
+    approval = await context_agent_module.approve_knowledge_rag_draft(
+        draft_id,
+        context_agent_module.KnowledgeRagDraftApproveRequest(
+            tenant_scope=tenant_id,
+            approved_by="runbook-approver@example.com",
+            expected_row_version=reviewed["row_version"],
+        ),
+    )
+    assert approval["indexing_status"] == "failed"
+    assert approval["learning_complete"] is False
+    assert "Qdrant collection connection refused" in (approval.get("indexing_error") or "")

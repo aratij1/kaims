@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from common.config import get_settings
 from common.errors import sanitize_handler_failure_text
+from common.migration_state import current_schema_version
 from common.service import create_app
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -92,7 +93,7 @@ def test_build_info_exposes_safe_release_contract(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {
         "release_sha": "a" * 40,
-        "schema_version": "20261015_snapshot_alert_retention_index",
+        "schema_version": current_schema_version(),
         "contract_version": "kaiops.incident-operations.v1",
         "build_time": "2026-08-31T11:00:00Z",
     }

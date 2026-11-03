@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from ai_workbench_common.models import Context
 from common.models import Alert, AlertSeverity, Recommendation
+from common.orchestration.execution_plan import resolve_execution_plan
 
 _APP_PATH = Path(__file__).resolve().parents[2] / "ai-workbench" / "src" / "resolution-agent" / "app.py"
 _APP_SPEC = importlib.util.spec_from_file_location("readiness_handoff_resolution_app", _APP_PATH)
@@ -66,6 +67,50 @@ def test_catalog_handoff_preserves_evidence_readiness_block() -> None:
 
     assert plan["execution_ready"] is False
     assert any("38% RCA-ready" in reason for reason in plan["readiness_blocks"])
+
+
+def test_catalog_plan_allowlist_violations_fall_back_to_resolved_plan(monkeypatch):
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="RobotShopRatingsUnavailable",
+        service="rs-ratings",
+        environment="demo",
+        severity=AlertSeverity.CRITICAL,
+        description="ratings service unavailable",
+    )
+    context = Context(tenant_id="tenant-a", incident_id=alert.id, alert=alert)
+    supplied_plan = resolve_execution_plan(
+        alert=alert,
+        workflow_name="resolution-rerun",
+        requires_approval=True,
+        risk_tier="medium",
+        execution_mode="human-approval",
+        resolution_hints="ratings service unavailable",
+    )
+    assert resolution_app.verify_plan_fingerprint(supplied_plan)
+
+    fallback_plan = {"schema_version": "fallback"}
+    fallback_calls = []
+    monkeypatch.setattr(
+        resolution_app,
+        "validate_plan_commands_allowlisted",
+        lambda _plan: ["execution command is not allowlisted"],
+    )
+    monkeypatch.setattr(
+        resolution_app,
+        "resolve_execution_plan",
+        lambda **kwargs: fallback_calls.append(kwargs) or fallback_plan,
+    )
+
+    result = resolution_app._catalog_plan_for(
+        context,
+        {"execution_plan": supplied_plan},
+    )
+
+    assert result is fallback_plan
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0]["alert"] is alert
 
 
 def test_intake_route_cannot_waive_later_plan_approval(monkeypatch):

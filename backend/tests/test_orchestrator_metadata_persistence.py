@@ -84,9 +84,15 @@ async def test_orchestrator_persists_metadata_envelope_before_publish(monkeypatc
 @pytest.mark.asyncio
 async def test_orchestrator_does_not_advance_delivery_without_persisted_decision(monkeypatch):
     captured = {}
+
     async def consume(_consumer, handler):
         captured["handler"] = handler
+
+    async def consume_lifecycle_without_broker(_consumer, _handler):
+        await asyncio.Event().wait()
+
     monkeypatch.setattr(orchestrator_app, "_build_ingress_consumers", lambda: [("test", object(), consume)])
+    monkeypatch.setattr(orchestrator_app, "consume_rabbitmq_forever", consume_lifecycle_without_broker)
     monkeypatch.setattr(orchestrator_app.settings, "temporal_pilot_enabled", False)
     monkeypatch.setattr(orchestrator_app, "selected_event_bus_provider", lambda _settings: "rabbitmq")
     monkeypatch.setattr(orchestrator_app.agent, "decide_workflow_async_with_runtime", AsyncMock(return_value=SimpleNamespace(workflow="investigate")))

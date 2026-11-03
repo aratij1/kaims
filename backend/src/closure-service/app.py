@@ -311,6 +311,16 @@ def _build_final_incident_payload(
         if diagnostic_report
         else IncidentStatus.FAILED.value
     )
+    jira_meta = (
+        existing_metadata.get("jira")
+        if isinstance(existing_metadata, dict) and isinstance(existing_metadata.get("jira"), dict)
+        else {}
+    )
+    resolved_ticket_id = (
+        incident_payload_map.get("ticket_id")
+        or incident_payload_map.get("jira_issue_key")
+        or jira_meta.get("issue_key")
+    )
     final_payload = {
         "id": str(action.incident_id),
         "service": service_name,
@@ -320,7 +330,7 @@ def _build_final_incident_payload(
         "title": str(incident_payload_map.get("title") or f"Incident {action.incident_id}"),
         "summary": str(incident_payload_map.get("summary") or ""),
         "owner_team": incident_payload_map.get("owner_team"),
-        "ticket_id": incident_payload_map.get("ticket_id"),
+        "ticket_id": resolved_ticket_id,
         "closed_at": datetime.now(timezone.utc).isoformat() if closure_complete else incident_payload_map.get("closed_at"),
         "trace_id": str(
             incident_payload_map.get("trace_id")
@@ -337,6 +347,18 @@ def _build_final_incident_payload(
         "created_at": incident_payload_map.get("created_at"),
         "tenant_id": incident_payload_map.get("tenant_id") or action.tenant_id,
     }
+    if incident_payload_map.get("jira_issue_key") or incident_payload_map.get("jira_key") or resolved_ticket_id:
+        resolved_key = incident_payload_map.get("jira_issue_key") or incident_payload_map.get("jira_key") or resolved_ticket_id
+        final_payload["jira_key"] = resolved_key
+        final_payload["jira_issue_key"] = resolved_key
+    if incident_payload_map.get("jira_issue_url") or incident_payload_map.get("jira_url") or jira_meta.get("issue_url") or jira_meta.get("url"):
+        resolved_url = incident_payload_map.get("jira_issue_url") or incident_payload_map.get("jira_url") or jira_meta.get("issue_url") or jira_meta.get("url")
+        final_payload["jira_url"] = resolved_url
+        final_payload["jira_issue_url"] = resolved_url
+    if closure_complete and (resolved_ticket_id or incident_payload_map.get("jira_status")):
+        final_payload["jira_status"] = "Closed"
+    elif incident_payload_map.get("jira_status"):
+        final_payload["jira_status"] = incident_payload_map.get("jira_status")
     lifecycle = extract_lifecycle(
         report.metadata,
         action.parameters,
@@ -406,7 +428,17 @@ async def _sync_closure_to_jira(incident_payload: dict[str, Any], report: Resolu
 
     logger = logging.getLogger("closure-service.jira-sync")
 
-    ticket_id = str(incident_payload.get("ticket_id") or "").strip()
+    jira_meta = (
+        (incident_payload.get("metadata") or {}).get("jira")
+        if isinstance(incident_payload.get("metadata"), dict)
+        else {}
+    )
+    ticket_id = str(
+        incident_payload.get("ticket_id")
+        or incident_payload.get("jira_issue_key")
+        or (jira_meta.get("issue_key") if isinstance(jira_meta, dict) else "")
+        or ""
+    ).strip()
     if not ticket_id:
         logger.info("No Jira ticket linked to incident %s; skipping closure update", report.incident_id)
         return {"status": "skipped", "reason": "no_linked_ticket", "transitioned": False}
@@ -609,7 +641,20 @@ async def _persist_closure_event(
             return {"status": "stale_suppressed", "reason": stale_reason, "transitioned": False, "outbox_enqueued": False}
         if _is_observed_recovery(report):
             await commit_guard(session, incident_payload, report, observed_assessment_id, settings)
-        report.ticket_id = str(incident_payload.get("ticket_id") or "").strip() or None
+        jira_meta_map = (
+            (incident_payload.get("metadata") or {}).get("jira")
+            if isinstance(incident_payload.get("metadata"), dict)
+            else {}
+        )
+        report.ticket_id = (
+            str(
+                incident_payload.get("ticket_id")
+                or incident_payload.get("jira_issue_key")
+                or (jira_meta_map.get("issue_key") if isinstance(jira_meta_map, dict) else "")
+                or ""
+            ).strip()
+            or None
+        )
         final_incident_payload = _build_final_incident_payload(
             action=action,
             report=report,
@@ -654,8 +699,35 @@ async def _persist_closure_event(
                     "owner": None,
                 },
                 policy={
-                    "risk_tier": "unknown",
-                    "execution_mode": "unknown",
+                    "risk_tier": str(
+                        (
+                            (recommendation.get("metadata") or {}).get("execution_plan", {})
+                            if isinstance(recommendation.get("metadata"), dict)
+                            and isinstance((recommendation.get("metadata") or {}).get("execution_plan"), dict)
+                            else (
+                                action.parameters.get("execution_plan")
+                                if isinstance(action.parameters.get("execution_plan"), dict)
+                                else {}
+                            )
+                        ).get("risk_tier")
+                        or recommendation.get("risk")
+                        or action.parameters.get("risk_tier")
+                        or "unknown"
+                    ).lower(),
+                    "execution_mode": str(
+                        (
+                            (recommendation.get("metadata") or {}).get("execution_plan", {})
+                            if isinstance(recommendation.get("metadata"), dict)
+                            and isinstance((recommendation.get("metadata") or {}).get("execution_plan"), dict)
+                            else (
+                                action.parameters.get("execution_plan")
+                                if isinstance(action.parameters.get("execution_plan"), dict)
+                                else {}
+                            )
+                        ).get("execution_mode")
+                        or action.parameters.get("execution_mode")
+                        or "unknown"
+                    ).lower(),
                     "requires_approval": None,
                     "policy_version": None,
                     "policy_reason": "closure validation completed",
@@ -791,9 +863,27 @@ app = create_app(title="KaiMS Closure Service", settings=settings, startup=start
 
 
 def _eligible_for_reusable_knowledge(action: RemediationAction, report: ResolutionReport) -> bool:
+    observations = report.metadata.get("independent_validation_observations")
+    observations = observations if isinstance(observations, list) else []
+    stability_window = report.metadata.get("stability_window")
+    stability_window = stability_window if isinstance(stability_window, dict) else {}
     return bool(
-        report.health_restored
+        action.status == RemediationStatus.SUCCEEDED
+        and report.closure_status == "closed"
+        and report.health_restored
         and report.alerts_cleared
+        and report.validation.get("independent_checks_passed") is True
+        and report.validation.get("all_recovery_checks_passed") is True
+        and stability_window.get("status") == "recovered"
+        and observations
+        and all(
+            isinstance(item, dict)
+            and item.get("phase") == "post_state"
+            and item.get("passed") is True
+            and str(item.get("execution_id") or "") == str(action.id)
+            and str(item.get("result_checksum") or "").strip()
+            for item in observations
+        )
         and action.parameters.get("outcome_reviewed") is True
         and str(action.parameters.get("outcome_reviewed_by") or "").strip()
         and not action.parameters.get("operator_modified")

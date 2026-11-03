@@ -22,7 +22,6 @@ from ai_workbench_common.model_evaluation import build_quality_evaluation
 from ai_workbench_common.prompts import PROMPT_SUMMARIZE_RCA
 from common.ai_layer_client import AiLayerClient
 from common.config import get_settings
-from common.database import create_engine, create_schema, create_session_factory
 from common.context_enrichment_contract import (
     HitlJiraRequest,
     HumanEvidenceJiraRequest,
@@ -30,7 +29,17 @@ from common.context_enrichment_contract import (
     JiraRegressionRequest,
     TicketClosurePolicy,
 )
+from common.database import create_engine, create_schema, create_session_factory
 from common.event_publishers import build_agent_event_contract, build_event_envelope
+from common.hitl_routing import resolve_hitl_assignee
+from common.jira_governance import (
+    governed_jira_action,
+    jira_actor_id,
+    jira_issue_status,
+    jira_webhook_event_id,
+    kaims_may_close_ticket,
+    validate_jira_approval,
+)
 from common.logging import get_logger
 from common.models import (
     Alert,
@@ -46,15 +55,6 @@ from common.models import (
     RemediationStatus,
     ResolutionReport,
 )
-from common.jira_governance import (
-    governed_jira_action,
-    jira_actor_id,
-    jira_issue_status,
-    jira_webhook_event_id,
-    kaims_may_close_ticket,
-    validate_jira_approval,
-)
-from common.hitl_routing import resolve_hitl_assignee
 from common.object_storage import build_object_storage
 from common.orchestration.execution_plan import resolve_execution_plan
 from common.repository import ContextEnrichmentRepository, IncidentRepository, ObjectStorageRepository
@@ -5096,21 +5096,33 @@ async def ingest_generic_provider_alert(provider: str = "prometheus", integratio
 @app.post("/api/v1/tickets/jira")
 @app.post("/api/v1/alerts/jira")
 async def ingest_jira_webhook(
+    background_tasks: BackgroundTasks,
     payload: dict = ALERT_BODY,
-    background_tasks: BackgroundTasks | None = None,
     token: str | None = None,
     x_webhook_token: str | None = Header(default=None),
     x_jira_webhook_secret: str | None = Header(default=None, alias="X-Jira-Webhook-Secret"),
     x_trace_id: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """Receive authenticated Jira webhooks before the generic provider route."""
+    """Receive authenticated Jira webhooks before the generic provider route.
+
+    Authentication token precedence:
+    1. X-Webhook-Token header
+    2. X-Jira-Webhook-Secret header
+    3. token query parameter (fallback for webhook senders without custom headers)
+    """
     if not JIRA_WEBHOOK_SECRET:
         raise HTTPException(status_code=503, detail="Jira ingestion is not configured (JIRA_WEBHOOK_SECRET unset)")
-    header_token = x_webhook_token if isinstance(x_webhook_token, str) else (
-        x_jira_webhook_secret if isinstance(x_jira_webhook_secret, str) else None
+    header_token = (
+        x_webhook_token.strip()
+        if isinstance(x_webhook_token, str) and x_webhook_token.strip()
+        else (
+            x_jira_webhook_secret.strip()
+            if isinstance(x_jira_webhook_secret, str) and x_jira_webhook_secret.strip()
+            else None
+        )
     )
-    query_token = token if isinstance(token, str) else None
-    provided_token = str(query_token or header_token or "").strip()
+    query_token = token.strip() if isinstance(token, str) and token.strip() else None
+    provided_token = str(header_token or query_token or "").strip()
     if not provided_token or not hmac.compare_digest(provided_token, JIRA_WEBHOOK_SECRET):
         raise HTTPException(status_code=401, detail="invalid or missing Jira webhook token")
 
@@ -5120,10 +5132,7 @@ async def ingest_jira_webhook(
     issue_key = str(issue.get("key") or "unknown-issue")
     webhook_event = str(payload.get("webhookEvent") or "").strip()
 
-    if background_tasks is not None and hasattr(background_tasks, "add_task"):
-        background_tasks.add_task(_process_jira_webhook, payload, x_trace_id)
-    else:
-        await _process_jira_webhook(payload, x_trace_id)
+    background_tasks.add_task(_process_jira_webhook, payload, x_trace_id)
     logger.info("received jira webhook event=%s issue=%s", webhook_event, issue_key)
     return {"received": True, "webhookEvent": webhook_event, "ticket_id": issue_key}
 
@@ -6418,7 +6427,7 @@ async def sample_scenarios_source() -> dict[str, Any]:
 async def get_onboarding_connectivity() -> OnboardingConnectivityResponse:
     connectivity = load_onboarding_connectivity()
     snapshot = OnboardingConnectivitySnapshot.model_validate(connectivity if isinstance(connectivity, dict) else {})
-    return OnboardingConnectivityResponse(connectivity=snapshot)
+    return OnboardingConnectivityResponse(connectivity=snapshot.model_dump())
 
 
 @app.get("/onboarding/state", response_model=OnboardingStateResponse)
@@ -6993,7 +7002,7 @@ async def post_onboarding_connectivity(
     sanitized = save_onboarding_connectivity(validated_payload)
     await persist_onboarding_connectivity(validated_payload)
     snapshot = OnboardingConnectivitySnapshot.model_validate(sanitized if isinstance(sanitized, dict) else {})
-    return OnboardingConnectivityResponse(connectivity=snapshot)
+    return OnboardingConnectivityResponse(connectivity=snapshot.model_dump())
 
 
 @app.post("/onboarding/complete")

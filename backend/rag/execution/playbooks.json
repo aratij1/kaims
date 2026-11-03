@@ -42,7 +42,9 @@
           "unreachable",
           "not reachable",
           "endpoint down",
-          "availability"
+          "availability",
+          "unavailable",
+          "health probe failed"
         ]
       },
       "risk_tier": "high",

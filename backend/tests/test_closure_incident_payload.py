@@ -66,7 +66,6 @@ def _existing_incident_payload() -> dict:
 
 def test_only_reviewed_successful_unedited_outcome_is_reusable_knowledge() -> None:
     module = load_closure_app_module()
-    report = _report(health_restored=True)
     action = RemediationAction(
         tenant_id="tenant-a",
         incident_id=INCIDENT_ID,
@@ -75,6 +74,7 @@ def test_only_reviewed_successful_unedited_outcome_is_reusable_knowledge() -> No
         status=RemediationStatus.SUCCEEDED,
         parameters={"outcome_reviewed": True, "outcome_reviewed_by": "sre@example.com"},
     )
+    report = _report(health_restored=True, verified_recovery=True, action_id=action.id)
     assert module._eligible_for_reusable_knowledge(action, report) is True
 
     action.parameters["operator_modified"] = True
@@ -82,6 +82,10 @@ def test_only_reviewed_successful_unedited_outcome_is_reusable_knowledge() -> No
     action.parameters = {}
     assert module._eligible_for_reusable_knowledge(action, report) is False
     assert module._eligible_for_reusable_knowledge(action, _report(health_restored=False)) is False
+    assert module._eligible_for_reusable_knowledge(
+        action.model_copy(update={"parameters": {"outcome_reviewed": True, "outcome_reviewed_by": "reviewer"}}),
+        _report(health_restored=True),
+    ) is False
 
 
 def _action() -> RemediationAction:
@@ -94,15 +98,36 @@ def _action() -> RemediationAction:
     )
 
 
-def _report(*, health_restored: bool) -> ResolutionReport:
+def _report(
+    *,
+    health_restored: bool,
+    verified_recovery: bool = False,
+    action_id=None,
+) -> ResolutionReport:
+    observations = [{
+        "phase": "post_state",
+        "execution_id": str(action_id),
+        "passed": True,
+        "result_checksum": "sha256:" + "a" * 64,
+    }] if verified_recovery else []
     return ResolutionReport(
         tenant_id="tenant-a",
         incident_id=INCIDENT_ID,
+        remediation_action_id=action_id,
+        closure_status="closed" if health_restored else "validation_failed",
         root_cause="deployment rollback",
         impact="payment service unavailable",
         action_taken="rolled back deployment",
         alerts_cleared=health_restored,
         health_restored=health_restored,
+        validation={
+            "independent_checks_passed": verified_recovery,
+            "all_recovery_checks_passed": verified_recovery,
+        },
+        metadata={
+            "stability_window": {"status": "recovered" if verified_recovery else "failed"},
+            "independent_validation_observations": observations,
+        },
     )
 
 

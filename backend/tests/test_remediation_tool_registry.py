@@ -263,9 +263,17 @@ async def test_jenkins_does_not_infer_restart_intent_from_triage_script(monkeypa
             "execution_plan": {
                 "scripts": ["bash scripts/remediation/kaiops_alert_health_triage.sh --service closure-service --dry-run false"],
                 "commands": ["curl -X POST http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/restart?t=30"],
-                "preflight": ["curl http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"],
-                "validation_commands": ["curl http://closure-service:8000/healthz"],
-                "rollback_commands": ["curl http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"],
+                "preflight": [
+                    "curl --fail --silent --show-error "
+                    "http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"
+                ],
+                "validation_commands": [
+                    "curl --fail --silent --show-error http://closure-service:8000/healthz"
+                ],
+                "rollback_commands": [
+                    "curl --fail --silent --show-error "
+                    "http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"
+                ],
             },
             "connection_profile": {
                 "executor_type": "jenkins",
@@ -279,10 +287,11 @@ async def test_jenkins_does_not_infer_restart_intent_from_triage_script(monkeypa
 
     assert action.action_type == "api_execution"
     assert action.parameters["execution_plan"]["preflight"] == [
-        "curl http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"
+        "curl --fail --silent --show-error "
+        "http://docker-socket-proxy:2375/containers/kaiops_azure-closure-service-1/json"
     ]
     assert action.parameters["execution_plan"]["validation_commands"] == [
-        "curl http://closure-service:8000/healthz"
+        "curl --fail --silent --show-error http://closure-service:8000/healthz"
     ]
     result = await JenkinsRollbackPlugin().execute(action)
 
@@ -302,13 +311,13 @@ def test_jenkins_fills_missing_safety_envelope_from_governed_template(monkeypatc
         comment="restart service",
         metadata={
             "service": "kaiops-remediation-engine",
-            "execution_plan": {"commands": ["curl http://approved-command"]},
+            "execution_plan": {"commands": ["curl --fail --silent --show-error http://approved-command"]},
             "connection_profile": {"executor_type": "jenkins"},
         },
     ))
 
     plan = action.parameters["execution_plan"]
-    assert plan["commands"] == ["curl http://approved-command"]
+    assert plan["commands"] == ["curl --fail --silent --show-error http://approved-command"]
     assert plan["preflight"] == []
     assert plan["validation_commands"] == []
     assert plan["rollback_commands"] == []
@@ -390,7 +399,11 @@ async def test_jenkins_submits_application_resolution_contract(monkeypatch: pyte
             return httpx.Response(200, json={"building": False, "result": "SUCCESS"})
         if request.url.path == "/job/payments/7/artifact/kaiops-result.json":
             return httpx.Response(200, json=_jenkins_result(submitted))
-        submitted.update(dict(request.url.params))
+        # Parameters are sent as form data (POST body), not URL query params.
+        if request.method == "POST" and request.content:
+            import urllib.parse
+            submitted.update(urllib.parse.parse_qs(request.content.decode(), keep_blank_values=True))
+            submitted.update({k: v[0] for k, v in submitted.items() if isinstance(v, list)})
         return httpx.Response(201, headers={"location": "https://jenkins.example/queue/item/7"})
 
     monkeypatch.setenv("JENKINS_USERNAME", "kaiops")
@@ -439,8 +452,10 @@ async def test_jenkins_does_not_finalize_stale_result_while_building(monkeypatch
             return httpx.Response(200, json={"building": False, "result": "SUCCESS"})
         if request.url.path == "/job/payments/8/artifact/kaiops-result.json":
             return httpx.Response(200, json=_jenkins_result(submitted))
-        if request.method == "POST":
-            submitted.update(dict(request.url.params))
+        if request.method == "POST" and request.content:
+            import urllib.parse
+            parsed = urllib.parse.parse_qs(request.content.decode(), keep_blank_values=True)
+            submitted.update({k: v[0] for k, v in parsed.items()})
         return httpx.Response(201, headers={"location": "/queue/item/8/"})
 
     monkeypatch.setenv("JENKINS_USERNAME", "kaiops")
@@ -483,7 +498,10 @@ async def test_jenkins_waits_until_queue_exposes_executable_url(monkeypatch: pyt
             return httpx.Response(200, json=_jenkins_result(submitted))
         if request.url.path == "/api/json":
             raise AssertionError("queue polling must not fall back to the Jenkins controller URL")
-        submitted.update(dict(request.url.params))
+        if request.method == "POST" and request.content:
+            import urllib.parse
+            parsed = urllib.parse.parse_qs(request.content.decode(), keep_blank_values=True)
+            submitted.update({k: v[0] for k, v in parsed.items()})
         return httpx.Response(201, headers={"location": "/queue/item/9/"})
 
     monkeypatch.setenv("JENKINS_USERNAME", "kaiops")

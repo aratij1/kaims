@@ -344,7 +344,7 @@ async def test_complete_e2e_incident_lifecycle_workflow(sqlite_session_factory, 
             tenant_id=tenant_id,
             draft_id=draft_id,
             expected_row_version=reviewed["row_version"],
-            approved_by="sre-lead@kaims.local",
+            approved_by="sre-manager@kaims.local",
         )
         await session.commit()
 

@@ -130,3 +130,17 @@ def test_fingerprint_ignores_generation_time_but_detects_plan_edits() -> None:
 
     assert canonical_plan_fingerprint(changed_timestamp) == plan["plan_fingerprint"]
     assert canonical_plan_fingerprint(changed_target) != plan["plan_fingerprint"]
+
+
+def test_execution_plan_requires_timezone_aware_expiry() -> None:
+    plan = execution_plan_module.resolve_execution_plan(
+        alert=_alert(),
+        workflow_name="critical-auto-remediation",
+        requires_approval=True,
+        risk_tier="high",
+        execution_mode="human-approval",
+    )
+    plan["expiry"] = "2099-01-01T00:00:00"
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        ExecutionPlanV2.model_validate(plan)

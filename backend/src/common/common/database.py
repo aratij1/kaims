@@ -1,13 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-
 from datetime import datetime
 from time import perf_counter
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import Computed, func, literal_column, Index, JSON, BigInteger, Boolean, DateTime, ForeignKey, ForeignKeyConstraint, Integer, MetaData, Numeric, String, Text, UniqueConstraint, Uuid, event, text
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Computed,
+    DateTime,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    MetaData,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+    event,
+    func,
+    literal_column,
+    text,
+)
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -21,7 +41,6 @@ from common.config import Settings
 from common.models import utc_now
 from common.resilience import CircuitBreaker, CircuitOpenError
 from common.telemetry import MYSQL_QUERY_LATENCY
-from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
 metadata = MetaData()
 
@@ -696,6 +715,87 @@ class ResolutionPlanSupersessionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class ResolutionInvestigationRecord(Base):
+    __tablename__ = "resolution_investigations"
+    __table_args__ = (
+        Index("idx_resolution_investigations_incident", "tenant_id", "incident_id", "started_at"),
+        Index("idx_resolution_investigations_status", "status", "updated_at"),
+    )
+
+    investigation_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False, default="default")
+    incident_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    alert_id: Mapped[str | None] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    stop_reason: Mapped[str | None] = mapped_column(String(128))
+    step_budget: Mapped[int] = mapped_column(Integer, nullable=False)
+    steps_used: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    evidence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    tool_budget: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    source_coverage: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    missing_sources: Mapped[list[Any]] = mapped_column(JSON, nullable=False)
+    conclusion: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, server_default=func.now(),
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, server_default=func.now(),
+    )
+
+
+class ResolutionInvestigationStepRecord(Base):
+    __tablename__ = "resolution_investigation_steps"
+    __table_args__ = (
+        UniqueConstraint("investigation_id", "sequence_no", name="uq_resolution_investigation_step"),
+        Index("idx_resolution_investigation_steps_tool", "tool_name", "status", "started_at"),
+    )
+
+    step_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("resolution_investigations.investigation_id", ondelete="CASCADE"), nullable=False,
+    )
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    query_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    result_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    evidence_ids: Mapped[list[Any]] = mapped_column(JSON, nullable=False)
+    hypothesis_updates: Mapped[list[Any]] = mapped_column(JSON, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(String(1000))
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, server_default=func.now(),
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ResolutionHypothesisRecord(Base):
+    __tablename__ = "resolution_hypotheses"
+    __table_args__ = (
+        UniqueConstraint("investigation_id", "claim_digest", name="uq_resolution_hypothesis_claim"),
+        Index("idx_resolution_hypotheses_status", "investigation_id", "status", "confidence"),
+    )
+
+    hypothesis_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    investigation_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("resolution_investigations.investigation_id", ondelete="CASCADE"), nullable=False,
+    )
+    claim_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    claim_text: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    confidence: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False, default=0)
+    supporting_evidence_ids: Mapped[list[Any]] = mapped_column(JSON, nullable=False)
+    contradicting_evidence_ids: Mapped[list[Any]] = mapped_column(JSON, nullable=False)
+    falsification_query: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, server_default=func.now(),
+    )
+
+
 class ExecutionPlanRecord(Base):
     """Durable canonical ExecutionPlanV2, separate from catalog selection."""
 
@@ -793,11 +893,14 @@ class RunbookApprovalRecord(Base):
     )
 
     approval_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id: Mapped[str | None] = mapped_column(String(128), index=True)
     runbook_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), index=True)
     version: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(32), index=True)
+    reviewer: Mapped[str | None] = mapped_column(String(255))
     approver: Mapped[str] = mapped_column(String(255))
     approver_role: Mapped[str] = mapped_column(String(64))
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
     reason: Mapped[str | None] = mapped_column(String(1000))
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
@@ -926,7 +1029,9 @@ class LearningAuditRecord(Base):
     """Append-only, hash-verifiable learning and governance event."""
 
     __tablename__ = "learning_audit_log"
-    sequence_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    sequence_id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    )
     event_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), unique=True, default=uuid4)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True, default="default")
     actor: Mapped[str] = mapped_column(String(255))

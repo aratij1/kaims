@@ -578,7 +578,7 @@ def test_dry_run_rejects_destructive_plan_even_after_generic_approval() -> None:
         metadata={"execution_plan": {"commands": ["rm -rf /"]}},
     )
     reasons = module._unsafe_plan_reasons(approval)
-    assert reasons and "filesystem deletion" in reasons[0]
+    assert any("filesystem deletion" in reason for reason in reasons)
 
 
 def test_validation_only_plan_is_detected_before_live_execution() -> None:

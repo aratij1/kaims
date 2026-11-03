@@ -64,7 +64,12 @@ async def test_outbox_commits_published_state_only_after_transport_success(monke
         assert kwargs["bind"] is connection
         yield session
     monkeypatch.setattr(dispatch,"AsyncSession",session_factory)
-    repo=SimpleNamespace(list_pending_resolution_events=AsyncMock(return_value=[SimpleNamespace(topic="context-events",payload={},partition_key="incident",event_id="event")]),mark_resolution_event_published=AsyncMock(),mark_resolution_event_retry=AsyncMock())
+    repo=SimpleNamespace(
+        dead_letter_exhausted_resolution_events=AsyncMock(return_value=0),
+        list_pending_resolution_events=AsyncMock(return_value=[SimpleNamespace(topic="context-events",payload={},partition_key="incident",event_id="event")]),
+        mark_resolution_event_published=AsyncMock(),
+        mark_resolution_event_retry=AsyncMock(),
+    )
     monkeypatch.setattr(dispatch,"IncidentRepository",lambda session:repo)
     async def publish(*args,**kwargs):
         if failure=="publish_error": raise ConnectionError("broker unavailable")

@@ -110,7 +110,7 @@ async def test_inconclusive_investigation_preserves_diagnostic_evidence_handoff(
     ]
     assert recommendation.metadata["confidence_kind"] == "leading_hypothesis"
     assert recommendation.metadata["confidence_actionable"] is False
-    assert "missing application sources" not in recommendation.recommended_action
+    assert recommendation.recommended_action == "Inspect system telemetry and logs to validate hypothesis."
 
 _APPROVAL_APP_PATH = Path(__file__).resolve().parents[1] / "src" / "approval-service" / "app.py"
 _APPROVAL_SPEC = importlib.util.spec_from_file_location("approval_service_app", _APPROVAL_APP_PATH)

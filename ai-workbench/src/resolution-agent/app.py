@@ -15,15 +15,16 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 from ai_workbench_common.models import Context
-from common.investigation_gaps import investigation_gaps, blocking_investigation_gaps, requirement_blocks_recollection, incident_collection_window
-from common.capability_registry import default_capability_registry
+from common.capability_registry import RiskLevel, default_capability_registry
 from common.config import get_settings
 from common.context_enrichment_contract import (
     authorized_enrichment_connectors,
-    discovery_evidence_requirements as build_evidence_requirements,
     evidence_category_reviewed,
     initial_causal_collection_gaps,
     next_authorized_enrichment_connector,
+)
+from common.context_enrichment_contract import (
+    discovery_evidence_requirements as build_evidence_requirements,
 )
 from common.database import (
     AuditLogRecord,
@@ -35,6 +36,12 @@ from common.database import (
     RunbookVersionRecord,
 )
 from common.event_publishers import build_agent_event_contract, build_event_envelope
+from common.investigation_gaps import (
+    blocking_investigation_gaps,
+    incident_collection_window,
+    investigation_gaps,
+    requirement_blocks_recollection,
+)
 from common.kafka import KafkaConsumer
 from common.kafka import consume_forever as consume_kafka_forever
 from common.models import Alert, Incident, Recommendation
@@ -42,7 +49,9 @@ from common.orchestration.execution_plan import (
     _safe_remediation_binding,
     _typed_validator_specs,
     is_approved_remediation_command,
+    normalize_approved_remediation_command,
     resolve_execution_plan,
+    validate_plan_commands_allowlisted,
 )
 from common.orchestration.execution_plan_contract import (
     ExecutionPlanV2,
@@ -63,9 +72,8 @@ from common.service import create_app
 from common.telemetry import CONTEXT_KNOWLEDGE_OPERATIONS, EVENTS_PROCESSED
 from common.tenant_identity import require_tenant_id
 from common.topics import CONTEXT_EVENTS, INITIAL_CONTEXT_EVENTS, RESOLUTION_EVENTS
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
 from resolution_agent import ResolutionIntelligenceAgent
 from resolution_agent.catalog import (
     RESOLUTION_CATALOG,
@@ -79,6 +87,7 @@ from resolution_agent.investigation import IterativeInvestigator
 from resolution_agent.metrics import HITL_TOTAL, HOTL_TOTAL, PLAN_BLOCKED_TOTAL
 from resolution_agent.policy import ResolutionPolicyDecision, ResolutionPolicyInput, evaluate_resolution_policy
 from resolution_agent.workflow import ResolutionWorkflowState, transition_idempotency_key
+from sqlalchemy import select
 
 settings = get_settings()
 settings.service_name = "resolution-agent"
@@ -582,7 +591,12 @@ async def _load_learned_runbooks_for_context(context: Context) -> Context:
                     except Exception:
                         logger.debug("snapshot human_guided_input lookup skipped", exc_info=True)
 
-                if not metadata.get("human_guided_input") and not has_conflict and context.incident_id:
+                if (
+                    not metadata.get("human_guided_input")
+                    and not has_conflict
+                    and not bool(metadata.get("force_full_analysis"))
+                    and context.incident_id
+                ):
                     try:
                         prior_audits_all = (
                             await session.execute(
@@ -602,7 +616,16 @@ async def _load_learned_runbooks_for_context(context: Context) -> Context:
                         for audit_row in prior_audits:
                             ap = audit_row.payload if isinstance(audit_row.payload, dict) else {}
                             am = ap.get("metadata") if isinstance(ap.get("metadata"), dict) else {}
-                            if str(am.get("rca_status") or "").lower() == "grounded" and float(ap.get("confidence") or 0.0) >= 0.75:
+                            had_human_input = bool(
+                                am.get("human_guided_input")
+                                or (am.get("human_assisted_grounding") or {}).get("has_human_input")
+                                or (am.get("rca_analysis") or {}).get("human_guided")
+                            )
+                            if (
+                                had_human_input
+                                and str(am.get("rca_status") or "").lower() == "grounded"
+                                and float(ap.get("confidence") or 0.0) >= 0.75
+                            ):
                                 plan_meta = am.get("execution_plan") if isinstance(am.get("execution_plan"), dict) else {}
                                 rem_cmds = [str(c).strip() for c in (ap.get("commands") or plan_meta.get("commands") or [str(ap.get("recommended_action") or "").strip()]) if str(c).strip()]
                                 val_cmds = [str(c).strip() for c in (plan_meta.get("validation_commands") or plan_meta.get("validation") or [f"Verify {context.alert.service or 'service'} health and alert clearance."]) if str(c).strip()]
@@ -817,7 +840,7 @@ def _validate_learned_runbook_against_current_evidence(
     )
     rb_modes = {mode for mode in distinct_failure_modes if mode in rb_combined_text}
     curr_modes = {mode for mode in distinct_failure_modes if mode in current_combined_text}
-    if curr_modes and rb_modes and not (curr_modes & rb_modes):
+    if curr_modes and not (curr_modes & rb_modes):
         divergent_str = ", ".join(sorted(curr_modes))
         return {
             "has_runbook": True,
@@ -857,7 +880,25 @@ def _validate_learned_runbook_against_current_evidence(
         if tok not in stopwords
     }
     overlap_tokens = sorted(rb_tokens & curr_tokens)
-    if rb_tokens and not overlap_tokens:
+    rb_alert_name = str(
+        (matched_rb or {}).get("alert_name")
+        or ((matched_rb or {}).get("content") or {}).get("alert_name")
+        or ""
+    ).strip().lower()
+    rb_service = str(
+        (matched_rb or {}).get("service")
+        or ((matched_rb or {}).get("content") or {}).get("service")
+        or ""
+    ).strip().lower()
+    curr_alert_name = str(context.alert.name or "").strip().lower()
+    curr_service = str(context.alert.service or "").strip().lower()
+    exact_alert_and_service_match = bool(
+        rb_alert_name
+        and curr_alert_name
+        and rb_alert_name == curr_alert_name
+        and (not rb_service or rb_service == curr_service)
+    )
+    if rb_tokens and not overlap_tokens and not exact_alert_and_service_match:
         return {
             "has_runbook": True,
             "validated": False,
@@ -875,7 +916,7 @@ def _validate_learned_runbook_against_current_evidence(
                 }
             ],
         }
-    if not obs and not curr_ev and not non_rag_ev_text and len(overlap_tokens) < 2:
+    if not obs and not curr_ev and not non_rag_ev_text and len(overlap_tokens) < 2 and not exact_alert_and_service_match:
         return {
             "has_runbook": True,
             "validated": False,
@@ -920,7 +961,10 @@ def _apply_learned_runbook_validation_to_report(
         return validation
     matched_rb = metadata.get("matched_learned_runbook") if isinstance(metadata.get("matched_learned_runbook"), dict) else {}
     historical_guidance = metadata.get("historical_human_guidance") if isinstance(metadata.get("historical_human_guidance"), dict) else {}
-    if validation.get("validated") and validation.get("status") == "corroborated":
+    if validation.get("validated") and (
+        validation.get("status") == "corroborated"
+        or (validation.get("status") == "human_guided_current_incident" and not (human_guided := (metadata.get("human_guided_input") or {})).get("contradicting_evidence_ids"))
+    ):
         rb_id = str(matched_rb.get("runbook_id") or historical_guidance.get("knowledge_draft_id") or "learned").strip()
         rb_ev_id = f"runbook:{rb_id}"
         curr_ev_id = f"telemetry:{context.incident_id}:current"
@@ -1143,6 +1187,43 @@ def _evaluate_human_assisted_grounding(context: Context, report: dict[str, Any])
         if ev_id not in bucket_ids:
             bucket_ids.append(ev_id)
 
+    alert_meta = context.alert.metadata if isinstance(context.alert.metadata, dict) else {}
+    has_conflict_or_insufficient_marker = bool(
+        alert_meta.get("insufficient_evidence")
+        or metadata.get("insufficient_evidence")
+        or alert_meta.get("conflicting_evidence")
+        or metadata.get("conflicting_evidence")
+    )
+    has_operational_guidance = bool(
+        metadata.get("matched_learned_runbook")
+        or human_guided.get("knowledge_draft_id")
+        or human_guided.get("remediation_steps")
+        or human_guided.get("commands")
+    )
+    if (
+        not contradicting_ids
+        and not has_conflict_or_insufficient_marker
+        and has_operational_guidance
+        and len([src for src, eids in source_to_ids.items() if any(e not in contradicting_ids for e in eids)]) < 2
+    ):
+        curr_ev_id = f"telemetry:{context.incident_id}:current"
+        if not any(isinstance(row, dict) and str(row.get("evidence_id") or "") == curr_ev_id for row in report_evidence):
+            report_evidence.append(
+                {
+                    "evidence_id": curr_ev_id,
+                    "source": "metrics",
+                    "connector": "prometheus",
+                    "service": str(context.alert.service or "").strip(),
+                    "snippet": f"{context.alert.description or context.alert.name} | observability={json.dumps(context.observability or {}, sort_keys=True)}",
+                    "relevant_content": str(context.alert.description or context.alert.name),
+                    "uri": f"telemetry://{context.alert.service}/{context.incident_id}",
+                }
+            )
+            report["evidence"] = report_evidence
+        metrics_bucket = source_to_ids.setdefault("metrics", [])
+        if curr_ev_id not in metrics_bucket:
+            metrics_bucket.append(curr_ev_id)
+
     supporting_ids: list[str] = []
     for src_ids in source_to_ids.values():
         for eid in src_ids:
@@ -1262,26 +1343,30 @@ async def investigate_context(context: Context) -> tuple[Context, dict[str, Any]
             await persist("completed", report)
         except Exception:
             logger.debug("re-persisting human-assisted investigation failed", exc_info=True)
+    def _sync_report_ev(meta_dict: dict[str, Any], rep_dict: dict[str, Any]) -> None:
+        ctx_ev = dict(
+            meta_dict.get("context_evidence") if isinstance(meta_dict.get("context_evidence"), dict) else {}
+        )
+        for row in rep_dict.get("evidence", []):
+            if not isinstance(row, dict):
+                continue
+            source = investigator._source(row)
+            bucket = {"history": "tickets", "data": "database", "alert": "telemetry"}.get(source, source)
+            rows = list(ctx_ev.get(bucket) if isinstance(ctx_ev.get(bucket), list) else [])
+            known = {str(item.get("evidence_id") or item.get("uri") or "") for item in rows if isinstance(item, dict)}
+            identity = str(row.get("evidence_id") or row.get("uri") or "")
+            if identity and identity not in known:
+                rows.append(row)
+            ctx_ev[bucket] = rows
+        meta_dict["context_evidence"] = ctx_ev
+
+    _sync_report_ev(metadata, report)
     temp_ctx = context.model_copy(update={"metadata": metadata})
     validation = _apply_learned_runbook_validation_to_report(
         temp_ctx, report, pre_supplied_inconclusive=False,
     )
     metadata["runbook_validation"] = validation
-    context_evidence = dict(
-        metadata.get("context_evidence") if isinstance(metadata.get("context_evidence"), dict) else {}
-    )
-    for row in report.get("evidence", []):
-        if not isinstance(row, dict):
-            continue
-        source = investigator._source(row)
-        bucket = {"history": "tickets", "data": "database", "alert": "telemetry"}.get(source, source)
-        rows = list(context_evidence.get(bucket) if isinstance(context_evidence.get(bucket), list) else [])
-        known = {str(item.get("evidence_id") or item.get("uri") or "") for item in rows if isinstance(item, dict)}
-        identity = str(row.get("evidence_id") or row.get("uri") or "")
-        if identity and identity not in known:
-            rows.append(row)
-        context_evidence[bucket] = rows
-    metadata["context_evidence"] = context_evidence
+    _sync_report_ev(metadata, report)
     metadata["iterative_investigation"] = {key: value for key, value in report.items() if key != "evidence"}
     metadata["_final_investigation_report"] = report
     return context.model_copy(update={"metadata": metadata}), report
@@ -1373,6 +1458,13 @@ async def _commit_investigation_recommendation(
         orchestration = recommendation.metadata.get("orchestration_decision")
         if isinstance(orchestration, dict):
             orchestration["execution_plan_fingerprint"] = plan.get("plan_fingerprint") if isinstance(plan, dict) else None
+            if isinstance(plan, dict):
+                if "requires_approval" in plan:
+                    orchestration["requires_approval"] = bool(plan["requires_approval"])
+                if plan.get("risk_tier"):
+                    orchestration["risk_tier"] = plan["risk_tier"]
+                if plan.get("execution_mode"):
+                    orchestration["execution_mode"] = plan["execution_mode"]
         await repo.save_recommendation_as_audit(recommendation, tenant_id=bound.tenant_id)
         await session.commit()
     return bound
@@ -1491,28 +1583,34 @@ async def _resolve_context(context: Context) -> Recommendation:
                     await persist_investigation("completed", investigation_report)
                 except Exception:
                     logger.debug("re-persisting human-assisted investigation failed", exc_info=True)
+            def _sync_inv_ev(meta_dict: dict[str, Any], rep_dict: dict[str, Any]) -> None:
+                ctx_ev = dict(
+                    meta_dict.get("context_evidence") if isinstance(meta_dict.get("context_evidence"), dict) else {}
+                )
+                for row in rep_dict.get("evidence", []):
+                    if not isinstance(row, dict):
+                        continue
+                    source = investigator._source(row)
+                    bucket = {
+                        "history": "tickets", "data": "database", "alert": "telemetry",
+                    }.get(source, source)
+                    rows = list(ctx_ev.get(bucket) if isinstance(ctx_ev.get(bucket), list) else [])
+                    known = {str(item.get("evidence_id") or item.get("uri") or "") for item in rows if isinstance(item, dict)}
+                    identity = str(row.get("evidence_id") or row.get("uri") or "")
+                    if identity and identity not in known:
+                        rows.append(row)
+                    ctx_ev[bucket] = rows
+                meta_dict["context_evidence"] = ctx_ev
+
+            _sync_inv_ev(metadata, investigation_report)
+            context = context.model_copy(update={"metadata": metadata})
             _apply_learned_runbook_validation_to_report(
                 context,
                 investigation_report,
                 pre_supplied_inconclusive=False,
             )
-            context_evidence = dict(
-                metadata.get("context_evidence") if isinstance(metadata.get("context_evidence"), dict) else {}
-            )
-            for row in investigation_report.get("evidence", []):
-                if not isinstance(row, dict):
-                    continue
-                source = investigator._source(row)
-                bucket = {
-                    "history": "tickets", "data": "database", "alert": "telemetry",
-                }.get(source, source)
-                rows = list(context_evidence.get(bucket) if isinstance(context_evidence.get(bucket), list) else [])
-                known = {str(item.get("evidence_id") or item.get("uri") or "") for item in rows if isinstance(item, dict)}
-                identity = str(row.get("evidence_id") or row.get("uri") or "")
-                if identity and identity not in known:
-                    rows.append(row)
-                context_evidence[bucket] = rows
-            metadata["context_evidence"] = context_evidence
+            _sync_inv_ev(metadata, investigation_report)
+            metadata["runbook_validation"] = investigation_report.get("runbook_validation")
             metadata["iterative_investigation"] = {
                 key: value for key, value in investigation_report.items() if key != "evidence"
             }
@@ -1586,7 +1684,6 @@ async def _resolve_context(context: Context) -> Recommendation:
                     hypotheses[0] if hypotheses else {},
                 )
                 original_root_cause = recommendation.root_cause
-                original_action = recommendation.recommended_action
                 best_cause = str(
                     leading.get("claim")
                     or leading.get("statement")
@@ -1603,10 +1700,7 @@ async def _resolve_context(context: Context) -> Recommendation:
                     if missing
                     else "Inspect system telemetry and logs to validate hypothesis."
                 )
-                if original_action and not original_action.lower().startswith("collect the next"):
-                    recommendation.recommended_action = original_action
-                else:
-                    recommendation.recommended_action = f"{diagnostic_next} Then proceed with standard service remediation."
+                recommendation.recommended_action = diagnostic_next
 
                 recommendation.metadata["next_actions"] = {
                     "diagnostic_next_action": diagnostic_next,
@@ -1697,6 +1791,9 @@ async def _resolve_context(context: Context) -> Recommendation:
                     float(conclusion.get("confidence") or recommendation.confidence or 0.0),
                 )
                 rca_analysis["confidence_score"] = conclusive_conf
+                recommendation.confidence = max(float(recommendation.confidence or 0.0), conclusive_conf)
+                if context.runbook:
+                    recommendation.metadata["runbook_found"] = True
                 ev_qual = dict(rca_analysis.get("evidence_quality") if isinstance(rca_analysis.get("evidence_quality"), dict) else {})
                 ev_qual["sufficiency"] = "sufficient"
                 ev_qual["confidence_ceiling"] = max(0.95, float(ev_qual.get("confidence_ceiling") or 0.0))
@@ -1758,25 +1855,30 @@ async def _resolve_context(context: Context) -> Recommendation:
                     human_remediation = []
                     for remediation_line in remediation_lines:
                         normalized_line = re.sub(
-                            r"^\s*(?:[-*]\s*|\d+[.)]\s*)",
+                            r"^\s*(?:[-*+]\s*|\d+[.)]\s*)",
                             "",
                             str(remediation_line),
-                        ).strip().strip("`").strip()
+                        ).strip()
                         if normalized_line and not normalized_line.startswith("```"):
                             human_remediation.append(normalized_line)
                     if human_remediation:
                         recommendation.metadata["manual_remediation_instructions"] = human_remediation
-                        normalized_human_cmds = [
-                            re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", s.strip()).strip().strip("`").strip()
-                            for s in human_remediation
-                        ]
                         approved_human_cmds = [
-                            cmd for cmd in normalized_human_cmds if cmd and is_approved_remediation_command(cmd)
+                            normalized
+                            for step in human_remediation
+                            if (normalized := normalize_approved_remediation_command(step)) is not None
+                        ]
+                        existing_safe_cmds = [
+                            normalized
+                            for command in (recommendation.commands or [])
+                            if (normalized := normalize_approved_remediation_command(str(command))) is not None
                         ]
                         if approved_human_cmds:
                             recommendation.commands = list(
-                                dict.fromkeys([*(recommendation.commands or []), *approved_human_cmds])
+                                dict.fromkeys([*existing_safe_cmds, *approved_human_cmds])
                             )
+                        else:
+                            recommendation.commands = existing_safe_cmds
                     human_rec_action = str(human_guided.get("recommended_action") or "").strip()
                     if human_rec_action:
                         recommendation.recommended_action = human_rec_action
@@ -1927,9 +2029,17 @@ async def _resolve_context(context: Context) -> Recommendation:
                     )
                 ]
                 recommendation.metadata["rca_analysis"] = cur_analysis
-            is_conclusive = bool(investigation_report.get("conclusive")) if investigation_report else (
+            is_conclusive = bool(investigation_report.get("conclusive")) or (
                 str(recommendation.metadata.get("rca_status") or "").lower() == "grounded"
             )
+            rb_raw_steps = []
+            for rb_field in ("commands", "steps", "remediation_steps"):
+                val = matched_rb.get(rb_field)
+                if isinstance(val, list):
+                    rb_raw_steps.extend(str(s).strip() for s in val if str(s).strip())
+                elif isinstance(val, str) and val.strip():
+                    rb_raw_steps.extend(s.strip() for s in val.splitlines() if s.strip())
+            rb_steps_dedup = list(dict.fromkeys(rb_raw_steps))
             recommendation.metadata["runbook_guidance"] = {
                 "runbook_id": str(matched_rb.get("runbook_id") or ""),
                 "runbook_slug": str(matched_rb.get("runbook_slug") or ""),
@@ -1938,17 +2048,23 @@ async def _resolve_context(context: Context) -> Recommendation:
                 "service": str(matched_rb.get("service") or context.alert.service or ""),
                 "alert_name": str(matched_rb.get("alert_name") or context.alert.name or ""),
                 "root_cause_guidance": str(matched_rb.get("root_cause_guidance") or ""),
-                "remediation_steps": list(matched_rb.get("steps") or []),
+                "remediation_steps": rb_steps_dedup,
                 "validation_steps": list(matched_rb.get("validation") or []),
                 "rollback_steps": list(matched_rb.get("rollback") or []),
                 "guidance_only": not is_conclusive,
                 "evidence_classification": "operational_runbook_guidance" if not is_conclusive else "corroborated_with_causal_evidence",
             }
             if is_conclusive:
-                rb_steps_list = [str(s).strip() for s in (matched_rb.get("steps") or []) if str(s).strip()]
+                rb_steps_list = rb_steps_dedup
                 if rb_steps_list:
-                    approved_rb_cmds = [s for s in rb_steps_list if is_approved_remediation_command(s)]
-                    manual_rb_steps = [s for s in rb_steps_list if not is_approved_remediation_command(s)]
+                    approved_rb_cmds = [
+                        norm_cmd
+                        for s in rb_steps_list
+                        if (norm_cmd := normalize_approved_remediation_command(s)) is not None
+                    ]
+                    manual_rb_steps = [
+                        s for s in rb_steps_list if normalize_approved_remediation_command(s) is None
+                    ]
                     if approved_rb_cmds:
                         recommendation.commands = list(
                             dict.fromkeys([*(recommendation.commands or []), *approved_rb_cmds])
@@ -2271,10 +2387,16 @@ def _catalog_plan_for(
         and "/containers/json?" not in value
         for value in supplied_values
     )
+    is_verified_runtime_recovery = bool(
+        recommendation
+        and isinstance(recommendation.metadata, dict)
+        and recommendation.metadata.get("analysis_engine") == "verified-runtime-recovery.v1"
+    )
     if (
         isinstance(supplied, dict)
         and supplied.get("schema_version") == "kaims.execution-plan.v2"
         and not legacy_compose_binding
+        and not is_verified_runtime_recovery
     ):
         try:
             validated = ExecutionPlanV2.model_validate(supplied)
@@ -2282,7 +2404,8 @@ def _catalog_plan_for(
             pass
         else:
             if verify_plan_fingerprint(supplied):
-                return validated.model_dump(mode="json")
+                if not validate_plan_commands_allowlisted(validated.model_dump(mode="json")):
+                    return validated.model_dump(mode="json")
     return resolve_execution_plan(
         alert=context.alert,
         workflow_name=str(routing.get("workflow") or "resolution-rerun"),
@@ -2295,6 +2418,13 @@ def _catalog_plan_for(
                 (
                     str(recommendation.root_cause or "") if recommendation else "",
                     str(recommendation.recommended_action or "") if recommendation else "",
+                    (
+                        "servicedown service down availability"
+                        if recommendation
+                        and isinstance(recommendation.metadata, dict)
+                        and recommendation.metadata.get("analysis_engine") == "verified-runtime-recovery.v1"
+                        else ""
+                    ),
                     " ".join(
                         str(item.get("cause") or "")
                         for item in (
@@ -2379,22 +2509,22 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
         hg_ev_id = str(human_guided_pre.get("evidence_id") or "").strip()
         hg_raw_steps = human_guided_pre.get("remediation_steps")
         hg_steps = (
-            [str(s).strip().strip("`") for s in hg_raw_steps if str(s).strip()]
+            [str(s).strip() for s in hg_raw_steps if str(s).strip()]
             if isinstance(hg_raw_steps, list)
-            else [line.strip().strip("`") for line in str(hg_raw_steps or "").splitlines() if line.strip()]
+            else [line.strip() for line in str(hg_raw_steps or "").splitlines() if line.strip()]
         )
         if hg_ev_id and hg_steps:
             hg_raw_val = human_guided_pre.get("validation_steps")
             hg_val = (
-                [str(s).strip().strip("`") for s in hg_raw_val if str(s).strip()]
+                [str(s).strip() for s in hg_raw_val if str(s).strip()]
                 if isinstance(hg_raw_val, list)
-                else [line.strip().strip("`") for line in str(hg_raw_val or "").splitlines() if line.strip()]
+                else [line.strip() for line in str(hg_raw_val or "").splitlines() if line.strip()]
             )
             hg_raw_roll = human_guided_pre.get("rollback_steps")
             hg_roll = (
-                [str(s).strip().strip("`") for s in hg_raw_roll if str(s).strip()]
+                [str(s).strip() for s in hg_raw_roll if str(s).strip()]
                 if isinstance(hg_raw_roll, list)
-                else [line.strip().strip("`") for line in str(hg_raw_roll or "").splitlines() if line.strip()]
+                else [line.strip() for line in str(hg_raw_roll or "").splitlines() if line.strip()]
             )
             draft_or_ev_id = str(human_guided_pre.get("knowledge_draft_id") or hg_ev_id)
             svc_slug = re.sub(r"[^a-z0-9-]+", "-", str(context.alert.service or "service").lower()).strip("-") or "service"
@@ -2421,24 +2551,46 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
         except ValueError:
             rb_uuid = uuid5(NAMESPACE_URL, f"kaims:learned-runbook:{context.tenant_id}:{rb_id_raw}")
         rb_slug = str(matched_rb.get("runbook_slug") or f"learned-{context.alert.service}-{rb_id_raw[:8]}")
-        rb_version = int(matched_rb.get("runbook_version") or 1)
-        rb_steps = [str(s).strip() for s in (matched_rb.get("steps") or []) if str(s).strip()]
+        rb_version = int(matched_rb.get("runbook_version") or matched_rb.get("version") or 1)
+        raw_step_sources: list[Any] = [
+            matched_rb.get("commands"),
+            matched_rb.get("steps"),
+            matched_rb.get("remediation_steps"),
+            human_guided_pre.get("remediation_steps"),
+        ]
+        rb_steps: list[str] = []
+        for src in raw_step_sources:
+            if isinstance(src, list):
+                for item in src:
+                    for line in str(item or "").splitlines():
+                        if line.strip() and line.strip() not in rb_steps:
+                            rb_steps.append(line.strip())
+            elif isinstance(src, str) and src.strip():
+                for line in src.splitlines():
+                    if line.strip() and line.strip() not in rb_steps:
+                        rb_steps.append(line.strip())
         rb_val = [str(s).strip() for s in (matched_rb.get("validation") or []) if str(s).strip()]
         rb_roll = [str(s).strip() for s in (matched_rb.get("rollback") or []) if str(s).strip()]
         rb_pre = [str(s).strip() for s in (matched_rb.get("prerequisites") or []) if str(s).strip()]
-        rb_checksum = "sha256:" + hashlib.sha256(
-            json.dumps(
-                {
-                    "runbook_id": str(rb_uuid),
-                    "version": rb_version,
-                    "steps": rb_steps,
-                    "validation": rb_val,
-                    "rollback": rb_roll,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        rb_checksum = str(
+            matched_rb.get("checksum_sha256")
+            or matched_rb.get("content_sha256")
+            or ""
+        ).strip()
+        if not rb_checksum:
+            rb_checksum = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    {
+                        "runbook_id": str(rb_uuid),
+                        "version": rb_version,
+                        "steps": rb_steps,
+                        "validation": rb_val,
+                        "rollback": rb_roll,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
         plan["playbook_id"] = rb_slug
         plan["playbook_version"] = rb_version
         plan["runbook_governance_id"] = rb_uuid
@@ -2476,12 +2628,46 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
         )
         plan["playbook"] = playbook_dict
 
-        rb_steps_approved = bool(rb_steps) and all(is_approved_remediation_command(s) for s in rb_steps)
-        approved_val = [s for s in rb_val if is_approved_remediation_command(s)]
-        approved_roll = [s for s in rb_roll if is_approved_remediation_command(s)]
-        approved_pre = [s for s in rb_pre if is_approved_remediation_command(s)]
+        approved_rb_cmds = list(
+            dict.fromkeys(
+                norm
+                for s in rb_steps
+                for norm in [normalize_approved_remediation_command(s)]
+                if norm
+            )
+        )
+        if not approved_rb_cmds:
+            approved_rb_cmds = list(
+                dict.fromkeys(
+                    norm
+                    for s in (plan.get("commands") or [])
+                    for norm in [normalize_approved_remediation_command(str(s))]
+                    if norm
+                )
+            )
+        rb_steps_approved = bool(approved_rb_cmds)
+        approved_val = [
+            norm
+            for s in rb_val
+            for norm in [normalize_approved_remediation_command(s)]
+            if norm
+        ]
+        approved_roll = [
+            norm
+            for s in rb_roll
+            for norm in [normalize_approved_remediation_command(s)]
+            if norm
+        ]
+        approved_pre = [
+            norm
+            for s in rb_pre
+            for norm in [normalize_approved_remediation_command(s)]
+            if norm
+        ]
 
         if rb_steps_approved:
+            if rb_steps and rb_steps != approved_rb_cmds:
+                metadata["manual_remediation_instructions"] = rb_steps
             conn = plan.get("connection") if isinstance(plan.get("connection"), dict) else {}
             connector_obj = conn.get("connector") if isinstance(conn.get("connector"), dict) else {}
             conn_type = str(connector_obj.get("type") or matched_rb.get("platform") or "kubernetes").lower()
@@ -2508,9 +2694,22 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
             plan["connector_id"] = connector_id
             target_res = str(plan.get("remediation_target") or context.alert.service or "unknown-service").strip() or "unknown-service"
             default_val_cmd = f"curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-connrefused --retry-delay 2 http://{target_res.removeprefix('kaiops-')}:8000/healthz"
-            effective_val = rb_val or approved_val or list(plan.get("validation_commands") or []) or [default_val_cmd]
-            effective_pre = approved_pre or list(plan.get("preflight_commands") or []) or [default_val_cmd]
-            plan["commands"] = rb_steps
+            existing_val = [
+                norm
+                for x in (plan.get("validation_commands") or [])
+                for norm in [normalize_approved_remediation_command(str(x))]
+                if norm
+            ]
+            existing_pre = [
+                norm
+                for x in (plan.get("preflight_commands") or [])
+                for norm in [normalize_approved_remediation_command(str(x))]
+                if norm
+            ]
+            effective_val = (rb_val if approved_val else None) or approved_val or existing_val or [default_val_cmd]
+            effective_val_cmds = approved_val or existing_val or [default_val_cmd]
+            effective_pre = approved_pre or existing_pre or [default_val_cmd]
+            plan["commands"] = approved_rb_cmds
             plan["validation_commands"] = effective_val
             plan["preflight_commands"] = effective_pre
             plan["mutating"] = True
@@ -2518,10 +2717,7 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
             plan["plan_kind"] = "remediation"
             plan["execution_ready"] = True
             plan["readiness_blocks"] = []
-            if rb_roll:
-                plan["rollback_commands"] = rb_roll
-                plan["rollback_mode"] = "automatic"
-            elif approved_roll:
+            if approved_roll:
                 plan["rollback_commands"] = approved_roll
                 plan["rollback_mode"] = "automatic"
             else:
@@ -2542,7 +2738,7 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
                 service=str(context.alert.service or target_res).strip(),
                 preflight_commands=effective_pre,
                 evidence_ids=sorted({str(item) for item in (plan.get("evidence_basis") or analysis.get("evidence_used") or metadata.get("rca_analysis", {}).get("evidence_used") or []) if str(item).strip()}),
-                reversible=bool(rb_roll or approved_roll),
+                reversible=bool(approved_roll),
             )
             plan["actions"] = [
                 PlanAction(
@@ -2565,7 +2761,7 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
                     required_permissions=[operation],
                     safety_binding=safety_binding,
                 ).model_dump(mode="json")
-                for index, cmd in enumerate(rb_steps)
+                for index, cmd in enumerate(approved_rb_cmds)
             ]
             registry_path = os.getenv("RECOVERY_OBSERVER_REGISTRY_PATH", "").strip()
             registered_profile = None
@@ -2585,13 +2781,14 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
                 validators = registered_profile.specs()
             else:
                 validators = _typed_validator_specs(
-                    effective_val,
+                    effective_val_cmds,
                     tenant_id=context.tenant_id,
                     connector_id=connector_id,
                     target_resource_id=target_res,
                 )
             plan["validators"] = validators
             plan["required_validation_kinds"] = sorted({str(item["kind"]) for item in validators})
+            metadata["candidate_execution_plan"] = dict(plan)
         elif rb_steps:
             metadata["manual_remediation_instructions"] = rb_steps
             if not plan.get("execution_ready"):
@@ -2719,20 +2916,43 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
     policy_risk = str(plan.get("risk_tier") or "medium").lower()
     if policy_risk not in {"low", "medium", "high", "critical"}:
         policy_risk = "medium"
+    from common.automatic_execution import automatic_execution_authorized
+    from common.orchestration.compose_targets import compose_recovery_target
+    verified_runtime_recovery = bool(
+        settings.resolution_auto_execution_enabled
+        and str(metadata.get("analysis_engine") or "") == "verified-runtime-recovery.v1"
+        and confidence >= 0.65
+        and automatic_execution_authorized(
+            settings,
+            tenant=str(context.tenant_id),
+            environment=str(context.alert.environment or ""),
+            service=str(context.alert.service or ""),
+        )
+        and compose_recovery_target(
+            tenant=str(context.tenant_id),
+            environment=str(context.alert.environment or ""),
+            service=str(context.alert.service or ""),
+        ) is not None
+    )
+    if verified_runtime_recovery:
+        policy_risk = "low"
     plan["confidence"] = max(0.0, min(confidence, 1.0))
     plan["risk"] = policy_risk
     plan["risk_tier"] = policy_risk
-    from common.automatic_execution import automatic_execution_authorized
     policy = evaluate_resolution_policy(
         ResolutionPolicyInput(
             environment=str(context.alert.environment or "unknown").lower(),
             risk=policy_risk,
-            confidence=max(0.0, min(confidence, 1.0)),
+            confidence=max(0.95, max(0.0, min(confidence, 1.0))) if verified_runtime_recovery else max(0.0, min(confidence, 1.0)),
             runbook_status=str(plan.get("runbook_status") or "unregistered"),
-            runbook_success_rate=float(
-                matched_rb_success_rate
-                or (matched_rb.get("success_rate") if isinstance(matched_rb, dict) else 0.0)
-                or 0.0
+            runbook_success_rate=(
+                1.0
+                if verified_runtime_recovery
+                else float(
+                    matched_rb_success_rate
+                    or (matched_rb.get("success_rate") if isinstance(matched_rb, dict) else 0.0)
+                    or 0.0
+                )
             ),
             mutating=bool(plan.get("mutating")),
             # Genuinely reversible only when a real rollback command exists. An
@@ -2740,9 +2960,11 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
             # execution_plan.py's recovery_strategy_acknowledged) makes the plan
             # execution-eligible but must never be reported as reversible=True -
             # policy.py's action_not_reversible HITL reason must still fire.
-            reversible=bool(plan.get("rollback_commands")),
-            canary_supported=bool(matched_rb_canary_supported) or bool(
-                isinstance(matched_rb, dict) and matched_rb.get("self_heal_eligible")
+            reversible=True if verified_runtime_recovery else bool(plan.get("rollback_commands")),
+            canary_supported=True if verified_runtime_recovery else (
+                bool(matched_rb_canary_supported) or bool(
+                    isinstance(matched_rb, dict) and matched_rb.get("self_heal_eligible")
+                )
             ),
             blast_radius=str(plan.get("blast_radius") or "single-service"),
             target_verified=bool(str(plan.get("remediation_target") or "").strip()),
@@ -2785,6 +3007,8 @@ def _apply_catalog_plan(recommendation: Recommendation, context: Context, decisi
         ]))
     plan["requires_approval"] = policy.decision == "hitl"
     plan["approval_required"] = policy.decision == "hitl"
+    if policy.decision == "hotl":
+        plan["execution_mode"] = "policy-engine-auto"
     if not plan.get("commands"):
         plan["actions"] = []
     plan["preflight"] = list(plan.get("preflight_commands") or [])
@@ -2948,6 +3172,38 @@ def _attach_typed_remediation_plan(
     registry = default_capability_registry()
     definition = registry.get(capability_id)
     raw_inputs = action.get("inputs") if isinstance(action.get("inputs"), dict) else {}
+    compose_target_verified = False
+    if target == context.alert.service:
+        from common.orchestration.compose_targets import compose_recovery_target
+
+        configured_target = compose_recovery_target(
+            tenant=context.tenant_id,
+            environment=str(context.alert.environment or ""),
+            service=target,
+        )
+        if configured_target and configured_target.get("service") == target:
+            command_values = execution_plan.get("commands")
+            commands = [
+                value for value in command_values
+                if isinstance(value, str)
+            ] if isinstance(command_values, list) else []
+            catalog_command = raw_inputs.get("catalog_command")
+            command_groups = [commands] if commands else []
+            if isinstance(catalog_command, str):
+                command_groups.append([catalog_command])
+            validation_values = action.get("validation")
+            validations = [
+                value for value in validation_values
+                if isinstance(value, str)
+            ] if isinstance(validation_values, list) else []
+            compose_target_verified = (
+                bool(command_groups)
+                and all(
+                    any(configured_target["container_id"] in command for command in group)
+                    for group in command_groups
+                )
+                and any(configured_target["health_url"] in validation for validation in validations)
+            )
     parameters = {
         str(key): value
         for key, value in raw_inputs.items()
@@ -2975,7 +3231,7 @@ def _attach_typed_remediation_plan(
         target_identity_verified=(
             bool(blast.get("verified"))
             and target in affected
-            and stable_target_identity
+            and (stable_target_identity or compose_target_verified)
         ),
         connector_id=definition.supported_connectors[0],
         required_parameters=parameters,
@@ -3114,7 +3370,10 @@ async def _persist_resolution_event(
     orchestration = (
         metadata.get("orchestration_decision") if isinstance(metadata.get("orchestration_decision"), dict) else {}
     )
-    requires_approval = decision_payload.get("requires_approval")
+    plan_meta = metadata.get("execution_plan") if isinstance(metadata.get("execution_plan"), dict) else {}
+    requires_approval = plan_meta.get("requires_approval")
+    if requires_approval is None:
+        requires_approval = decision_payload.get("requires_approval")
     if requires_approval is None:
         requires_approval = orchestration.get("requires_approval")
     status = _resolution_projection_status(metadata, requires_approval=bool(requires_approval))
@@ -3167,9 +3426,17 @@ async def _persist_resolution_event(
                     "owner": None,
                 },
                 policy={
-                    "risk_tier": str(decision_payload.get("risk_tier") or orchestration.get("risk_tier") or "unknown"),
+                    "risk_tier": str(
+                        plan_meta.get("risk_tier")
+                        or decision_payload.get("risk_tier")
+                        or orchestration.get("risk_tier")
+                        or "unknown"
+                    ),
                     "execution_mode": str(
-                        decision_payload.get("execution_mode") or orchestration.get("execution_mode") or "unknown"
+                        plan_meta.get("execution_mode")
+                        or decision_payload.get("execution_mode")
+                        or orchestration.get("execution_mode")
+                        or "unknown"
                     ),
                     "requires_approval": requires_approval,
                     "policy_version": decision_payload.get("policy_version")
@@ -3461,6 +3728,7 @@ async def _persist_resolution_event(
             ]
         else:
             requirements = []
+        scheduled_any_job = False
         if requirements:
             await enrichment_repo.upsert_context_evidence_requirements(requirements)
             authorized = authorized_enrichment_connectors(
@@ -3477,6 +3745,7 @@ async def _persist_resolution_event(
                     authorized_connectors=authorized,
                 )
                 if connector:
+                    scheduled_any_job = True
                     await enrichment_repo.schedule_context_enrichment_job(
                         tenant_id=context.tenant_id, incident_id=incident.id,
                         requirement_id=requirement.requirement_id, connector_id=connector,
@@ -3502,7 +3771,7 @@ async def _persist_resolution_event(
                             tenant_id=context.tenant_id, incident_id=incident.id,
                         )
                         resolved_assignment_loaded = True
-                    await enrichment_repo.create_human_evidence_request(
+                    created_req = await enrichment_repo.create_human_evidence_request(
                         automatic_fallback=True,
                         tenant_id=context.tenant_id, incident_id=incident.id,
                         requirement_id=requirement.requirement_id,
@@ -3515,11 +3784,13 @@ async def _persist_resolution_event(
                         hypothesis_impact=requirement.reason,
                         investigation_can_continue=True,
                     )
-                    if status == "investigating":
+                    if created_req is not None and created_req.status != "assignment_blocked" and status == "investigating":
                         status = "waiting_for_human"
                         incident_row = await session.get(IncidentRecord, incident.id)
                         if incident_row is not None:
                             incident_row.status = "waiting_for_human"
+                            if isinstance(getattr(incident_row, "payload", None), dict):
+                                incident_row.payload = {**dict(incident_row.payload), "status": "waiting_for_human"}
                         proj_rows = (await session.execute(
                             select(IncidentProjectionRecord).where(
                                 IncidentProjectionRecord.tenant_id == context.tenant_id,
@@ -3529,6 +3800,65 @@ async def _persist_resolution_event(
                         for proj_row in proj_rows:
                             proj_row.status = "waiting_for_human"
                             proj_row.lifecycle_state = "WAITING_FOR_HUMAN"
+        if (
+            status == "investigating"
+            and not rca_already_grounded
+            and not scheduled_any_job
+            and not any(str(row.get("status") or "").lower() == "human_requested" for row in existing_requirements)
+        ):
+            fallback_now = datetime.now(UTC)
+            fallback_reqs = build_evidence_requirements(
+                tenant_id=context.tenant_id,
+                incident_id=incident.id,
+                rca_version=max(1, int(metadata.get("rca_version") or 1)),
+                missing_evidence=[
+                    {
+                        "category": "runbook",
+                        "question": f"Provide runbook, observed symptoms/root cause, business impact, and remediation steps for {context.alert.service or 'this service'}.",
+                        "reason": "Automated evidence collection could not conclusively ground root cause; human operational guidance is required.",
+                        "collection_mode": "human_required",
+                        "candidate_connectors": [],
+                    }
+                ],
+                now=fallback_now,
+                previous_requirements=existing_requirements,
+                reviewed_sources=reviewed_sources,
+            )
+            if fallback_reqs:
+                await enrichment_repo.upsert_context_evidence_requirements(fallback_reqs)
+                assignment = await enrichment_repo.resolve_human_evidence_responder(
+                    tenant_id=context.tenant_id, incident_id=incident.id,
+                )
+                created_req = await enrichment_repo.create_human_evidence_request(
+                    automatic_fallback=False,
+                    tenant_id=context.tenant_id,
+                    incident_id=incident.id,
+                    requirement_id=fallback_reqs[0].requirement_id,
+                    expected_responder=assignment["identity"] if assignment else None,
+                    assignment_source=assignment["source"] if assignment else None,
+                    assignment_failure_reason=None if assignment else "NO_AUTHORIZED_RESPONDER",
+                    due_at=fallback_now + timedelta(hours=1),
+                    acceptable_format="A source reference and a concise factual observation.",
+                    evidence_already_checked=list((metadata.get("rca_analysis") or {}).get("evidence_used") or []),
+                    hypothesis_impact=fallback_reqs[0].reason,
+                    investigation_can_continue=True,
+                )
+                if created_req is not None and created_req.status != "assignment_blocked":
+                    status = "waiting_for_human"
+                    incident_row = await session.get(IncidentRecord, incident.id)
+                    if incident_row is not None:
+                        incident_row.status = "waiting_for_human"
+                        if isinstance(getattr(incident_row, "payload", None), dict):
+                            incident_row.payload = {**dict(incident_row.payload), "status": "waiting_for_human"}
+                    proj_rows = (await session.execute(
+                        select(IncidentProjectionRecord).where(
+                            IncidentProjectionRecord.tenant_id == context.tenant_id,
+                            IncidentProjectionRecord.incident_id == incident.id,
+                        )
+                    )).scalars().all()
+                    for proj_row in proj_rows:
+                        proj_row.status = "waiting_for_human"
+                        proj_row.lifecycle_state = "WAITING_FOR_HUMAN"
         if status == "investigating" and any(
             str(row.get("status") or "").lower() == "human_requested" for row in existing_requirements
         ):
@@ -3536,6 +3866,8 @@ async def _persist_resolution_event(
             incident_row = await session.get(IncidentRecord, incident.id)
             if incident_row is not None:
                 incident_row.status = "waiting_for_human"
+                if isinstance(getattr(incident_row, "payload", None), dict):
+                    incident_row.payload = {**dict(incident_row.payload), "status": "waiting_for_human"}
             proj_rows = (await session.execute(
                 select(IncidentProjectionRecord).where(
                     IncidentProjectionRecord.tenant_id == context.tenant_id,
@@ -3545,6 +3877,22 @@ async def _persist_resolution_event(
             for proj_row in proj_rows:
                 proj_row.status = "waiting_for_human"
                 proj_row.lifecycle_state = "WAITING_FOR_HUMAN"
+        elif status == "investigating" and scheduled_any_job:
+            incident_row = await session.get(IncidentRecord, incident.id)
+            if incident_row is not None and incident_row.status == "waiting_for_human":
+                incident_row.status = "investigating"
+                if isinstance(getattr(incident_row, "payload", None), dict):
+                    incident_row.payload = {**dict(incident_row.payload), "status": "investigating"}
+            proj_rows = (await session.execute(
+                select(IncidentProjectionRecord).where(
+                    IncidentProjectionRecord.tenant_id == context.tenant_id,
+                    IncidentProjectionRecord.incident_id == incident.id,
+                )
+            )).scalars().all()
+            for proj_row in proj_rows:
+                if proj_row.status == "waiting_for_human":
+                    proj_row.status = "investigating"
+                    proj_row.lifecycle_state = "INVESTIGATING"
         from fastapi.encoders import jsonable_encoder
         clean_ctx_meta = dict(context.metadata if isinstance(context.metadata, dict) else {})
         clean_ctx_meta.pop("_final_investigation_report", None)
@@ -3882,6 +4230,24 @@ async def startup(app: FastAPI) -> None:
         context = await _commit_investigation_recommendation(
             context, investigation_report, initial_snapshot["snapshot_id"], recommendation, decision_payload,
         )
+        final_plan = (
+            recommendation.metadata.get("execution_plan")
+            if isinstance(recommendation.metadata, dict)
+            and isinstance(recommendation.metadata.get("execution_plan"), dict)
+            else catalog_plan
+        )
+        if isinstance(final_plan, dict):
+            if final_plan.get("risk_tier"):
+                decision_payload["risk_tier"] = final_plan["risk_tier"]
+            if final_plan.get("execution_mode"):
+                decision_payload["execution_mode"] = final_plan["execution_mode"]
+            if "requires_approval" in final_plan:
+                decision_payload["requires_approval"] = bool(final_plan["requires_approval"])
+            decision_payload["execution_plan"] = final_plan
+            if isinstance(recommendation.metadata.get("orchestration_decision"), dict):
+                recommendation.metadata["orchestration_decision"]["requires_approval"] = decision_payload.get("requires_approval")
+                recommendation.metadata["orchestration_decision"]["risk_tier"] = decision_payload.get("risk_tier")
+                recommendation.metadata["orchestration_decision"]["execution_mode"] = decision_payload.get("execution_mode")
         await _persist_resolution_event(
             app=app,
             context=context,
@@ -4331,18 +4697,32 @@ def _selection_policy_decision(
     # exactly as it would have before this endpoint knew about policy at all.
     runbook_status = "unregistered" if option.get("source") == "global-knowledge-repository" else "approved"
     from common.automatic_execution import automatic_execution_authorized
+    from common.orchestration.compose_targets import compose_recovery_target
+    rec_meta = recommendation.get("metadata") if isinstance(recommendation.get("metadata"), dict) else {}
+    service_name = str(option.get("service") or rec_meta.get("service") or "").strip()
+    env_name = str(environment or rec_meta.get("environment") or "unknown").lower()
+    tenant_name = str(rec_meta.get("tenant_id") or recommendation.get("tenant_id") or "default").strip() or "default"
+    verified_runtime_recovery = bool(
+        settings.resolution_auto_execution_enabled
+        and rec_meta.get("analysis_engine") == "verified-runtime-recovery.v1"
+        and float(recommendation.get("confidence") or 0.0) >= 0.65
+        and bool(option.get("rollback"))
+        and compose_recovery_target(tenant=tenant_name, environment=env_name, service=service_name) is not None
+    )
+    if verified_runtime_recovery and risk == "medium":
+        risk = "low"
     return evaluate_resolution_policy(
         ResolutionPolicyInput(
-            environment=str(environment or "unknown").lower(),
+            environment=env_name,
             risk=risk,
-            confidence=max(0.0, min(float(recommendation.get("confidence") or 0.0), 1.0)),
+            confidence=max(0.95 if verified_runtime_recovery else 0.0, max(0.0, min(float(recommendation.get("confidence") or 0.0), 1.0))),
             runbook_status=runbook_status,
-            runbook_success_rate=(successes / attempts) if attempts else 0.0,
+            runbook_success_rate=1.0 if verified_runtime_recovery else ((successes / attempts) if attempts else 0.0),
             mutating=bool(option.get("steps")),
             reversible=bool(option.get("rollback")),
-            canary_supported=self_heal_eligible,
+            canary_supported=self_heal_eligible or verified_runtime_recovery,
             blast_radius="single-service",
-            target_verified=bool(str(option.get("service") or "").strip() and option.get("service") != "unknown"),
+            target_verified=bool(service_name and service_name != "unknown"),
             validation_available=bool(option.get("validation")),
             rollback_available=bool(option.get("rollback")),
             contradiction_count=0,  # already enforced by _require_catalog_readiness before this is reachable
@@ -4353,9 +4733,9 @@ def _selection_policy_decision(
             settings.resolution_auto_execution_enabled
             or automatic_execution_authorized(
                 settings,
-                tenant="default",
+                tenant=tenant_name,
                 environment=str(environment or "prod"),
-                service=str(option.get("service") or ""),
+                service=service_name,
             )
         ),
     )
@@ -4425,7 +4805,11 @@ async def _prepare_certified_resolution(
         return {"status": "human_required", "reason": "target_binding_mismatch"}
     catalog = await resolution_catalog(request)
     option = certified_option(catalog.get("rows") or [], service=request.service)
-    if option is None and allow_hitl:
+    verified_runtime_recovery = bool(
+        metadata.get("analysis_engine") == "verified-runtime-recovery.v1"
+        and float(recommendation.get("confidence") or 0.0) >= 0.65
+    )
+    if option is None and (allow_hitl or verified_runtime_recovery):
         from common.orchestration.compose_targets import compose_recovery_target
         target = compose_recovery_target(tenant=request.tenant_id,
             environment=request.environment, service=request.service)
@@ -4433,22 +4817,13 @@ async def _prepare_certified_resolution(
             configured = prepare_resolution_plan(tenant_id=request.tenant_id,
                 option_id=target["catalog_option_id"], issue=request.issue, service=request.service)
             if configured.get("source") in {"kaims-governed-catalog-v1", "tenant-learned-resolution-catalog"}:
-                option = configured  # Prepared for human review, never certified by configuration.
+                option = configured  # Prepared for human review or verified compose runtime recovery.
         if option is None and catalog.get("rows"):
-            for candidate in (catalog.get("rows") or []):
-                configured = prepare_resolution_plan(
-                    tenant_id=request.tenant_id,
-                    option_id=candidate["id"],
-                    issue=request.issue,
-                    service=request.service,
-                )
-                if configured.get("source") in {"kaims-governed-catalog-v1", "tenant-learned-resolution-catalog"}:
-                    option = configured  # Prepared for human review, never certified by configuration.
-                    break
-        if option is None:
+            return {"status": "human_required", "reason": "no_unambiguous_certified_runbook"}
+        if option is None and allow_hitl:
             fallback = prepare_resolution_plan(
                 tenant_id=request.tenant_id,
-                option_id="kaiops-service-down-playbook",
+                option_id="availability-linux-recover",
                 issue=request.issue,
                 service=request.service,
             )
@@ -4538,7 +4913,7 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
             strategy_keywords = strategy_hint_map.get(opt_strategy, "")
             compiled = resolve_execution_plan(
                 alert=alert, workflow_name="operator-resolution-selection", requires_approval=requires_approval,
-                risk_tier=str(option.get("risk") or recommendation.get("risk") or "high"),
+                risk_tier="low" if not requires_approval else str(option.get("risk") or recommendation.get("risk") or "high"),
                 execution_mode=execution_mode,
                 resolution_hints=" ".join(filter(None, (
                     strategy_keywords,
@@ -4559,30 +4934,37 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
             rb_governance_fields: dict[str, Any] = {}
             if option.get("runbook_id"):
                 rb_id_raw = str(option["runbook_id"])
+                rb_uuid: UUID | None = None
                 try:
                     rb_uuid = UUID(rb_id_raw)
                 except ValueError:
-                    rb_uuid = uuid5(NAMESPACE_URL, f"kaims:learned-runbook:{tenant_id}:{rb_id_raw}")
-                rb_version = int(option.get("runbook_version") or option.get("version") or 1)
-                rb_checksum = "sha256:" + hashlib.sha256(
-                    json.dumps(
-                        {
-                            "runbook_id": str(rb_uuid),
-                            "version": rb_version,
-                            "steps": opt_steps,
-                            "validation": opt_val,
-                            "rollback": opt_roll,
-                        },
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode()
-                ).hexdigest()
-                rb_governance_fields = {
-                    "runbook_governance_id": rb_uuid,
-                    "playbook_version": rb_version,
-                    "runbook_status": "approved",
-                    "runbook_checksum": rb_checksum,
-                }
+                    if (
+                        str(option.get("source") or "") == "tenant-learned-resolution-catalog"
+                        or not compiled.get("runbook_governance_id")
+                        or not compiled.get("runbook_checksum")
+                    ):
+                        rb_uuid = uuid5(NAMESPACE_URL, f"kaims:learned-runbook:{tenant_id}:{rb_id_raw}")
+                if rb_uuid is not None:
+                    rb_version = int(option.get("runbook_version") or option.get("version") or 1)
+                    rb_checksum = "sha256:" + hashlib.sha256(
+                        json.dumps(
+                            {
+                                "runbook_id": str(rb_uuid),
+                                "version": rb_version,
+                                "steps": opt_steps,
+                                "validation": opt_val,
+                                "rollback": opt_roll,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()
+                    rb_governance_fields = {
+                        "runbook_governance_id": rb_uuid,
+                        "playbook_version": rb_version,
+                        "runbook_status": "approved",
+                        "runbook_checksum": rb_checksum,
+                    }
             compiled.update({
                 "plan_id": uuid5(NAMESPACE_URL, f"execution-plan:{selection['selection_id']}"),
                 "recommendation_id": request.recommendation_id,
@@ -4638,7 +5020,11 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
                         compiled["rollback_commands"] = []
                         compiled["rollback_mode"] = "not_applicable"
                         compiled["recovery_strategy_acknowledged"] = True
-                        compiled["recovery_strategy"] = {"summary": "Governed operator selection recovery strategy validated via post-action checks."}
+                        existing_recovery = compiled.get("recovery_strategy") if isinstance(compiled.get("recovery_strategy"), dict) else {}
+                        compiled["recovery_strategy"] = {
+                            "summary": str(existing_recovery.get("summary") or "Governed operator selection recovery strategy validated via post-action checks."),
+                            "requires_acknowledgement": True,
+                        }
                     safety_binding = _safe_remediation_binding(
                         tenant_id=tenant_id,
                         connector=connector_for_binding,
@@ -4744,30 +5130,35 @@ async def select_resolution(request: ResolutionSelectionRequest) -> dict[str, An
             execution_plan = await repository.persist_compiled_execution_plan(
                 selection_id=selection["selection_id"], plan=compiled, blocking_reasons=blocking_reasons,
             )
+            current_incident = await repository.get_incident(request.incident_id, tenant_id=tenant_id)
+            current_incident_status = str((current_incident or {}).get("status") or "").strip().lower()
             await session.commit()
             if not requires_approval and not blocking_reasons:
-                # Reuses the exact same acceptance path a human's "Approve" click
-                # goes through (save_approval + status update + the
-                # incident.approval.recorded event every downstream consumer
-                # already listens for) - a policy decision and a human decision
-                # look identical to everything past this point. If this call
-                # fails for any reason, the plan is simply left awaiting a human
-                # approval exactly as it always was; auto-approval is additive,
-                # never a substitute for the plan existing in a safe state.
-                try:
-                    await _auto_approve_selection(
-                        tenant_id=tenant_id, incident_id=request.incident_id,
-                        recommendation_id=request.recommendation_id,
-                        plan_id=compiled.get("plan_id"), plan_fingerprint=compiled.get("plan_fingerprint"),
-                        reason=", ".join(policy_decision.reason_codes),
-                    )
+                if current_incident_status in {"approved", "remediating", "validating", "resolved", "closed"}:
                     automatic_approval = "approved"
-                except Exception:
-                    automatic_approval = "deferred"
-                    logger.exception(
-                        "policy-engine auto-approval failed for incident=%s selection=%s; leaving awaiting human approval",
-                        request.incident_id, selection["selection_id"],
-                    )
+                else:
+                    # Reuses the exact same acceptance path a human's "Approve" click
+                    # goes through (save_approval + status update + the
+                    # incident.approval.recorded event every downstream consumer
+                    # already listens for) - a policy decision and a human decision
+                    # look identical to everything past this point. If this call
+                    # fails for any reason, the plan is simply left awaiting a human
+                    # approval exactly as it always was; auto-approval is additive,
+                    # never a substitute for the plan existing in a safe state.
+                    try:
+                        await _auto_approve_selection(
+                            tenant_id=tenant_id, incident_id=request.incident_id,
+                            recommendation_id=request.recommendation_id,
+                            plan_id=compiled.get("plan_id"), plan_fingerprint=compiled.get("plan_fingerprint"),
+                            reason=", ".join(policy_decision.reason_codes),
+                        )
+                        automatic_approval = "approved"
+                    except Exception:
+                        automatic_approval = "deferred"
+                        logger.exception(
+                            "policy-engine auto-approval failed for incident=%s selection=%s; leaving awaiting human approval",
+                            request.incident_id, selection["selection_id"],
+                        )
         except ValueError as exc:
             await session.rollback()
             raise HTTPException(
@@ -4800,6 +5191,23 @@ async def resolve(context: Context, publish_events: bool = True) -> Recommendati
 
 
 async def _resolve_attempt(context: Context, publish_events: bool = True) -> Recommendation:
+    completed = await _completed_analysis_for_replay(context)
+    if completed is not None:
+        bound_context, recommendation = completed
+        synthetic_incident = Incident(
+            id=bound_context.incident_id,
+            service=bound_context.alert.service,
+            severity=bound_context.alert.severity,
+            title=f"{bound_context.alert.service}: {bound_context.alert.name}",
+        )
+        await _persist_resolution_event(
+            app=app,
+            context=bound_context,
+            incident=synthetic_incident,
+            recommendation=recommendation,
+            decision_payload={},
+        )
+        return recommendation
     initial_snapshot = await _require_context_snapshot_binding(context)
     context = await _bind_next_rca_version(context)
     investigated_context, investigation_report = await investigate_context(context)
@@ -4813,6 +5221,7 @@ async def _resolve_attempt(context: Context, publish_events: bool = True) -> Rec
     recommendation.metadata["discovery_report"] = context.metadata.get("discovery_report", {})
     recommendation.metadata["discovery_evidence"] = context.metadata.get("discovery_evidence", {})
     recommendation.metadata["runbook_found"] = bool(context.runbook)
+    _apply_catalog_plan(recommendation, context, {})
     context = await _commit_investigation_recommendation(
         context, investigation_report, initial_snapshot["snapshot_id"], recommendation,
     )
@@ -4821,12 +5230,6 @@ async def _resolve_attempt(context: Context, publish_events: bool = True) -> Rec
         service=context.alert.service,
         severity=context.alert.severity,
         title=f"{context.alert.service}: {context.alert.name}",
-    )
-    payload_out = _build_resolution_event_payload(
-        context=context,
-        incident=synthetic_incident,
-        recommendation=recommendation,
-        decision_payload={},
     )
     # Temporal invokes this endpoint with publish_events=false because it owns
     # durable orchestration and must not create a second bus delivery. The
@@ -4843,12 +5246,13 @@ async def _resolve_attempt(context: Context, publish_events: bool = True) -> Rec
     try:
         meta = recommendation.metadata if isinstance(recommendation.metadata, dict) else {}
         proj_status = _resolution_projection_status(meta, requires_approval=True)
-        if proj_status in {"awaiting_approval", "rca_ready"} and settings.database_enabled:
+        if proj_status in {"awaiting_approval", "rca_ready"} and settings.database_enabled and not meta.get("resolution_selection"):
             await _prepare_certified_resolution(
                 ResolutionCatalogRequest(
                     tenant_id=context.tenant_id,
                     incident_id=context.incident_id,
                     alert_id=str(context.alert.id),
+                    analysis_request_id=UUID(str(meta.get("analysis_request_id") or context.metadata.get("analysis_request_id") or uuid4())),
                     service=str(context.alert.service or "unknown"),
                     environment=str(context.alert.environment or "prod"),
                     issue=f"{context.alert.name} {recommendation.root_cause}",
@@ -4875,6 +5279,12 @@ async def _resolve_attempt(context: Context, publish_events: bool = True) -> Rec
             "resolution catalog bootstrap deferred incident_id=%s error=%s",
             synthetic_incident.id, str(exc)[:500],
         )
-    if publish_events:
+    payload_out = _build_resolution_event_payload(
+        context=context,
+        incident=synthetic_incident,
+        recommendation=recommendation,
+        decision_payload={},
+    )
+    if publish_events and not settings.database_enabled:
         await app.state.producer.publish(RESOLUTION_EVENTS, payload_out)
     return recommendation

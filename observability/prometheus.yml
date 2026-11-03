@@ -214,6 +214,28 @@ scrape_configs:
           environment: demo
           monitoring_scope: demo
 
+  # Ratings serves the Robot Shop HTTP app on port 80 and has no native
+  # Prometheus endpoint, so probe its real HTTP health instead of /metrics.
+  - job_name: robot-shop-ratings
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: ["http://rs-ratings:80/_health"]
+        labels:
+          environment: demo
+          monitoring_scope: demo
+          service: rs-ratings
+          application: Robot Shop
+          project: robot-shop
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+
   # mongodb/redis/rabbitmq/mysql don't expose /metrics natively — standard
   # community exporters provide real infrastructure metrics instead.
   - job_name: robot-shop-mysql

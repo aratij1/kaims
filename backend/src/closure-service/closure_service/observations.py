@@ -109,6 +109,12 @@ class PrometheusRecoveryObserver:
             raise ObservationUnavailable("prometheus_query_incomplete")
         data = body.get("data") or {}
         rows = data.get("result")
+        if isinstance(rows, list) and len(rows) > 1 and "vector(" in check.query:
+            labeled_rows = [
+                row for row in rows if isinstance(row, dict) and bool(row.get("metric"))
+            ]
+            if len(labeled_rows) == 1:
+                rows = labeled_rows
         # Registry queries must aggregate to exactly one target-scoped value.
         # No-data is unknown, never an implicit zero or successful recovery.
         if data.get("resultType") != "matrix" or not isinstance(rows, list) or len(rows) != 1:

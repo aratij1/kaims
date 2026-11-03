@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 import pytest
 from test_governed_resolution_handoff import load_resolution_module
 from common.models import Alert, AlertSeverity, Incident, Recommendation
@@ -11,6 +11,7 @@ async def test_resolution_persists_when_human_assignment_is_unavailable(monkeypa
     monkeypatch.setattr(module.settings, "database_enabled", True)
     session = AsyncMock()
     session.__aenter__.return_value = session
+    session.execute = AsyncMock(return_value=SimpleNamespace(scalars=MagicMock(return_value=SimpleNamespace(all=MagicMock(return_value=[])))))
     repo = AsyncMock()
     enrichment = AsyncMock()
     enrichment.list_context_evidence_requirements.return_value = []

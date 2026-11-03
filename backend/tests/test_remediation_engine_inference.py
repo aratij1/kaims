@@ -63,7 +63,7 @@ def test_build_action_does_not_infer_action_type_from_command_text() -> None:
         RemediationEngine().build_action(approval)
 
 
-def test_catalog_docker_restart_is_not_mislabeled_as_rollback() -> None:
+def test_docker_socket_restart_command_stays_outside_automated_allowlist() -> None:
     approval = Approval(
         incident_id="11111111-1111-1111-1111-111111111111",
         recommendation_id="22222222-2222-2222-2222-222222222222",
@@ -86,6 +86,5 @@ def test_catalog_docker_restart_is_not_mislabeled_as_rollback() -> None:
         },
     )
 
-    action = RemediationEngine().build_action(approval)
-
-    assert action.action_type == "restart_service"
+    with pytest.raises(ValueError, match="outside the automated allowlist"):
+        RemediationEngine().build_action(approval)

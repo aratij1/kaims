@@ -483,6 +483,12 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
         provenance = 0.35 if any(present.values()) else 0.0
         relevance = 0.5 if present["identity"] else 0.0
 
+    fresh_or_aligned_sources = {
+        canonical_source(row.get("source"))
+        for row in all_rows
+        if _clamp(row.get("freshness_score")) > 0.0
+        or bool(row.get("incident_window_aligned"))
+    }
     stale_sources = sorted(
         {
             canonical_source(row.get("source"))
@@ -490,6 +496,7 @@ def assess_context(context: Context, *, now: datetime | None = None, threshold: 
             if _clamp(row.get("freshness_score")) <= 0.0
             and not bool(row.get("incident_window_aligned"))
         }
+        - fresh_or_aligned_sources
     )
     conflicts = metadata.get("context_conflicts") if isinstance(metadata.get("context_conflicts"), list) else []
     represented_planes = {

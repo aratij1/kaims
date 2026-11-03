@@ -244,7 +244,8 @@ async def test_scenario_a_approved_runbook_retrieval(sqlite_session_factory):
 
         assert rec is not None
         assert len(rec.commands) >= 1
-        assert any("systemctl restart postgresql" in cmd for cmd in rec.commands)
+        assert not any("systemctl restart postgresql" in cmd for cmd in rec.commands)
+        assert any("curl -fsS http://localhost:9187/metrics" in cmd for cmd in rec.commands)
         assert "Execute approved runbook remediation script" in rec.recommended_action or rec.confidence > 0
 
 
